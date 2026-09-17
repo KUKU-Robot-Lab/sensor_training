@@ -15,6 +15,7 @@ pytorch/
 # 이미지(png/jpg)는 figure 산출물이므로 추적함 (예전엔 제외했었음)
 
 # Local env and artifacts
+.trash_*/
 skin/
 training/runs/*
 sats/training/runs/*

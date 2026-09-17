@@ -46,6 +46,14 @@
     "sats/ecomesh/v3/xy_1mm/d5/test1": 1,
     "sats/ecomesh/v3/xy_1mm/d5/test2": 2
   },
+  "ecomesh_v4_xy1/d10": {
+    "sats/ecomesh/v4/xy_1mm/d10/test1": 1,
+    "sats/ecomesh/v4/xy_1mm/d10/test2": 2
+  },
+  "ecomesh_v4_xy1/d5": {
+    "sats/ecomesh/v4/xy_1mm/d5/test1": 1,
+    "sats/ecomesh/v4/xy_1mm/d5/test2": 2
+  },
   "ecomesh_v5_xy1/d10": {
     "sats/ecomesh/v5/xy_1mm/d10/test1": 1,
     "sats/ecomesh/v5/xy_1mm/d10/test2": 2
@@ -61,6 +69,22 @@
   "ecomesh_v6_xy1/d5": {
     "sats/ecomesh/v6/xy_1mm/d5/test1": 1,
     "sats/ecomesh/v6/xy_1mm/d5/test2": 2
+  },
+  "ecomesh_v8_xy1/d10": {
+    "sats/ecomesh/v8/xy_1mm/d10/test1": 1,
+    "sats/ecomesh/v8/xy_1mm/d10/test2": 2
+  },
+  "ecomesh_v8_xy1/d5": {
+    "sats/ecomesh/v8/xy_1mm/d5/test1": 1,
+    "sats/ecomesh/v8/xy_1mm/d5/test2": 2
+  },
+  "ecomesh_v9_xy1/d10": {
+    "sats/ecomesh/v9/xy_1mm/d10/test1": 1,
+    "sats/ecomesh/v9/xy_1mm/d10/test2": 2
+  },
+  "ecomesh_v9_xy1/d5": {
+    "sats/ecomesh/v9/xy_1mm/d5/test1": 1,
+    "sats/ecomesh/v9/xy_1mm/d5/test2": 2
   },
   "ecomesh_xy0p5/d10": {
     "sats/ecomesh/xy_0.5mm/d10/20260610_test1": 1,
