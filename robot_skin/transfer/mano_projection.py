@@ -1,21 +1,11 @@
-"""Glove ⇄ robot-hand transfer through MANO (stub).
+"""Backward-compatible import path of the former stub module.
 
-Plan
-- ``project_to_mano``: robot-hand taxel poses (URDF FK) → nearest MANO surface point/segment
-  (retargeted hand), so robot and glove taxels live on one canonical hand.
-- ``align_layouts``: correspondence between a glove layout and a robot-hand layout on that
-  canonical hand (by segment + nearest position), used to map tokens / labels across embodiments.
+``project_to_mano`` / ``align_layouts`` are implemented in :mod:`robot_skin.transfer.skeleton` and
+:mod:`robot_skin.transfer.align`; import them from :mod:`robot_skin.transfer`.
 """
 from __future__ import annotations
 
-import numpy as np
+from .align import align_layouts
+from .skeleton import project_to_mano
 
-from common.layouts import Layout
-
-
-def project_to_mano(taxel_pos: np.ndarray, mano_vertices: np.ndarray, mano_segments: np.ndarray):
-    raise NotImplementedError("MANO projection not implemented yet")
-
-
-def align_layouts(src: Layout, dst: Layout, **kw) -> np.ndarray:
-    raise NotImplementedError("layout alignment not implemented yet")
+__all__ = ["align_layouts", "project_to_mano"]

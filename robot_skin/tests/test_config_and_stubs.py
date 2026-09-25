@@ -1,4 +1,4 @@
-import pytest
+import numpy as np
 
 from common.layouts import load_layout
 from robot_skin.config import load_config
@@ -18,8 +18,15 @@ def test_default_config_loads_and_is_consistent(tmp_path):
     assert cfg2["policy"]["obs_mode"] == "none"
 
 
-def test_transfer_stubs():
-    with pytest.raises(NotImplementedError):
-        align_layouts(load_layout("glove_template"), load_layout("robot_hand_template"))
-    with pytest.raises(NotImplementedError):
-        project_to_mano(None, None, None)
+def test_transfer_is_implemented():
+    """The former transfer stubs (NotImplementedError) are implemented: glove taxels project onto
+    their own MANO segments and a layout aligns to itself."""
+    glove = load_layout("glove_template")
+    al = align_layouts(glove, glove)
+    np.testing.assert_array_equal(al.index[:, 0], np.arange(glove.n))
+    from robot_skin.transfer import layout_rest_poses
+
+    pos, _ = layout_rest_poses(glove)
+    pr = project_to_mano(pos)
+    assert pr.segment_names[:2] == ["thumb3", "index3"]
+    assert pr.u.shape == (glove.n,)
