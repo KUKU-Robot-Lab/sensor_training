@@ -1,0 +1,87 @@
+# Stage `deploy` — robot_skin.stages.deploy.run(cfg). Mirrors stages/deploy.py DEFAULTS (a test
+# keeps them equal). Operator guide: docs/DEPLOYMENT.md.
+#   python -m robot_skin.stages.deploy --set bundle=robot_skin/runs/vtla --set duration_s=10
+stage: deploy
+hardware: null                  # profile name (rtx5090 …): exports its env; device: auto uses it
+hardware_applied: false
+out_dir: null                   # null → robot_skin/runs/deploy (metrics.json, sessions/)
+robot: fake                     # fake = FakeRobotHand + FakeCamera; anything else needs run(cfg, robot=...)
+bundle: null                    # policy_bundle.pt or the vtla run dir (required)
+device: cpu                     # cpu | cuda | cuda:N | auto
+duration_s: 5.0                 # rollout length (after start-up)
+control_hz: null                # null → bundle timing.source_hz (tactile master rate, 200)
+policy_hz: null                 # null → bundle timing.policy_hz (20)
+instruction: null               # task text; null → bundle meta.instruction or ""
+seed: 0                         # flow-head sampling noise, fake robot draws
+allow_bootstrap: false          # refuse bundles trained on bootstrap tactile levels
+realtime: false                 # fake robot: simulated clock (false) or host clock + sleeping (true)
+layout: null                    # skin layout; null → robot.layout (fake: robot_hand_template)
+urdf: null                      # robot URDF; null → robot.model (fake: synthetic 16-DoF hand)
+stage1:                         # the ROBOT skin's stage-1 outputs (robot D1 data)
+  baseline_model: null          # baseline run dir / baseline_model.pt
+  calibrator: null              # contact run dir / calibrator.json
+  detector: null                # contact_detector.pt (optional)
+  use_bundle_refs: true         # else fall back to the bundle's refs when they match this layout
+startup:
+  baseline_s: 1.0               # hold still, no contact: tactile raw baseline (as preprocessing)
+  calib_s: 0.5                  # bring-up calibrator from a still hold when no calibrator exists (0 = off)
+tactile:                        # OnlineTactileProcessor pressure settings (= preprocessing pressure.*)
+  adc_min: 0.0
+  adc_max: 16777215.0
+  rail_margin: 0.0
+  max_abs_pct: 90.0
+  fsm: null                     # null → calibrator.fsm; or {enabled, ok_pct, ok_sec, max_recover_s}
+fake_robot:
+  sim_hz: 400.0
+  tau_s: 0.05                   # first-order position tracking
+  seed: 0
+  noise_pct: 0.02
+  n_channels: null
+  object:                       # virtual object: contact when a finger's closure exceeds `angle`
+    angle: 0.9
+    compliance_rad: 0.25
+    palm: true
+cameras:                        # fake cameras for the bundle's camera names
+  hw: [24, 32]
+  rate_hz: 30.0
+retarget:                       # hand_mano bundles: FingertipRetargeter (action.retarget)
+  tip_links: null               # null → {finger: <finger>_distal_link}
+  base_link: null
+  human_to_robot: null          # 3x3; null → synthetic-hand frame (fake) / identity + warning
+  scale: auto                   # robot/human size (multiplies human vectors); auto = estimate_scale
+  tip_offsets: layout           # fingertip point on the tip link: layout pads | {finger: xyz} | null
+  method: lm
+  iters: 10
+  jacobian: fd
+  reg_weight: 1.0e-6
+  smooth_weight: 1.0e-5
+hand_state:                     # hand_mano proprio on a robot
+  init: mean                    # mean | flat — initial commanded hand state
+  estimate: false               # true: fingers from robot q (transfer.RobotToManoEstimator)
+safety:
+  max_vel: 3.0                  # rad/s
+  max_acc: null                 # rad/s²
+  margin: 0.0                   # rad inside the joint limits
+  closing_sign: 1.0             # +1: increasing q closes (scalar, list or {joint_glob: sign})
+  per_taxel_joints: true        # tactile stop freezes only the triggering taxel's chain
+  tactile_stop:
+    enabled: true
+    levels: [STRONG, SATURATED]
+    min_ticks: 10               # sustained ticks before the stop engages (50 ms at 200 Hz)
+    release_ticks: 20
+    mode: freeze_closing        # freeze_closing | hold | estop
+  watchdog:
+    enabled: true
+    max_age_s: {pressure: 0.05, joint_state: 0.05, "camera_*": 0.5}
+    estop_after_s: 0.5
+log:                            # deployment session in the RAW format (re-ingestible)
+  enabled: true
+  dir: null                     # null → <out_dir>/sessions/<session_id>
+  dataset: other                # other | task (task: VTLA training would pick it up)
+  subject: robot
+  session_id: null              # null → deploy_<seed>
+  camera_format: auto
+latency:
+  benchmark: true               # policy-only p50/p95 with a dummy observation
+  n: 20
+  warmup: 3

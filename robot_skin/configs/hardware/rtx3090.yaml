@@ -1,0 +1,33 @@
+# Hardware profile: NVIDIA GeForce RTX 3090 (Ampere, compute capability 8.6, 24 GB).
+# Ampere has native bf16 tensor cores, so bf16 autocast without GradScaler is used.
+name: rtx3090
+gpu:
+  vendor: nvidia
+  model: GeForce RTX 3090
+  arch: ampere
+  compute_capability: [8, 6]
+  memory_gb: 24
+  bf16: true
+  min_torch_cuda: "11.1"
+
+train:
+  device: auto
+  precision: bf16
+  tf32: true
+  compile: true
+  num_workers: 8
+  pin_memory: true
+
+suggest:                    # same effective batch as rtx5090
+  imu_pose: {batch_size: 512, grad_accum: 1}
+  baseline: {batch_size: 1024, grad_accum: 1}
+  contact:  {batch_size: 512, grad_accum: 1}
+  pretrain: {batch_size: 128, grad_accum: 2}
+  vtla:     {batch_size: 32, grad_accum: 4}
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+
+notes: >-
+  Roughly half the bf16 throughput of an RTX 4090; prefer it for sweeps / smaller stages
+  (imu_pose, baseline, contact) and keep VTLA runs on the 5090/4090 machines.

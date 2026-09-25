@@ -1,0 +1,103 @@
+# Stage `contact`: residual calibration (z, levels), learned contact detector, D2 pseudo labels.
+# Runner: robot_skin.stages.contact.run(cfg)  (python -m robot_skin.stages.contact --config <this>)
+# Needs the baseline stage's derived residual / baseline_logvar. Writes derived residual_z,
+# contact_level, contact_prob, contact_label_pseudo (D2) and <out_dir>/calibrator.json,
+# contact_detector.pt, metrics.json. Keys mirror robot_skin.stages.contact.DEFAULTS (test-synced).
+stage: contact
+hardware: null                  # rtx5090 | rtx4090 | rtx3090 | a100 | cpu | auto | null
+hardware_applied: false
+out_dir: null                   # null → train.out_dir
+
+data:
+  processed_root: robot_skin/data/processed
+  datasets: [motion]            # D1: calibration + detector labels (self-touch = 1, no-contact = 0)
+  predict_datasets: [motion, task]
+  episodes: null                # explicit episode dirs (replace the discovery; the dataset lists still select)
+  splits: null                  # same splits.json as the baseline stage (calibrate on its val split)
+  use_test: false
+  split_by: episode
+  val_frac: 0.2
+  split_seed: 0
+  kind: null                    # glove | robot | null (all) — one model per layout: set it for mixed data
+  stride: 1
+  q_source: q                   # joint speed source for the detector: q | hand_pose_imu
+
+calibration:                    # contact.calibration.ResidualCalibrator
+  split: val                    # fit on held-out no-contact frames (falls back to train)
+  labels: [0]
+  use_logvar: true              # z = p / (g·sqrt(σ² + exp(baseline_logvar)))
+  center: true
+  weak_z: 3.0
+  strong_z: 8.0
+  weak_floor_pct: 0.5           # WEAK also needs ≥ 0.5 % press
+  strong_floor_pct: 3.0
+  sigma_floor_pct: 0.02
+  min_samples: 50
+
+fsm:                            # SaturationFSM gate (dropout recovery); stored in calibrator.json for CTRL
+  enabled: false
+  ok_pct: 1.5
+  ok_sec: 2.0
+  max_recover_s: 30.0
+
+detector:                       # contact.detector.ContactDetector
+  enabled: true                 # false → contact_prob = sigmoid(z − weak_z)
+  bootstrap: auto               # auto | true | false: label STRONG z in contact phases as 1 (auto: train split
+                                # has no self-touch labels, e.g. robot D1)
+  window: 16
+  hidden: 32
+  n_layers: 3
+  kernel: 3
+  taxel_emb_dim: 4
+  use_motion: true
+  use_sat: true
+  z_scale: 2.0
+  z_clip: 100.0
+  prior: 0.01                   # output-bias prior (Lin et al. 2017)
+  dropout: 0.0
+
+loss:                           # contact.detector.contact_loss
+  kind: focal                   # focal | bce
+  gamma: 2.0
+  alpha: 0.25
+  pos_weight: null              # bce only
+
+eval:
+  prob_threshold: 0.5
+
+hysteresis:                     # contact.hysteresis.HysteresisFilter on contact_prob
+  on_thr: 0.6
+  off_thr: 0.4
+  min_on: 2
+  min_off: 4
+
+pseudo_label:                   # contact.pseudo_label.pseudo_label_episode
+  enabled: true
+  datasets: [task]
+  neg_thr: 0.1
+  keep_existing: true
+  none_conflict: unknown        # unknown | zero (detector firing in a no-contact phase)
+  unknown_phase: unknown        # unknown | any | none (frames outside any phase)
+  saturated_as_contact: true
+  proximity_m: null             # e.g. 0.12: veto contact on taxels farther than this from object_pos
+  phase_overrides: {}           # {phase_name: none|self|object|any}
+
+predict:
+  write_derived: true
+  batch_size: 4096
+
+train:
+  max_epochs: 20
+  batch_size: 128
+  lr: 1.0e-3
+  weight_decay: 0.01
+  warmup_steps: 100
+  schedule: cosine
+  min_lr_ratio: 0.05
+  grad_clip: 1.0
+  precision: auto
+  ema_decay: null
+  monitor: val/loss
+  log_every: 50
+  seed: 0
+  out_dir: robot_skin/runs/contact

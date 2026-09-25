@@ -1,67 +1,24 @@
-sats/preprocessing/processed_data/
-sats/preprocessing/gt_output_v1/
-processed_data/
-hitmap/preprocessing/processed_sweeps/
-hitmap/preprocessing/processed_data/
-raw_data/
-learning_data/*
-!learning_data/README.md
-!learning_data/trial_registry.json
-pytorch/
+# Root ignores. deformable_sats/ keeps its own .gitignore (patterns relative to that dir).
 
-# Media and large documents
-*.pdf
-*.mp4
-# 이미지(png/jpg)는 figure 산출물이므로 추적함 (예전엔 제외했었음)
+# robot_skin data / training outputs — only the READMEs are tracked
+robot_skin/data/*
+!robot_skin/data/README.md
+robot_skin/runs/*
+!robot_skin/runs/README.md
+/runs/
+/data/
 
-# Local env and artifacts
-.trash_*/
-skin/
-training/runs/*
-sats/training/runs/*
-!sats/training/runs/README.md
-**/__pycache__/
-*.pyc
-
-# Model artifacts (전역 제외: gt_meta_cache ~200MB·중간 epoch 스냅샷 등)
-# 단, 피규어 대표 모델 best_model.pt 는 git add -f 로 강제 추적함 (부모 dir이 ignore라 negation 불가)
-*.pth
+# model artefacts
 *.pt
+*.pth
 *.ckpt
 *.onnx
-*.bin
-*.h5
-*.npz
-*.npy
 *.safetensors
 
-# Virtual environment (large)
+# python / tooling
+**/__pycache__/
+*.pyc
+.pytest_cache/
 .venv/
-
-# Logs and scratch run outputs
+*.egg-info/
 *.log
-
-# Large media / office docs
-*.pptx
-*.bmp
-*.tiff
-
-# Raw acquisition data (large CSVs under fig2_heatmap)
-ethermotion_data.csv
-due_data.csv
-loadcell_data.csv
-unified.csv
-combined_centerline.csv
-figure_set.html
-
-# Large acquisition node data (skin_ws/node/*.node, 31MB total)
-*.node
-# 예외: 새 센서 취득용 xy1 계단식 node (재생성 가능하나 추적)
-!skin_ws/node/SATS_d5_mk20_StairStep_xy1_05_Ufix_velfix.node
-!skin_ws/node/SATS_d10_mk20_StairStep_xy1_05_Ufix_velfix.node
-
-# 재생성 가능한 진단 per-sample 덤프(대용량) — pngs/csv/README만 추적
-samples_*.npz
-
-# 밴딩 실험 산출물(가중치·history) — 재생성 가능, 저장소에 두지 않음
-sats/bending/runs/*

@@ -1,313 +1,107 @@
-# 16-Channel Tactile Intelligence Framework
+# sensor_training (monorepo)
 
-16채널 기압 기반 tactile sensor array 데이터로 sparse-to-dense pressure map,
-XY heatmap, contact 기준 Z/Fz 회귀를 실험하는 workspace입니다.
+기압 기반 촉각 센서 연구 저장소. 평면 SATS 패드 연구(`deformable_sats/`)와 손 전체 촉각 스킨(`robot_skin/`)이
+공유 규약 계층(`common/`)을 통해 함께 산다. `robot_skin` 은 촉각 글러브(기압 taxel + IMU 7개 + 카메라)로 모은
+사람 손 데이터에서 **vision + tactile + language → action (VTLA)** 정책을 학습해 촉각 스킨 로봇 핸드를 제어하는
+프레임워크다: 수집 → 전처리 → 촉각 해석(무접촉 baseline, 접촉 보정) → 촉각 표현 사전학습 → VTLA → 로봇 제어.
 
-현재 mk555 SATS 데이터의 공식 경로는 `skin_ws/raw_data`의 raw BIN archive를
-`learning_data`로 정리한 뒤 `sats` 학습을 돌리는 흐름입니다. 기존
-CSV/Zarr 기반 `hitmap` 경로는 XY/Z/Fz 회귀 실험용으로 유지됩니다.
+| 디렉터리 | 역할 |
+|---|---|
+| `robot_skin/` | 글러브 ⇄ 로봇 핸드 촉각 스킨 프레임워크 — 모듈 표는 [`robot_skin/README.md`](robot_skin/README.md) |
+| `common/` | 공유 규약: ΔS% 신호·baseline·정규화·포화(`signal`), 스트림 시계 정렬(`timeline`), taxel 레이아웃(`layouts`) — [`common/README.md`](common/README.md) |
+| `deformable_sats/` | **기존 저장소 전체**(sats, hitmap, cnn_lstm, scripts, skin_ws, learning_data, runs, history). 4×4 SATS 압력맵·XY/Z/Fz 회귀, 밴딩 보상, 논문 워크스페이스. 내부 구조·import 무변경 — [`deformable_sats/README.md`](deformable_sats/README.md) |
+| `docs/` | 설계·운영 문서 (아래) |
 
-## 현재 상태 (2026-07-12)
+## 문서
 
-- **최종 모델 = `train_e2e` + 인덴터 크기 입력(A, FiLM conditioning)**. β GT 보정은 인프라만 보존(무이득 확정).
-  소재 서열(d10 상대오차): **ecomesh 0.182 < eco20 0.259 < eco50 0.336** / 위치오차 ecomesh_xy1 0.79 mm.
-- 데이터: xy1 소재 3종(각 6 trial) + ecomesh xy0.5(13 trial) 병합 완료. 진단은 `sats/tools/eval_diagnostics.py`.
-- **밴딩 보상 모듈** `sats/bending/` Phase 0 완료 — 데이터 취득 대기.
-- **논문 워크스페이스 = `history/fig_data/`** (Figure·분석·투고 로드맵). 진행 관리:
-  `history/fig_data/SUBMISSION_CHECKLIST.md` · 구조 색인: `history/fig_data/PROJECT_STRUCTURE.md`.
-- 실험 러너·검증 스크립트는 `scripts/` (구 루트 scratchpad_* — `scripts/README.md` 참조).
+| 문서 | 내용 |
+|---|---|
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 목표(D1 motion / D2 task → VTLA → 로봇), 의존 방향, 전체 데이터 흐름, 핵심 설계 결정, 논문 매핑, 한계와 다음 단계 |
+| [`docs/DATA_ACQUISITION.md`](docs/DATA_ACQUISITION.md) | 수집 운영 절차: 장비, 3-탭 싱크, D1/D2 스크립트, QC 게이트, 권장 수집량 |
+| [`docs/DATA_FORMAT.md`](docs/DATA_FORMAT.md) | raw 세션과 processed Episode 의 모든 파일·키·단위·좌표 규약 |
+| [`docs/TRAINING.md`](docs/TRAINING.md) | stage·파이프라인 실행, 설정, 하드웨어 프로파일(RTX 5090), torchrun, Tailscale 다중 머신, 재개, 스윕, 평가 |
+| [`docs/VTLA.md`](docs/VTLA.md) | VTLA 모델 구조, 데이터 샘플링, 정책 번들, 논문과의 관계, VLM 백본 확장 |
+| [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | 정책을 로봇 핸드에서 실행: 제어 루프, 안전, 지연 예산, 실제 핸드 연결 |
+| [`docs/REFERENCES.md`](docs/REFERENCES.md) | 검증된 참고문헌 — 코드·문서는 여기 있는 문헌만 인용한다 |
+| [`robot_skin/train/README.md`](robot_skin/train/README.md) | 학습 엔진 세부: Trainer, precision 규칙, DDP, 체크포인트, 스윕 |
 
-## Current Official SATS Flow
+## 의존 방향
 
-```text
-skin_ws/raw_data/sats/eco20 + mesh/d5/testN/
-  ├── due_raw_burst_*.bin
-  ├── ethermotion_encoder_*.bin
-  └── loadcell_raw_*.bin
-
-learning_data/
-  ├── sensor_raw_bin/ecomesh/d5/z_2.5mm/testN/*_merged.bin
-  └── gt/ecomesh_d5_z2.5_testN_targets.npy  # legacy/precomputed GT
-
-sats/training/
-  ├── train_lstm.py
-  ├── train_attention.py
-  ├── train_local_map.py
-  └── train_cnn.py
+```
+robot_skin  ──▶  common  ◀──  deformable_sats
 ```
 
-## Data Alignment Policy
+`common` 은 두 패키지 어느 쪽도 import 하지 않고, `robot_skin` 은 `deformable_sats` 를 import 하지 않는다
+(`common/tests/test_dependency_direction.py`).
 
-- DUE effective sensor stream is 200 Hz. One raw DUE burst contains 10 FIFO
-  frames, so `bin_merge.py` expands bursts into the 200 Hz tactile stream.
-- Loadcell is aligned to the same 200 Hz common timeline and converted with
-  `Fz = (kg - kg_baseline) * 9.80665`.
-- EtherMotion is logged much faster, around 1000 Hz or higher, and provides
-  high-resolution `x/y/z/u` labels. It is interpolated onto the 200 Hz common
-  timeline; the final training row count is not expanded to EtherMotion rate.
-- `z_stage_mm` and `z_depth_mm` preserve EtherMotion command precision at about
-  `0.0001 mm`; do not bin Z coarsely when the goal is `0.xx mm` behavior.
-- `u_mm` is a node-internal wait/virtual axis. It is not physical shear and is
-  not the depth source. SATS uses all rows by default.
-
-This means the recommended learning row is:
-
-```text
-input[t] = DUE s1..s16 at 200 Hz
-Fz[t]    = loadcell Fz interpolated to t
-Z[t]     = EtherMotion z interpolated to t
-GT[t]    = Boussinesq pressure map from x/y/Fz/diameter
-```
-
-## GT Modes
-
-Two GT paths are available:
-
-```text
-precomputed  : legacy path, stores learning_data/gt/*_targets.npy
-on_the_fly   : CPU worker path, generates dense GT during DataLoader fetch
-gpu_on_the_fly: optimized path, sends compact GT metadata and builds batch GT on GPU
-```
-
-The default remains `precomputed`, so existing runs are unchanged. The new
-on-the-fly modes avoid writing dense GT files of about 18 GB per d5 trial.
-For `0.25 mm`, `0.2 mm`, or `0.1 mm` output grids, prefer
-`gpu_on_the_fly`; the CPU `on_the_fly` mode is mainly a compatibility/debug
-path for the original `41 x 41` grid.
-
-Current on-the-fly GT assumptions:
-
-```text
-z_s_mm                  = 2.0 fixed
-beta/FEM correction     = none
-indenter model          = spherical
-contact radius          = sqrt(R * z_depth_mm), R = diameter / 2
-contact starts at d5    = z_depth_mm > 0.001
-minimum contact radius  = 0.05 mm
-z-depth sample bins     = 0.005 mm
-pressure map grid       = 41 x 41, 0.5 mm XY spacing
-```
-
-The high-resolution EtherMotion Z signal is preserved in `merged.bin` at about
-`0.0001 mm`, but training samples are balanced by `0.005 mm` z-depth bins to
-avoid over-weighting repeated plateau rows.
-
-Example on-the-fly training command:
-
-First build compact metadata cache from merged BIN data. This does not save
-dense pressure maps; it stores normalized sensor windows and compact
-`diameter/x/y/z_depth/Fz` metadata.
+## 빠른 시작
 
 ```bash
-python3 -m sats.training.build_gt_meta_cache \
-  --raw-dir learning_data/sensor_raw_bin \
-  --out-dir learning_data/gt_meta_cache \
-  --exclude-diameters 10 \
-  --grid-step-mm 0.5
+pip install -r requirements.txt          # = deformable_sats/requirements.txt (torch 2.9.0+cu128 고정) + PyYAML, pytest
+
+# robot_skin + common 테스트 (CPU, 결정적; 루트 pytest.ini: pythonpath = . deformable_sats)
+python -m pytest -q -p no:cacheprovider robot_skin/tests common/tests
+# 저장소 전체 (deformable_sats 테스트 포함 — 아래 "알려진 테스트 실패")
+pytest
 ```
 
-Then train from that cache:
+### 하드웨어 없이 robot_skin 전체 경로 (합성 데이터)
 
 ```bash
-python3 -m sats.training.train_e2e \
-  --gt-mode gpu_on_the_fly \
-  --raw-dir learning_data/sensor_raw_bin \
-  --gt-meta-cache-dir learning_data/gt_meta_cache \
-  --z-depth-min-mm 0.001 \
-  --z-balance-bin-width-mm 0.005 \
-  --min-contact-radius-mm 0.05 \
-  --exclude-diameters 10 \
-  --run-name e2e_d5_onthefly
+R=/tmp/rs
+python -m robot_skin synth --out $R/raw                     # 합성 glove raw 세션 8개 (D1 4 + D2 4)
+python -m robot_skin preprocess --raw $R/raw --out $R/processed
+python -m robot_skin pipeline --processed $R/processed --out $R/runs --hardware cpu \
+    --set train.max_steps=30 --set train.warmup_steps=5 --set vtla.image.image_size='[24, 32]'
+python -m robot_skin deploy --set bundle=$R/runs/vtla --set duration_s=2 --set out_dir=$R/deploy
 ```
 
-High-resolution grid examples:
+`pipeline` 은 `splits.json` 하나를 만들어 imu_pose → baseline → contact → pretrain → vtla 를 순서대로 학습하고
+산출물을 이어 준다(`$R/runs/<stage>/`, `$R/runs/pipeline.json`). `deploy` 는 정책 번들을 가짜 로봇 핸드 + 가짜 카메라로
+200 Hz 폐루프 실행하고 `$R/deploy/metrics.json` 과 다시 전처리할 수 있는 raw 세션을 남긴다. 네 명령 모두 이 저장소의
+4 코어 CPU VM(GPU 없음)에서 실행해 확인했고 합쳐 약 30 초 걸렸다. 모델이 작고 30 step 이라 지표에는 의미가 없다 —
+배관 점검이다. 단계별 설명은 [`docs/TRAINING.md`](docs/TRAINING.md) §1.3.
+
+### 실제 데이터
 
 ```bash
-# 0.25 mm virtual grid, 81 x 81 output
-python3 -m sats.training.train_e2e \
-  --gt-mode gpu_on_the_fly \
-  --raw-dir learning_data/sensor_raw_bin \
-  --gt-meta-cache-dir learning_data/gt_meta_cache \
-  --exclude-diameters 10 \
-  --grid-step-mm 0.25 \
-  --batch-size 2048 \
-  --num-workers 6 \
-  --prefetch-factor 2 \
-  --run-name e2e_d5_gpu_gt_g025
-
-# 0.1 mm virtual grid, 201 x 201 output. Start smaller because target memory
-# grows about 24x compared with 41 x 41.
-python3 -m sats.training.train_e2e \
-  --gt-mode gpu_on_the_fly \
-  --raw-dir learning_data/sensor_raw_bin \
-  --gt-meta-cache-dir learning_data/gt_meta_cache \
-  --exclude-diameters 10 \
-  --grid-step-mm 0.1 \
-  --batch-size 1024 \
-  --num-workers 4 \
-  --prefetch-factor 2 \
-  --run-name e2e_d5_gpu_gt_g010
+python -m robot_skin record glove --protocol d1_motion --subject S01 --dry-run   # 계획·운영자 대본만 (장비 없이)
+python -m robot_skin record glove --protocol d1_motion --subject S01 --fake --time-scale 0.05   # 합성 소스로 end-to-end
+python -m robot_skin preprocess                          # robot_skin/data/raw → robot_skin/data/processed
+python -m robot_skin env                                 # GPU/torch 점검, 추천 하드웨어 프로파일
+python -m robot_skin pipeline --hardware rtx5090         # → robot_skin/runs/<stage>/
+python -m robot_skin deploy --set bundle=robot_skin/runs/vtla
 ```
 
-Use a denser virtual XY pressure map by changing the GT/model grid, not by
-recollecting raw data. For example, `81 x 81` over the same `[-10, 10] mm` area
-gives `0.25 mm` virtual taxel spacing. The current raw scan centers are still
-collected every `0.5 mm`, so finer XY output improves map resolution but does
-not create new sub-0.5mm press-center labels by itself.
+`record` 는 `--out`/`--root` 를 생략하면 `robot_skin/data/raw/<dataset>/<subject>/…` 에 쓴다(`--dry-run` 도 계획을
+`…/dry_run/session.json` 으로 남긴다). 앞의 두 줄(`--dry-run`, `--fake`)과 `env` 는 이 VM 에서 실행해 확인했다.
+실제 장비 입력(IMU 허브, ROS joint state, 로봇 핸드 드라이버, mk555 `.bin` 로더)은 아직 인터페이스만 있다 —
+[`docs/DATA_ACQUISITION.md`](docs/DATA_ACQUISITION.md), [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) §7.
 
-In `train_e2e.py`, `--local-map-size 0` is the default. It automatically scales
-the local decoder's physical footprint with `--grid-step-mm`: `0.5 mm -> 15`,
-`0.25 mm -> 29`, `0.2 mm -> 37`, and `0.1 mm -> 71`.
+### 공유 규약 (Python)
 
-## Build Learning Data
+```python
+from common.signal import relative_change, estimate_baseline
+from common.layouts import load_layout
+from robot_skin.contact import OrdinalQuantizer
 
-Run from repository root:
+layout = load_layout("glove_template")          # 손끝 5 + 손바닥 2×2, parent = MANO 세그먼트, IMU 7개
+delta = relative_change(raw, estimate_baseline(raw, n_samples=200))   # SATS 규약 ΔS% (누르면 음수)
+levels = OrdinalQuantizer(weak_pct=3, strong_pct=15)(delta)          # 0 무접촉 / 1 약 / 2 강 / 3 포화
+```
+
+규약: ΔS SATS 부호(누르면 음수; 접촉 로직은 `press_intensity = −ΔS`), 쿼터니언 wxyz, 6D 회전 = 회전행렬 첫 두 열,
+MANO 관절 순서, 시간 s, 위치 m.
+
+### 기존 SATS 워크플로
 
 ```bash
-python3 sats/preprocessing/prepare_learning_data.py \
-  --source-root skin_ws/raw_data \
-  --learning-root learning_data
+cd deformable_sats                       # 커맨드는 예전과 동일, 디렉터리만 이동
+python -m sats.training.train_e2e --help
 ```
 
-The script discovers raw BIN trial folders, assigns stable `testN` numbers via
-`learning_data/trial_registry.json`, writes merged BIN files, and generates
-Boussinesq pressure-map GT files under `learning_data/gt`.
+## 알려진 테스트 실패 (main 과 동일, 이동과 무관)
 
-To preview what will be processed without writing:
-
-```bash
-python3 sats/preprocessing/prepare_learning_data.py --dry-run --stage all
-```
-
-To process only one new trial, use the planned output from dry-run and run the
-merge/GT tools against that specific trial, or run `prepare_learning_data.py`
-after confirming the registry mapping. Existing `testN` numbers are append-only.
-
-For on-the-fly GT training, dense `learning_data/gt/*_targets.npy` files are not
-required. You still need the merged BIN and baseline artifacts under
-`learning_data/sensor_raw_bin`.
-
-## Raw BIN Sufficiency Check
-
-Before running long training, inspect whether the raw BIN archive has enough
-usable data and consistent coverage.
-
-Quick file/record check:
-
-```bash
-python3 sats/tools/analyze_raw_bins.py \
-  --source-root skin_ws/raw_data \
-  --source-material "eco20 + mesh" \
-  --diameter d5 \
-  --out sats/tools/raw_bin_sufficiency_quick.csv
-```
-
-Full distribution check:
-
-```bash
-python3 sats/tools/analyze_raw_bins.py \
-  --source-root skin_ws/raw_data \
-  --source-material "eco20 + mesh" \
-  --diameter d5 \
-  --full \
-  --out sats/tools/raw_bin_sufficiency_full.csv
-```
-
-The full report builds the same 200 Hz merged rows in memory and summarizes:
-
-```text
-source stream row counts and rates
-merged row count and duration
-covered XY cells
-per-XY sequence length distribution
-z_depth range
-Fz distribution
-active contact row ratio
-```
-
-Use this report to confirm that each trial reaches the expected `2.5 mm` d5
-depth, has comparable force distribution, covers all `41 x 41` XY points, and
-does not have abnormal sequence lengths or missing streams.
-
-## Current Dataset (2026-07 기준)
-
-`learning_data/sensor_raw_bin` 병합 완료 31 trials:
-
-```text
-eco20_xy1   : d5 x3 + d10 x3  (6)
-eco50_xy1   : d5 x3 + d10 x3  (6)   # d10 test3 loadcell tare 교정됨 (retare_meta_cache)
-ecomesh_xy1 : d5 x3 + d10 x3  (6)
-ecomesh_xy0p5 : d5 x10 + d10 x3 (13)  # 최종 모델 학습 데이터
-```
-
-GT meta cache: `learning_data/gt_meta_cache_xy_d5d10_g05` (31개 + manifest, grid-step 0.5).
-trial 번호 추적: `learning_data/trial_registry.json`, controlled 비교용 인덱스: `learning_data/trial_indices/`.
-
-## SATS Training (현행 = train_e2e + 크기입력 A)
-
-현행 학습은 **`train_e2e` 단일 커맨드** (위 on-the-fly GT 예시 참조)에
-`--use-indenter-size-input`(A)을 켠 구성이 최종이다. 현행 run:
-
-```text
-sats/training/runs/size_input/           # 최종 flat 모델 (ecomesh xy0.5)
-sats/training/runs/size_input_material/  # 소재 비교 대표 fold (eco20 f2 / eco50 f1 / ecomesh f3)
-```
-
-재현 러너는 `scripts/`(예: `scratchpad_rollout_A.sh`), 진단·figure 재생성은
-`sats/tools/eval_diagnostics.py` + `history/fig_data/visualizing_scripts/`.
-
-Default training follows the paper-style SATS data contract:
-
-```text
-raw cycle cap:  seq_len = 1000      # keeps loading peak around timestep 820-860
-sample input:   sensor_window [B, 10, 16]
-sample target:  pressure map  [B, 41, 41] at the window's last timestep
-split:          random sequence-level train/val split, val_ratio = 0.2
-```
-
-`--use-window-dataset` is enabled by default. Use `--no-use-window-dataset`
-only for the older peak-map experiment:
-
-```text
-old mode: sensor_seq [B, 1000, 16] -> peak pressure map [B, 41, 41]
-```
-
-### Legacy: 4단계 분리 학습 (train_lstm → attention → local_map → cnn)
-
-초기 재현용으로 유지되는 단계별 파이프라인이다. 현행 실험은 모두 `train_e2e`를 사용한다.
-
-```bash
-# 예시 (legacy): 단계별 학습 체인
-python3 -m sats.training.train_lstm      --run-name lstm_run --epochs 50 --batch-size 2048 --device cuda
-python3 -m sats.training.train_attention --lstm-ckpt sats/training/runs/lstm_run/best_model.pt --run-name attn_run ...
-python3 -m sats.training.train_local_map --attn-ckpt sats/training/runs/attn_run/best_model.pt --run-name local_run ...
-python3 -m sats.training.train_cnn       --local-map-ckpt sats/training/runs/local_run/best_model.pt --run-name cnn_run ...
-```
-
-Batch tuning rule for 2 to 10 sets:
-
-```text
-default:       batch_size=2048, num_workers=2
-RAM pressure:  batch_size=1024, num_workers=1 or 0
-stable/idle:   batch_size=4096, num_workers=2
-```
-
-Judge tuning by epoch time and RAM stability, not by whether instantaneous GPU
-utilization stays fixed at 90%.
-
-## Legacy / Alternate Paths
-
-- `hitmap/` contains the newer CSV/Zarr based XY heatmap and Z/Fz regressor
-  experiments.
-- `sats/preprocessing/raw_merge.py` and CSV exports are compatibility surfaces.
-  For current mk555 SATS data, prefer raw BIN -> merged BIN.
-
-## Directory Map
-
-- `skin_ws/`: raw acquisition archive, node files, acquisition scripts.
-- `learning_data/`: managed SATS merged BIN and GT meta cache workspace (대용량, git-ignored).
-- `sats/`: SATS preprocessing, GT generation, training(e2e+A), inference, tools(eval_diagnostics), **bending/**(밴딩 보상 모듈).
-- `scripts/`: 실험 러너·검증 스크립트 (구 루트 scratchpad_* — `scripts/README.md`).
-- `history/fig_data/`: **논문 워크스페이스** — Figure(fig1~4)·supplementary·experiments_archive·투고 체크리스트.
-- `hitmap/`: Zarr/heatmap/Z-Fz experimental training pipelines (legacy, 데이터 컨트랙트 다름).
-- `cnn_lstm/`: 사이드 프로젝트.
+- `deformable_sats/sats/training/tests/test_phase0_data_layout.py` — git-ignored raw 데이터 필요
+- `deformable_sats/hitmap/tests/test_zarr_index_resolution.py`, `test_depth_contract.py` — zarr 2.16 고정,
+  zarr 3 환경에서는 실패

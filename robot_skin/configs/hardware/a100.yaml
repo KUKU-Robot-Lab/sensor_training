@@ -1,0 +1,32 @@
+# Hardware profile: NVIDIA A100 80GB (Ampere datacenter, compute capability 8.0).
+name: a100
+gpu:
+  vendor: nvidia
+  model: A100-SXM4-80GB
+  arch: ampere
+  compute_capability: [8, 0]
+  memory_gb: 80
+  bf16: true
+  min_torch_cuda: "11.0"
+
+train:
+  device: auto
+  precision: bf16
+  tf32: true
+  compile: true
+  num_workers: 16
+  pin_memory: true
+
+suggest:                    # same effective batch as rtx5090, without accumulation
+  imu_pose: {batch_size: 512, grad_accum: 1}
+  baseline: {batch_size: 1024, grad_accum: 1}
+  contact:  {batch_size: 512, grad_accum: 1}
+  pretrain: {batch_size: 256, grad_accum: 1}
+  vtla:     {batch_size: 128, grad_accum: 1}
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+
+notes: >-
+  For the 40 GB variant halve the vtla batch and set grad_accum 2. Multi-GPU A100 nodes
+  (NVLink) are the only setting where DDP across many GPUs scales well for VTLA.

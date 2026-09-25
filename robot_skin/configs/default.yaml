@@ -1,0 +1,47 @@
+# robot_skin top-level defaults, read by `python -m robot_skin` (robot_skin/__main__.py) through
+# robot_skin.config.load_config(path=None, overrides=None): data / run paths, the stage config files,
+# the pipeline's stage list and its shared split policy, the default hardware profile.
+#
+# Hyper-parameters are NOT here: every stage reads (and validates) its own YAML in configs/stages/
+# (preprocess, imu_pose, baseline, contact, pretrain, vtla, deploy); hardware profiles are in
+# configs/hardware/. Conventions everywhere: ΔS in % (SATS sign: press → negative), time in s,
+# positions in m, quaternions wxyz, 6D rotation = first two matrix columns, MANO joint order.
+
+paths:
+  raw_root: robot_skin/data/raw              # recorded sessions (acquisition loggers --root; preprocess --raw)
+  processed_root: robot_skin/data/processed  # episodes <dataset>/<episode_id> (preprocess --out; stage data.processed_root)
+  runs_root: robot_skin/runs                 # pipeline --out: <runs_root>/<stage>/, splits.json, pipeline.json
+  synthetic_root: robot_skin/data/synthetic  # `synth` output (synthetic raw sessions — keep apart from real data)
+
+hardware: null          # default --hardware for train / pipeline / deploy: rtx5090 | rtx4090 | rtx3090 | a100 |
+                        # cpu | auto | a profile YAML path | null (each stage YAML's own `hardware`)
+
+stages:                 # stage config files (bare names: robot_skin/configs/stages/<name>)
+  preprocess: preprocess.yaml
+  imu_pose: imu_pose.yaml
+  baseline: baseline.yaml
+  contact: contact.yaml
+  pretrain: pretrain.yaml
+  vtla: vtla.yaml
+  deploy: deploy.yaml
+
+pipeline:
+  stages: [imu_pose, baseline, contact, pretrain, vtla]   # always run in this order
+  splits:               # one splits.json (datasets.splits.make_splits) shared by every stage
+    file: splits.json   # <runs>/splits.json, created once (delete it — and --force — to re-split)
+    by: subject         # group key: subject | session | object | task | dataset | kind | episode_id
+    val_frac: 0.15
+    test_frac: 0.15
+    seed: 0
+    datasets: [motion, task]
+    holdout: null       # e.g. {subject: [S07]} → test, or {val: {task: [pour]}}
+
+synthetic:              # `python -m robot_skin synth` defaults (datasets.synthetic.generate_dataset)
+  kind: glove
+  n_motion: 4
+  n_task: 4
+  subjects: [s0, s1, s2, s3]
+  seed: 0
+  duration_s: 8.0       # ≥ 6.5 s so D1 sessions include the air_grasp block
+  cameras: [ego]
+  image_hw: [24, 32]

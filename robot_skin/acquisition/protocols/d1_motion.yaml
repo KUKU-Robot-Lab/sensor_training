@@ -1,0 +1,205 @@
+# D1 "motion" protocol — free hand motion WITHOUT objects: vision (ego + third) + 7 glove IMUs +
+# tactile taxels. One session = one pass through all blocks (~5.5 min of blocks + operator pauses).
+#
+# Purpose of the data
+#   - no_contact blocks  → motion-induced tactile baseline predictor (ΔS artefact vs hand motion);
+#                          air_grasp_* = D2 grasp hand shapes held in the air, so the baseline has seen
+#                          grasp-like poses without contact (otherwise it under-predicts their artefact
+#                          out of distribution and D2 grasps read as false contact)
+#   - self_touch blocks  → contact-detector calibration with "free" labels (hand geometry)
+#   - everything         → IMU → MANO hand-pose model (labels: offline vision, hand_pose.npz)
+#   - imu_calibration    → per-session IMU mounting offsets (manifest.calibration)
+#   - sync_start/_end    → 3-tap cross-stream clock sync (start & end → offset + drift)
+#
+# Block schema (validated by robot_skin.acquisition.protocol.load_protocol):
+#   id           step/phase name (lower_snake_case); `for_each` appends _<value>
+#   kind         static | calibration | sync | motion | self_touch
+#   duration_s   fixed duration, or cycle_s × repetitions (metronome-paced cycles)
+#   contact      none (must be contact-free) | self (self-touch) | object | any
+#   labels       manifest segment labels (default: none→[no_contact], self→[self_touch])
+#   speed        static | slow | medium | fast | mixed
+#   motion/pose  motion pattern (operator script + synthetic --fake generator)
+#   for_each     {key: [values]} → one step per value (e.g. per finger)
+#   prompt       operator script (Korean; {finger_ko} {axis_ko} {repetitions} {cycle_s} {duration_s})
+#   prompt_en    English script (optional)
+# See docs/DATA_ACQUISITION.md for the full operator procedure.
+name: d1_motion
+version: 1
+dataset: motion
+kind: glove
+description: >-
+  D1 free-motion session: static baselines, flat-hand IMU calibration, per-finger flexion,
+  whole-hand open/close (slow/fast), wrist rotations, random free motion, contact-free "air grasps"
+  (D2 grasp shapes held without an object, slow/fast) and a self-touch set (thumb pinches, fist,
+  finger crossing, finger-to-palm), bracketed by 3-tap sync at start and end.
+cameras: [ego, third]
+rates: {pressure: 200.0, imu: 100.0, camera: 30.0, hand_pose: 30.0}
+timing:
+  lead_in_s: 1.0        # recording before the first block starts
+  transition_s: 1.0     # nominal pause between blocks (operator-paced in real runs)
+  lead_out_s: 1.0       # recording after the last block
+  min_step_s: 0.5       # floor when durations are shrunk with --time-scale
+sync:
+  taps: 3
+  intervals_s: [0.6, 1.2]   # short–long rhythm ("탁-탁---탁"): unequal spacing removes lag ambiguity
+  lead_s: 1.0               # still time before the first tap
+  tail_s: 1.5               # still time after the last tap
+  finger: index             # tapping fingertip (taxel group finger_index)
+
+blocks:
+  - id: baseline_start
+    kind: static
+    pose: rest
+    duration_s: 5
+    contact: none
+    speed: static
+    prompt: "손에 힘을 빼고 공중에 띄운 채 {duration_s}초간 정지한다. 손가락·손바닥이 아무것에도 닿지 않게 한다 (팔뚝만 받침대에)."
+    prompt_en: "Relax the hand in the air and hold still for {duration_s} s; nothing touches the glove."
+
+  - id: sync_start
+    kind: sync
+    prompt: "검지 끝으로 싱크 패드를 '탁-탁---탁' (짧게-길게) 3번 친다. 두 카메라에 손이 보여야 한다."
+    prompt_en: "Tap the sync pad with the index fingertip three times, short-long rhythm, in view of both cameras."
+
+  - id: imu_calibration
+    kind: calibration
+    pose: flat_hand
+    duration_s: 5
+    contact: none
+    labels: [calibration, no_contact]
+    speed: static
+    prompt: "보정 자세: 손가락을 모두 붙여 곧게 펴고 손바닥을 아래로, 손을 수평으로 공중에 띄워 {duration_s}초간 완전히 정지."
+    prompt_en: "Calibration pose: flat hand, fingers together and straight, palm down, level, in the air; hold still."
+
+  - id: finger_flex
+    kind: motion
+    motion: finger_flex
+    for_each: {finger: [thumb, index, middle, ring, pinky]}
+    cycle_s: 2.0
+    repetitions: 5
+    contact: none
+    speed: slow
+    prompt: "{finger_ko} 손가락만 천천히 끝까지 굽혔다 편다 ({cycle_s}초 주기 × {repetitions}회). 다른 손가락은 힘을 뺀 채 유지, 손끝이 손바닥에 닿지 않게."
+    prompt_en: "Slowly flex and extend only the {finger} finger ({cycle_s} s per cycle, {repetitions} times) without touching the palm."
+
+  - id: open_close_slow
+    kind: motion
+    motion: open_close
+    cycle_s: 2.0
+    repetitions: 8
+    contact: none
+    speed: slow
+    prompt: "손 전체를 천천히 쥐었다 편다 ({cycle_s}초 주기 × {repetitions}회). 주먹을 끝까지 쥐지 말고 손끝이 손바닥에 닿기 직전까지만."
+    prompt_en: "Slowly open and close the whole hand; stop just before the fingertips reach the palm."
+
+  - id: open_close_fast
+    kind: motion
+    motion: open_close
+    cycle_s: 0.7
+    repetitions: 12
+    contact: none
+    speed: fast
+    prompt: "같은 동작을 빠르게 ({cycle_s}초 주기 × {repetitions}회). 손끝이 손바닥에 닿지 않게."
+    prompt_en: "Same open/close, fast ({cycle_s} s per cycle); no fingertip-palm contact."
+
+  - id: wrist_rotation
+    kind: motion
+    motion: wrist_rotation
+    for_each: {axis: [pronation_supination, flexion_extension, radial_ulnar]}
+    cycle_s: 3.0
+    repetitions: 4
+    contact: none
+    speed: slow
+    prompt: "손 모양은 편안히 유지하고 손목만 {axis_ko} 방향으로 끝까지 왕복 ({cycle_s}초 주기 × {repetitions}회)."
+    prompt_en: "Keep the hand relaxed and rotate the wrist through {axis} ({cycle_s} s per cycle, {repetitions} times)."
+
+  - id: free_motion
+    kind: motion
+    motion: free
+    duration_s: 30
+    contact: none
+    speed: mixed
+    prompt: "{duration_s}초 동안 자유롭게 손가락·손목을 섞어 움직인다 (빠름/느림 섞기, 손가락 벌리기 포함). 아무것도, 자기 손끼리도 닿지 않게."
+    prompt_en: "Move fingers and wrist freely for {duration_s} s, mixing speeds and spreads; no contact at all."
+
+  # "air grasps": the hand shapes of the D2 grasps (d2_task.yaml grasp types), formed around an
+  # IMAGINARY object and held — nothing touches the glove, not even the own hand (fingertips stay
+  # ≥ 1 cm apart). Without these the baseline predictor never sees grasp-like finger poses without
+  # contact and under-predicts their motion artefact on D2 (false contacts).
+  - id: air_grasp_slow
+    kind: motion
+    motion: air_grasp
+    for_each: {grasp: [power, precision, lateral, tripod]}
+    cycle_s: 4.0
+    repetitions: 3
+    contact: none
+    speed: slow
+    prompt: "물체 없이 공중에서 {grasp_ko} 손모양을 천천히 만들어 약 1초 유지한 뒤 편다 ({cycle_s}초 주기 × {repetitions}회). 가상의 물체를 쥐듯 하되 손끝·손바닥이 아무것에도, 자기 손에도 닿지 않게 (손끝 사이 1 cm 이상)."
+    prompt_en: "Without any object, slowly form the {grasp} grasp shape in the air around an imaginary object, hold ~1 s and open ({cycle_s} s per cycle, {repetitions} times); nothing, not even the own hand, touches the glove (fingertips >= 1 cm apart)."
+
+  - id: air_grasp_fast
+    kind: motion
+    motion: air_grasp
+    for_each: {grasp: [power, precision, lateral, tripod]}
+    cycle_s: 1.5
+    repetitions: 4
+    contact: none
+    speed: fast
+    prompt: "같은 {grasp_ko} 손모양을 빠르게 만들었다 편다 ({cycle_s}초 주기 × {repetitions}회). 손끝끼리·손바닥에 닿지 않게."
+    prompt_en: "Form and release the {grasp} grasp shape quickly in the air ({cycle_s} s per cycle, {repetitions} times); no self-contact."
+
+  - id: pinch
+    kind: self_touch
+    motion: pinch
+    for_each: {finger: [index, middle, ring, pinky]}
+    cycle_s: 2.0
+    repetitions: 5
+    contact: self
+    speed: slow
+    prompt: "엄지 끝과 {finger_ko} 끝을 맞대고 살짝→꾹 눌렀다 뗀다 ({cycle_s}초 주기 × {repetitions}회)."
+    prompt_en: "Pinch thumb tip against the {finger} tip, light then firm, and release ({repetitions} times)."
+
+  - id: fist
+    kind: self_touch
+    motion: fist
+    cycle_s: 2.5
+    repetitions: 5
+    contact: self
+    speed: slow
+    prompt: "주먹을 끝까지 꽉 쥐었다 완전히 편다 ({cycle_s}초 주기 × {repetitions}회). 손끝이 손바닥을 누르도록."
+    prompt_en: "Make a tight fist (fingertips pressing the palm) and open fully ({repetitions} times)."
+
+  - id: finger_crossing
+    kind: self_touch
+    motion: finger_crossing
+    cycle_s: 2.5
+    repetitions: 4
+    contact: self
+    speed: slow
+    prompt: "검지와 중지를 꼬았다(행운 표시) 푼다 ({cycle_s}초 주기 × {repetitions}회)."
+    prompt_en: "Cross the index and middle fingers and uncross ({repetitions} times)."
+
+  - id: palm_touch
+    kind: self_touch
+    motion: palm_touch
+    for_each: {finger: [thumb, index, middle, ring, pinky]}
+    cycle_s: 2.0
+    repetitions: 4
+    contact: self
+    speed: slow
+    prompt: "{finger_ko} 끝을 같은 손 손바닥에 닿게 굽혀 눌렀다 편다 ({cycle_s}초 주기 × {repetitions}회)."
+    prompt_en: "Curl the {finger} fingertip onto the palm of the same hand, press, and extend ({repetitions} times)."
+
+  - id: sync_end
+    kind: sync
+    prompt: "시작과 같은 방법으로 '탁-탁---탁' 3번 친다 (시계 드리프트 측정)."
+    prompt_en: "Repeat the three short-long taps (clock drift measurement)."
+
+  - id: baseline_end
+    kind: static
+    pose: rest
+    duration_s: 5
+    contact: none
+    speed: static
+    prompt: "처음과 같은 편안한 자세로 공중에서 {duration_s}초간 정지 (baseline 드리프트 확인)."
+    prompt_en: "Hold the relaxed rest pose in the air for {duration_s} s (baseline drift check)."

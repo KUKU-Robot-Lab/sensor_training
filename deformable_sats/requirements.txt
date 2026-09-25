@@ -1,0 +1,25 @@
+# Sensor training environment
+#
+# Recommended conda bootstrap:
+#   conda create -n sensor python=3.10
+#   conda activate sensor
+#   conda env config vars set PYTHONNOUSERSITE=1 MPLCONFIGDIR=/tmp/matplotlib-cache
+#   conda deactivate && conda activate sensor
+#   mkdir -p /tmp/matplotlib-cache
+#   pip install -r requirements.txt
+#
+# PYTHONNOUSERSITE=1 prevents ~/.local Python packages from leaking into the
+# conda env. This is required if a user-site torch/numpy install exists.
+
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+torch==2.9.0+cu128
+numpy==1.26.4
+pandas==2.3.3
+scipy==1.15.3
+scikit-learn==1.7.2
+zarr==2.16.1
+numcodecs==0.13.1
+matplotlib==3.10.8
+tqdm==4.67.3
+joblib==1.5.3

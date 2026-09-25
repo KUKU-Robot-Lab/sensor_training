@@ -1,0 +1,26 @@
+# Tactile glove template: 5 fingertip pads + 2x2 palm pad (9 taxels), 7 IMU sites.
+# `parent` = MANO segment name (see common.layouts.MANO_SEGMENTS); positions are in that
+# segment's local frame (approximate, measure on the real glove and overwrite).
+# Channels are the logger's raw channel index.
+name: glove_template
+units: mm
+parent_frame: mano
+meta: {template: true, note: "replace positions/normals with measured values per glove build"}
+taxels:
+  - {id: thumb_tip,  channel: 0, parent: thumb3,  position: [0.0, -6.0, 12.0], normal: [0.0, -1.0, 0.3], groups: [fingertip, finger_thumb]}
+  - {id: index_tip,  channel: 1, parent: index3,  position: [0.0, -6.0, 10.0], normal: [0.0, -1.0, 0.3], groups: [fingertip, finger_index]}
+  - {id: middle_tip, channel: 2, parent: middle3, position: [0.0, -6.0, 10.0], normal: [0.0, -1.0, 0.3], groups: [fingertip, finger_middle]}
+  - {id: ring_tip,   channel: 3, parent: ring3,   position: [0.0, -6.0, 10.0], normal: [0.0, -1.0, 0.3], groups: [fingertip, finger_ring]}
+  - {id: pinky_tip,  channel: 4, parent: pinky3,  position: [0.0, -5.0, 8.0],  normal: [0.0, -1.0, 0.3], groups: [fingertip, finger_pinky]}
+  - {id: palm_00,    channel: 5, parent: palm,    position: [-12.0, -12.0, 30.0], normal: [0.0, -1.0, 0.0], groups: [palm]}
+  - {id: palm_01,    channel: 6, parent: palm,    position: [12.0, -12.0, 30.0],  normal: [0.0, -1.0, 0.0], groups: [palm]}
+  - {id: palm_10,    channel: 7, parent: palm,    position: [-12.0, -12.0, 55.0], normal: [0.0, -1.0, 0.0], groups: [palm]}
+  - {id: palm_11,    channel: 8, parent: palm,    position: [12.0, -12.0, 55.0],  normal: [0.0, -1.0, 0.0], groups: [palm]}
+imu_sites:
+  - {name: wrist,  parent: wrist}
+  - {name: palm,   parent: palm}
+  - {name: thumb,  parent: thumb3}
+  - {name: index,  parent: index3}
+  - {name: middle, parent: middle3}
+  - {name: ring,   parent: ring3}
+  - {name: pinky,  parent: pinky3}

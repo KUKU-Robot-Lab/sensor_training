@@ -1,0 +1,17 @@
+# Robot hand template: 5 fingertip pads + 2x2 palm pad (same topology as glove_template).
+# `parent` = URDF link name. The names below are placeholders — rename them to the links of
+# the actual hand URDF (robot_skin.pose.robot_fk resolves them via forward kinematics).
+name: robot_hand_template
+units: mm
+parent_frame: urdf
+meta: {template: true, note: "rename parent links to the target URDF"}
+taxels:
+  - {id: thumb_tip,  channel: 0, parent: thumb_distal_link,  position: [0.0, 0.0, 15.0], normal: [1.0, 0.0, 0.0], groups: [fingertip, finger_thumb]}
+  - {id: index_tip,  channel: 1, parent: index_distal_link,  position: [0.0, 0.0, 15.0], normal: [1.0, 0.0, 0.0], groups: [fingertip, finger_index]}
+  - {id: middle_tip, channel: 2, parent: middle_distal_link, position: [0.0, 0.0, 15.0], normal: [1.0, 0.0, 0.0], groups: [fingertip, finger_middle]}
+  - {id: ring_tip,   channel: 3, parent: ring_distal_link,   position: [0.0, 0.0, 15.0], normal: [1.0, 0.0, 0.0], groups: [fingertip, finger_ring]}
+  - {id: pinky_tip,  channel: 4, parent: pinky_distal_link,  position: [0.0, 0.0, 12.0], normal: [1.0, 0.0, 0.0], groups: [fingertip, finger_pinky]}
+  - {id: palm_00,    channel: 5, parent: palm_link, position: [10.0, -15.0, 40.0], normal: [1.0, 0.0, 0.0], groups: [palm]}
+  - {id: palm_01,    channel: 6, parent: palm_link, position: [10.0, 15.0, 40.0],  normal: [1.0, 0.0, 0.0], groups: [palm]}
+  - {id: palm_10,    channel: 7, parent: palm_link, position: [10.0, -15.0, 70.0], normal: [1.0, 0.0, 0.0], groups: [palm]}
+  - {id: palm_11,    channel: 8, parent: palm_link, position: [10.0, 15.0, 70.0],  normal: [1.0, 0.0, 0.0], groups: [palm]}

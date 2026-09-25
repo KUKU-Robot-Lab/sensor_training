@@ -1,0 +1,134 @@
+# Stage `vtla`: vision + tactile + language → action-chunk policy on D2 task episodes.
+# Runner: robot_skin.stages.vtla.run(cfg)  (python -m robot_skin.stages.vtla --config <this> --set k=v)
+# Needs the contact stage's derived residual_z / contact_level (data.tactile_source auto falls back to
+# a warned BOOTSTRAP static baseline — tests / bring-up only). Optional: pretrain stage encoder_state.pt.
+# Outputs <out_dir>/policy_bundle.pt (build_policy_from_bundle / control) + metrics.json.
+# Keys mirror robot_skin.stages.vtla.DEFAULTS (kept in sync by a test).
+stage: vtla
+hardware: null                  # rtx5090 | rtx4090 | rtx3090 | a100 | cpu | auto | null (suggest.vtla batch)
+hardware_applied: false         # load_stage_config sets it after applying `hardware` (then --set overrides win)
+out_dir: null                   # null → train.out_dir
+
+data:
+  processed_root: robot_skin/data/processed
+  datasets: [task]              # D2 task episodes
+  episodes: null                # explicit list of episode dirs (overrides the discovery above)
+  splits: null                  # splits.json (robot_skin.datasets.splits; share it with the pretrain stage)
+  split_by: subject             # make_splits group when splits is null: subject | object | task | session | episode
+  val_frac: 0.15
+  test_frac: 0.15
+  split_seed: 0
+  phases: task                  # task (reach…retreat) | all | [phase names] — never imitate calibration/sync blocks
+  sample_stride: null           # master frames between samples (null = policy stride; 1 = every 200 Hz frame)
+  min_valid_steps: 1            # drop ticks whose chunk has fewer valid steps
+  require_valid_state: true     # the current state (hand_pose_valid) must be a measurement
+  require_success: false        # only successful demonstrations (manifest.task.success)
+  tactile_source: auto          # auto | derived (require the contact stage) | bootstrap (tests only)
+  bootstrap: {}                 # vtla.dataset.BOOTSTRAP_DEFAULTS overrides (weak_z, strong_z, weak_pct, …)
+  contact_rule: level_ge_weak   # ContactGate input: level_ge_weak (WEAK/STRONG/SAT) | weak_or_strong
+                                # (a dead, always-saturated channel keeps level_ge_weak's gate open)
+  aux_target: label             # aux contact target: label (contact_label ≥ 0) | level | gt (synthetic)
+
+policy:
+  policy_hz: 20.0               # policy tick rate (stride = 200 / policy_hz master frames)
+  horizon: 16                   # chunk length H (ACT); 16 × 50 ms = 0.8 s
+  obs_history: 1                # policy ticks of proprio / camera frames stacked
+  chunk_offset: 1               # actions[0] = a[t + offset·stride] (1: strictly future)
+  cameras: [ego]                # camera_<name> streams used (default rig: ego, third)
+
+action:
+  kind: hand_mano               # hand_mano (54-D MANO action) | robot_joint (q)
+  rel_mode: delta               # abs | delta (wrist pos / q relative to the current state) | delta_pose
+  norm_method: std              # std | robust | minmax | none (ActionNormalizer, fit on train)
+  min_scale: 0.01               # scale floor for near-constant dims
+
+features:                       # representation.TactileFeatureSpec (a pretrained encoder's spec wins)
+  obs_mode: full                # full (6/taxel) | ordinal (4) | binary (1) | none (no tactile branch)
+  history: 1                    # stacked 200 Hz frames k
+  stride: 1                     # master ticks between stacked frames
+  z_clip: 100.0
+  z_scale: 2.0
+
+tactile:
+  pretrained: null              # pretrain stage out_dir or encoder_state.pt → initialise the TaxelEncoder
+  freeze: false                 # freeze the (pretrained) tactile encoder
+  calibrator: null              # reference to the contact stage's ResidualCalibrator (stored in the bundle)
+  baseline_model: null          # reference to the baseline stage checkpoint (stored in the bundle)
+
+vision:
+  encoder:                      # vision.build_vision_encoder cfg (a block with `type` replaces this one); null = no vision
+    type: tiny
+    out_dim: 128
+    grid: [4, 4]
+  frozen: false                 # freeze the vision encoder (pretrained towers: also set train.lr_mult)
+  cache_features: false         # cache frozen-encoder features once (implies frozen; no train augmentation)
+  cache_batch_size: 64
+
+image:                          # vision.build_transforms cfg (train augmentation + matching eval transform)
+  image_size: [96, 128]
+  scale: [0.8, 1.0]
+  brightness: 0.2
+  contrast: 0.2
+  seed: null
+  eval_crop_scale: null         # null = mean train crop area (same zoom as training)
+
+language:
+  encoder:                      # language.build_text_encoder cfg; null = no language tokens
+    type: hashing
+    dim: 128
+    max_len: 32
+  frozen: false
+
+model:                          # vtla.VTLAConfig
+  d_model: 128
+  fusion_depth: 2
+  fusion_heads: 4
+  ff_mult: 4
+  dropout: 0.1
+  n_readout: 1
+  tactile_encoder:              # representation.TaxelEncoder kwargs (ignored with tactile.pretrained)
+    d_model: 64
+    depth: 2
+    heads: 4
+    n_fourier: 6                # finest Fourier period 0.3 m / 2**5 ≈ 9 mm (above pose-label noise)
+    fourier_scale: 0.3          # m, lowest-octave period (≥ hand size)
+    ff_mult: 4
+    dropout: 0.0
+  n_tactile_tokens: 4           # TactileTokenAdapter queries K
+  tactile_heads: 4
+  tactile_gate: hard            # hard | soft ContactGate
+  head: chunk                   # chunk (ACT, masked L1) | flow (flow matching, Euler sampling)
+  head_depth: 2
+  head_heads: null              # null → fusion_heads
+  flow_steps: 10                # Euler steps K at inference
+  flow_tau: uniform             # uniform | beta (Beta(1, b): more weight on noisy τ ≈ 0)
+  flow_tau_beta_b: 1.5
+  p_drop_tactile: 0.1           # modality dropout (per sample, training only)
+  p_drop_vision: 0.0
+  p_drop_language: 0.0
+  aux_contact_weight: 0.0       # > 0 adds the per-taxel contact BCE head
+  contact_pos_weight: null
+
+eval:
+  batch_size: 64
+  seed: 0                       # flow-head sampling noise
+  flow_steps: null              # null → model.flow_steps
+  splits: [val, test]
+
+train:                          # robot_skin.train.TrainConfig (hardware profile suggest.vtla overrides batch)
+  max_epochs: 50
+  batch_size: 64
+  lr: 3.0e-4
+  weight_decay: 0.05
+  warmup_steps: 200
+  schedule: cosine
+  min_lr_ratio: 0.1
+  grad_clip: 1.0
+  precision: auto
+  ema_decay: null
+  monitor: val/loss
+  log_every: 50
+  seed: 0
+  out_dir: robot_skin/runs/vtla
+  find_unused_parameters: false # masked modalities keep their graph; true only for custom branches
+  lr_mult: null                 # e.g. {vision_encoder: 0.1, tactile_encoder: 0.1} for pretrained parts
