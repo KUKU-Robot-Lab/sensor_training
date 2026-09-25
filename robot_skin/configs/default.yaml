@@ -1,0 +1,54 @@
+# robot_skin defaults. Load with robot_skin.config.load_config(path=None, overrides=None).
+# Units: ΔS in % (SATS sign: press → negative), time in s, positions in m.
+
+layout: glove_template          # common/layouts/<name>.yaml or a path
+master_hz: 200.0                # common.timeline.MASTER_HZ
+
+signal:
+  baseline_duration_s: 1.0      # initial no-contact segment for common.signal.estimate_baseline
+  norm_method: std              # std | robust | none
+  max_abs_pct: 90.0             # |ΔS| cap for saturation_mask
+  rail_margin: 0.0
+
+baseline:                       # robot_skin.baseline.BaselinePredictor
+  hidden: 128
+  depth: 3
+  taxel_embedding_dim: 8
+  window: 20                    # frames averaged into one no-contact target
+  stride: 5
+  epochs: 50
+  batch_size: 256
+  lr: 1.0e-3
+  weight_decay: 1.0e-5
+  val_frac: 0.2
+
+contact:
+  weak_pct: 3.0                 # press intensity (−ΔS residual) for level 1
+  strong_pct: 15.0              # level 2
+  fsm:                          # SaturationFSM — defaults mirror sats/inference/run_dashboard.py quarantine
+    ok_pct: 1.5
+    ok_sec: 2.0
+    max_recover_s: 30.0
+  self_touch:
+    margin_m: 0.004
+
+representation:
+  d_model: 64
+  n_fourier: 8
+  fourier_scale_m: 0.05
+  mask_ratio: 0.3
+
+sim:
+  gain_range: [0.7, 1.3]
+  offset_pct_range: [-1.0, 1.0]
+  sat_pct_range: [40.0, 90.0]
+  noise_pct_std: 0.3
+  dropout_prob: 0.0
+
+policy:
+  obs_mode: ordinal             # full | ordinal | binary | none
+
+vtla:
+  n_query_tokens: 4
+  d_out: 512
+  gate: hard                    # hard | soft

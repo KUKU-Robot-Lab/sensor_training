@@ -1,0 +1,4 @@
+# Monorepo environment = deformable_sats pins + what common/robot_skin add.
+-r deformable_sats/requirements.txt
+PyYAML>=6.0
+pytest>=7.0

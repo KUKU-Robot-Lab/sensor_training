@@ -1,3 +1,8 @@
+> **모노레포 이동 안내** — 이 디렉터리는 예전 저장소 루트 전체입니다(`git mv` 로 한 단계 내림, 내부 구조·import 무변경).
+> **`cd deformable_sats` 후 기존 커맨드를 그대로** 쓰면 됩니다 (`python -m sats.…`, `pytest` 등).
+> 저장소 루트에서는 `pytest` 가 `pythonpath = . deformable_sats` 로 이 패키지 테스트도 함께 돌립니다.
+> 공유 신호 규약(ΔS%, baseline, 포화, 레이아웃)은 루트 `common/`, 손 전체 촉각 스킨은 `robot_skin/` — 루트 `README.md` 참조.
+
 # 16-Channel Tactile Intelligence Framework
 
 16채널 기압 기반 tactile sensor array 데이터로 sparse-to-dense pressure map,

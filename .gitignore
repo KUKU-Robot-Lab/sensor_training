@@ -1,0 +1,24 @@
+# Root ignores. deformable_sats/ keeps its own .gitignore (patterns relative to that dir).
+
+# robot_skin data / training outputs — only the READMEs are tracked
+robot_skin/data/*
+!robot_skin/data/README.md
+robot_skin/runs/*
+!robot_skin/runs/README.md
+/runs/
+/data/
+
+# model artefacts
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+
+# python / tooling
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+*.egg-info/
+*.log
