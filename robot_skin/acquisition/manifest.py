@@ -1,14 +1,25 @@
-"""SessionManifest — one JSON per recorded session describing its streams.
+"""SessionManifest — one JSON per recorded (raw) session describing its streams.
 
 Layout on disk (``robot_skin/data/`` is git-ignored)::
 
-    <session_dir>/
-      session.json            # this manifest
-      pressure.bin | .npz     # stream files (paths relative to session_dir)
-      imu.npz, camera/…, joint_state.npz
+    robot_skin/data/raw/<dataset>/<subject>/<session_id>/
+      session.json                  # this manifest
+      pressure.npz                  # t[T] (s, host clock), raw[T,C] (channel order)
+      imu.npz                       # t, quat[T,S,4] wxyz, gyro[T,S,3] rad/s, acc[T,S,3] m/s², sites[S]
+      joint_state.npz               # t, q[T,D], qd[T,D]?, tau[T,D]?, names[D]          (robot)
+      hand_pose.npz                 # t, global_orient[T,3], finger_pose[T,15,3], wrist_pos[T,3],
+                                    #   confidence[T]  — MANO axis-angle labels (vision / mocap)
+      object_pose.npz               # t, pos[T,3], quat[T,4] wxyz                        (optional)
+      camera_<name>/timestamps.npy  # [F] s, + frames.npy uint8[F,H,W,3] or 000000.jpg …
+      events.jsonl                  # {"t", "type": phase_start|phase_end|marker|success|instruction,
+                                    #  "name", "value"}
 
-``segments`` marks labelled time spans, most importantly ``no_contact`` spans that the
-baseline predictor trains on.
+The full contract is ``docs/DATA_FORMAT.md``. ``segments`` marks labelled time spans, most
+importantly ``no_contact`` spans that the baseline predictor trains on.
+
+Schema v2 adds ``dataset`` (``motion`` = D1 free-motion / self-touch, ``task`` = D2 object
+tasks), ``subject``, ``task`` (task_id / instruction / object / success) and ``calibration``.
+v1 manifests load with defaults.
 """
 from __future__ import annotations
 
@@ -18,9 +29,10 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MANIFEST_NAME = "session.json"
 SESSION_KINDS = ("glove", "robot", "bench")
+DATASETS = ("motion", "task", "other")
 
 
 @dataclass
@@ -44,6 +56,10 @@ class SessionManifest:
     baseline: list[float] | None = None                   # per-channel raw baseline if known
     notes: str = ""
     meta: dict = field(default_factory=dict)
+    dataset: str = "other"                                # motion | task | other
+    subject: str = ""
+    task: dict | None = None                              # {task_id, instruction, object, success}
+    calibration: dict = field(default_factory=dict)       # e.g. imu offsets, channel map
     schema_version: int = SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -52,6 +68,8 @@ class SessionManifest:
     def validate(self) -> None:
         if self.kind not in SESSION_KINDS:
             raise ValueError(f"kind must be one of {SESSION_KINDS}, got {self.kind!r}")
+        if self.dataset not in DATASETS:
+            raise ValueError(f"dataset must be one of {DATASETS}, got {self.dataset!r}")
         for name, s in self.streams.items():
             if Path(s.file).is_absolute():
                 raise ValueError(f"stream {name!r}: file must be relative to the session dir")
@@ -80,6 +98,7 @@ class SessionManifest:
         if ver > SCHEMA_VERSION:
             raise ValueError(f"manifest schema {ver} is newer than supported {SCHEMA_VERSION}")
         d["streams"] = {k: StreamInfo(**v) for k, v in d.get("streams", {}).items()}
+        d["schema_version"] = SCHEMA_VERSION  # older manifests are upgraded with field defaults
         return cls(**d)
 
     def save(self, session_dir: str | Path) -> Path:
@@ -98,3 +117,8 @@ class SessionManifest:
 
     def stream_path(self, session_dir: str | Path, name: str) -> Path:
         return Path(session_dir) / self.streams[name].file
+
+    @property
+    def cameras(self) -> list[str]:
+        """Camera names = streams called ``camera_<name>``."""
+        return sorted(k[len("camera_"):] for k in self.streams if k.startswith("camera_"))
