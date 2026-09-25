@@ -51,8 +51,8 @@ class HaMeREstimator:
          axis-angle, betas, camera translation) plus the detection score;
       3. convert: ``finger_pose`` = hand_pose (+ hands_mean if the model uses it), ``wrist_pos`` =
          camera-frame wrist joint (``transl + J_0(β)``), ``confidence`` = detection score;
-      4. :func:`save_hand_labels` to ``<session>/hand_pose.npz`` with the frame timestamps and
-         register the stream in the manifest.
+      4. :func:`save_hand_labels` to ``<session>/hand_pose.npz`` with the frame timestamps (it
+         registers the ``hand_pose`` stream in ``session.json``: :func:`register_hand_labels`).
     Any class with ``estimate(frames) -> dict`` satisfying :class:`VisionHandEstimator` can be
     used with :func:`estimate_sequence` instead.
     """
@@ -82,11 +82,16 @@ def _check_labels(t, global_orient, finger_pose, wrist_pos, confidence) -> dict[
     return {"t": t, "global_orient": go, "finger_pose": fp, "wrist_pos": wp, "confidence": conf}
 
 
-def save_hand_labels(path: str | Path, t, global_orient, finger_pose, wrist_pos, confidence=None) -> Path:
+def save_hand_labels(path: str | Path, t, global_orient, finger_pose, wrist_pos, confidence=None, *,
+                     register: bool = True) -> Path:
     """Write ``hand_pose.npz`` (validated shapes; confidence defaults to 1).
 
     ``path`` is a ``.npz`` file or a session directory (created if needed; any path without the
-    ``.npz`` suffix is a directory, so names like ``sess_2026.01.02`` are safe).
+    ``.npz`` suffix is a directory, so names like ``sess_2026.01.02`` are safe). With ``register``
+    and a raw session there (``session.json`` next to the file), the ``hand_pose`` stream is added
+    to the manifest (:func:`register_hand_labels`) — labels made offline after recording are then
+    listed like every other stream (``datasets.build`` also reads an unregistered canonical
+    ``hand_pose.npz``).
     """
     d = _check_labels(t, global_orient, finger_pose, wrist_pos, confidence)
     p = Path(path)
@@ -94,7 +99,30 @@ def save_hand_labels(path: str | Path, t, global_orient, finger_pose, wrist_pos,
         p = p / "hand_pose.npz"
     p.parent.mkdir(parents=True, exist_ok=True)
     np.savez(p, **d)
+    if register:
+        register_hand_labels(p)
     return p
+
+
+def register_hand_labels(path: str | Path, *, rate_hz: float | None = None) -> bool:
+    """Add (or point) the ``hand_pose`` stream of the raw session that contains ``path`` (a
+    ``hand_pose`` ``.npz`` inside the session directory) to its ``session.json``. Returns True when the
+    manifest was changed, False when there is no manifest there or it already lists this file."""
+    from robot_skin.acquisition.manifest import MANIFEST_NAME, SessionManifest, StreamInfo
+
+    p = Path(path)
+    sdir = p.parent
+    if not (sdir / MANIFEST_NAME).is_file():
+        return False
+    m = SessionManifest.load(sdir)
+    cur = m.streams.get("hand_pose")
+    if cur is not None and Path(cur.file) == Path(p.name):
+        return False
+    m.streams["hand_pose"] = StreamInfo(file=p.name, rate_hz=rate_hz,
+                                        fields=["t", "global_orient[3]", "finger_pose[15,3]", "wrist_pos[3]",
+                                                "confidence"])
+    m.save(sdir)
+    return True
 
 
 def load_hand_labels(path: str | Path) -> dict[str, np.ndarray]:

@@ -16,8 +16,13 @@ Observation contract (identical to ``vtla.dataset.VTLADataset.__getitem__`` at a
 
 - ``tactile_values`` = :class:`~robot_skin.representation.TactileHistory` of the processor (the
   bundle's feature spec, history in master ticks — so ``control_hz`` should equal the bundle's
-  ``source_hz``); ``contact`` = the bundle's contact rule; ``taxel_pos`` / ``taxel_nrm`` in the
-  hand / robot base frame (pose function of the processor);
+  ``source_hz``); ``contact`` = the bundle's contact rule; ``taxel_pos`` / ``taxel_nrm`` from the
+  processor's pose function (URDF root frame for a robot skin), re-expressed in the frame the
+  policy's tactile encoder was trained in (``PolicyBundle.taxel_frames``): a glove-trained bundle
+  (``mano_wrist``) on a URDF skin gets them mapped into the MANO wrist frame by the retargeter's
+  inverse (:class:`robot_skin.transfer.RobotToManoTaxelFrame`: ``R_hrᵀ R_bᵀ (p − t_b) / scale``);
+  ``taxel_pad`` hides the session's dead channels (processor ``dead``) when the bundle was trained
+  with ``mask_dead_taxels`` (the dataset hides ``meta.preprocessing.dead_taxels`` the same way);
 - ``proprio`` = the last ``obs_history`` action-space states at policy ticks (oldest first, edge
   padded), normalized by the bundle's proprio normalizer. For ``robot_joint`` the state is the
   measured joint vector; for ``hand_mano`` a robot has no human hand state, so the state is the
@@ -39,6 +44,15 @@ streams, rings, safety state and loop metrics are reset at every rollout start.
 Clock: a :class:`~robot_skin.acquisition.sources.SimClock` (the fake hand's) is advanced by exactly
 ``1/control_hz`` per tick — deterministic, faster than real time; with a real clock the loop keeps
 its rate by deadline scheduling and counts overruns (ticks that started more than one period late).
+The ticks missed during an overrun (synchronous inference) catch up back to back: their processor
+inputs are the joint / pressure samples interpolated at each tick's scheduled time (uniform ticks
+for qd, tactile history and FSM, as in training; ``catchup_ticks``), and the safety filter limits
+the commands by the wall time since the previous command, so a catch-up never outruns ``max_vel``.
+
+Failures: a non-finite joint reading holds the last finite one (policy state, taxel poses, processor);
+start-up / rollout start re-read until the joints are finite; a non-finite policy chunk is dropped
+(safety event ``nonfinite_chunk``); any exception in :meth:`PolicyRunner.run` latches the e-stop,
+sends the hold, closes the session log and stops the robot before it propagates.
 """
 from __future__ import annotations
 
@@ -307,6 +321,12 @@ class PolicyRunner:
         interpolate: linear joint-target ramp between policy ticks.
         seed: generator seed of the flow head's sampling noise (deterministic rollouts).
         stop_on_estop: end the rollout when the safety e-stop latches.
+        taxel_frame: ``auto`` (default) — feed the policy taxel poses in the frame its tactile
+            encoder was trained in (``bundle.taxel_frames``): a glove-trained (``mano_wrist``)
+            bundle on a URDF skin maps them with :class:`~robot_skin.transfer.RobotToManoTaxelFrame`
+            of the retargeter, other mismatches warn; a callable ``(pos[N,3], nrm[N,3], q_robot) →
+            (pos, nrm)`` (``q_robot`` in ``robot.joint_names`` order) maps them explicitly; ``None``
+            feeds the processor's poses unchanged. :attr:`taxel_frame_info` describes the choice.
     """
 
     def __init__(self, robot: Any, bundle: Any, processor: Any, *, cameras: Any = None, retargeter: Any = None,
@@ -316,7 +336,7 @@ class PolicyRunner:
                  hand_state_fn: Callable[[np.ndarray, np.ndarray], np.ndarray] | None = None,
                  hand_state_init: str | Sequence[float] = "mean", interpolate: bool = True, device: Any = None,
                  seed: int = 0, allow_bootstrap: bool = False, stop_on_estop: bool = True,
-                 n_steps: int | None = None):
+                 n_steps: int | None = None, taxel_frame: Any = "auto"):
         import torch
 
         from ..action.chunking import TemporalEnsembler
@@ -351,9 +371,15 @@ class PolicyRunner:
         if abs(self.control_hz - float(processor.hz)) > 1e-6:
             warnings.warn(f"control_hz {self.control_hz:g} differs from the tactile processor's master rate "
                           f"{processor.hz:g}: tactile history / qd / FSM timing no longer match training", stacklevel=2)
-        if abs(self.policy_every * b.policy_hz - self.control_hz) > 1e-6 * self.control_hz and policy_hz is None:
-            warnings.warn(f"policy runs every {self.policy_every} ticks at control_hz {self.control_hz:g}, the bundle "
-                          f"was trained at {b.policy_hz:g} Hz (stride {b.stride} of {b.source_hz:g} Hz)", stacklevel=2)
+        if abs(self.policy_every * b.policy_hz - self.control_hz) > 1e-6 * self.control_hz:
+            # also (above all) for an explicit policy_hz: chunk[i] was trained as the action i training
+            # periods ahead, the ensembler / interpolation execute one entry per runner period
+            eff = self.control_hz / self.policy_every
+            warnings.warn(f"policy runs every {self.policy_every} ticks at control_hz {self.control_hz:g} "
+                          f"({eff:g} Hz), the bundle was trained at {b.policy_hz:g} Hz (stride {b.stride} of "
+                          f"{b.source_hz:g} Hz): each chunk entry is executed over 1/{eff:g} s instead of "
+                          f"1/{b.policy_hz:g} s — trajectories run {eff / b.policy_hz:.3g}× as fast as trained",
+                          stacklevel=2)
 
         # cameras
         cams = {} if cameras is None else (dict(cameras) if isinstance(cameras, Mapping)
@@ -403,6 +429,7 @@ class PolicyRunner:
         else:
             raise ValueError(f"unsupported action kind {self.kind!r}")
         self.hand_state_fn = hand_state_fn
+        self.taxel_frame_map, self.taxel_frame_info = self._resolve_taxel_frame(taxel_frame)
 
         self.safety = safety if safety is not None else SafetyFilter(robot.lower, robot.upper, dt=self.dt,
                                                                      joint_names=R)
@@ -439,13 +466,44 @@ class PolicyRunner:
         self.tick_meter = LatencyMeter("tick")
         self.infer_meter = LatencyMeter("inference")
         self.retarget_meter = LatencyMeter("retarget")
-        self.n_ticks = self.n_policy_ticks = self.overruns = 0
+        self.n_ticks = self.n_policy_ticks = self.overruns = self.catchup_ticks = 0
         self.n_contact_ticks = 0
         self._wall0 = self._t_start = None
         self._deadline: float | None = None
         self._rollout = False
+        self._q_meas: np.ndarray | None = None               # last finite joint reading (robot order)
+        self._nonfinite_warned = False
+        self._last_in: dict[str, Any] | None = None          # the previous tick's processor input
 
     # ── helpers ───────────────────────────────────────────────────────────
+    def _resolve_taxel_frame(self, spec: Any) -> tuple[Callable | None, str | None]:
+        """``(map (pos, nrm, q_robot) → (pos, nrm) | None, description | None)`` — see ``taxel_frame``."""
+        from .bundle import LAYOUT_TAXEL_FRAME
+
+        b = self.bundle
+        skin = LAYOUT_TAXEL_FRAME.get(self.processor.layout.parent_frame, "layout")
+        if spec is None:
+            return None, f"taxel poses fed in the skin's frame ({skin}; mapping disabled)"
+        if callable(spec):
+            return spec, "taxel poses mapped by the given taxel_frame function"
+        if spec != "auto":
+            raise ValueError("taxel_frame must be 'auto', None or a callable (pos, nrm, q_robot) -> (pos, nrm)")
+        train = set(b.taxel_frames)
+        if not b.uses_tactile or not train or skin in train:
+            return None, None
+        if train == {"mano_wrist"} and skin == "urdf_root" and self.retargeter is not None:
+            from ..transfer.reverse import RobotToManoTaxelFrame
+
+            m, inv = RobotToManoTaxelFrame(self.retargeter), self._p_ret_inv
+            return ((lambda pos, nrm, q: m(pos, nrm, np.asarray(q)[inv])),
+                    f"taxel poses URDF root → MANO wrist frame (policy tactile encoder trained on glove poses; "
+                    f"retargeter human_to_robot, scale {float(self.retargeter.scale):.3f})")
+        msg = (f"the policy's tactile encoder was trained on taxel poses in the {sorted(train)} frame(s) but the "
+               f"skin {self.processor.layout.name!r} gives {skin!r} poses: its pose tokens are out of distribution "
+               "(pass taxel_frame=(pos, nrm, q_robot) -> (pos, nrm) mapping them into the training frame)")
+        warnings.warn(msg, stacklevel=3)
+        return None, msg
+
     @property
     def _logging(self) -> bool:
         return self.logger is not None and not self.logger.closed
@@ -464,6 +522,12 @@ class PolicyRunner:
         return q if self._p_proc is None else q[self._p_proc]
 
     def _advance(self) -> None:
+        """Wait for the next tick's deadline. A tick that starts late is run at once: up to 10
+        periods behind, the missed ticks catch up back to back — :meth:`step` feeds the processor
+        the joint / pressure samples interpolated at each tick's scheduled time (uniform ticks, as
+        in training) and :class:`~robot_skin.control.safety.SafetyFilter` limits the commands by
+        wall time, so the catch-up neither bursts the hand nor corrupts qd / history / FSM timing;
+        further behind, the schedule re-synchronises (those ticks are dropped)."""
         if self.sim:
             self.clock.advance(self.dt)
             return
@@ -475,6 +539,48 @@ class PolicyRunner:
             self.overruns += 1
             if -delay > 10 * self.dt:                         # far behind: re-synchronise, do not burst
                 self._deadline = float(self.clock())
+
+    def _wait_period(self) -> None:
+        """One control period without a tick (start-up re-reads)."""
+        if self.sim:
+            self.clock.advance(self.dt)
+        else:
+            time.sleep(self.dt)
+
+    def _read_valid_q(self, what: str, retries: int | None = None
+                      ) -> tuple[float, np.ndarray, np.ndarray | None, float, np.ndarray]:
+        """A reading whose joint state is finite, to (re)start the safety filter from: a single
+        non-finite sample (a driver glitch) must not become the start position — every later
+        command would be NaN. Re-reads up to ``retries`` times (default ≈ 50 ms), one period apart;
+        joints still non-finite keep the filter's previous command (``SafetyFilter.reset``) when
+        there is one, else ``RuntimeError`` (nothing has been sent yet)."""
+        n = max(3, int(round(0.05 * self.control_hz))) if retries is None else int(retries)
+        r = self._read()
+        for _ in range(n):
+            if np.all(np.isfinite(r[1])):
+                return r
+            self._wait_period()
+            r = self._read()
+        bad = ~np.isfinite(r[1])
+        if not bad.any():
+            return r
+        names = [self.robot_joint_names[i] for i in np.flatnonzero(bad)]
+        prev = getattr(self.safety, "q_last", None)
+        if prev is not None and np.all(np.isfinite(np.asarray(prev, dtype=np.float64)[bad])):
+            log.warning("%s: joint state of %s non-finite for %d reads: those joints keep the last command",
+                        what, names, n + 1)
+            return r
+        raise RuntimeError(f"{what}: the joint state of {names} is non-finite for {n + 1} consecutive reads "
+                           "(and there is no previous command to keep) — check the robot driver")
+
+    def _clear_estop(self, where: str) -> None:
+        """A latched e-stop is cleared by an explicit (re)start only — say so in the log."""
+        if getattr(self.safety, "estopped", False):
+            reason = getattr(self.safety, "estop_reason", None)
+            log.warning("%s: clearing the latched e-stop (%s)", where, reason)
+            if self._logging:
+                self.logger.marker("safety", {"t": float(self.clock()), "type": "estop_cleared",
+                                              "detail": {"reason": reason, "by": where}})
 
     def _hold_tick(self, q_hold: np.ndarray) -> tuple[float, np.ndarray, np.ndarray | None, float, np.ndarray]:
         r = self._read()
@@ -490,16 +596,18 @@ class PolicyRunner:
         (as preprocessing: median over the no-contact window, rail samples excluded). If the
         processor has no calibrator and ``calib_s > 0``, keep holding for ``calib_s`` and fit a
         bring-up calibrator on the residuals (:func:`~robot_skin.control.online.startup_calibrator`).
-        Logged as ``baseline`` / ``calibration`` phases (``no_contact`` segments)."""
+        Logged as ``baseline`` / ``calibration`` phases (``no_contact`` segments). The hand holds its
+        measured pose (re-read until finite; a latched e-stop is cleared with a warning)."""
         from .online import startup_calibrator
 
         for fn in ("start",):
             if hasattr(self.robot, fn):
                 getattr(self.robot, fn)()
         self._deadline = float(self.clock())
-        _, q0, _, _, _ = self._read()
+        _, q0, _, _, _ = self._read_valid_q("startup")
+        self._clear_estop("startup")
         self.safety.reset(q0)
-        q_hold = self.safety.q_last.copy()
+        q_hold = self.safety.q_last.copy()            # the measured pose: the hand does not move
         proc = self.processor
         proc.begin_baseline()
         n_b = max(2, int(round(float(baseline_s) * self.control_hz)))
@@ -514,10 +622,13 @@ class PolicyRunner:
             self._advance()
         base = proc.finish_baseline(baseline_s)
         if proc.dead.any():
+            policy = ("hidden from the policy input (bundle mask_dead_taxels)" if self.bundle.mask_dead_taxels else
+                      "the policy sees them (bundle without mask_dead_taxels: under level_ge_weak its ContactGate "
+                      "stays open)")
             warnings.warn(f"dead tactile channels (baseline ≤ 0) on taxels {np.flatnonzero(proc.dead).tolist()}: they "
                           "read SATURATED on every tick, so a tactile stop on SATURATED keeps their kinematic chains "
-                          "from closing (fail safe) — repair the channel or drop SATURATED from safety levels",
-                          stacklevel=2)
+                          "from closing (fail safe) — repair the channel or drop SATURATED from safety levels; "
+                          f"{policy}", stacklevel=2)
         if self._logging:
             self.logger.phase_end("baseline")
             ch = np.median(np.stack(raws), axis=0)                  # per channel; taxels: the processor's
@@ -579,19 +690,22 @@ class PolicyRunner:
     # ── rollout ───────────────────────────────────────────────────────────
     def begin_rollout(self) -> None:
         """Reset every stream (processor, ensembler, retargeter, hand-state estimator, proprio /
-        camera rings, safety state from the current measured position — a latched e-stop is
-        cleared here, with a warning: starting a rollout is the operator's explicit restart) and
+        camera rings, safety state from the current measured position, re-read until finite — a
+        latched e-stop is cleared here (or already by :meth:`startup`), with a warning and an
+        ``estop_cleared`` safety marker: starting a rollout is the operator's explicit restart) and
         open the ``rollout`` phase."""
         import torch
 
-        _, q, _, _, _ = self._read()
+        tq, q, qd, tp, raw = self._read_valid_q("begin_rollout")
         self.processor.reset(keep_baseline=True)
         self.ensembler.reset()
         self._deadline = float(self.clock())                  # do not carry start-up lag into the rollout
-        if self.safety.estopped:
-            log.warning("begin_rollout: clearing the latched e-stop (%s)", self.safety.estop_reason)
+        self._clear_estop("begin_rollout")
         self.safety.reset(q)
         q_cmd = self.safety.q_last.copy()
+        # joints still non-finite in this reading hold the (finite) start position until measured
+        self._q_meas = np.where(np.isfinite(q), q, q_cmd)
+        self._last_in = None
         if self.retargeter is not None:
             self.retargeter.reset(q_cmd[self._p_ret_inv])
         if self.hand_state_fn is not None and hasattr(self.hand_state_fn, "reset"):
@@ -602,9 +716,10 @@ class PolicyRunner:
         self._target_prev = q_cmd.copy()
         self._target_next = q_cmd.copy()
         self._since_policy = 0
+        self._nonfinite_warned = False
         self._gen = torch.Generator(device=self.device).manual_seed(self.seed)
         # metrics() describes one rollout: restart the loop counters and latency meters
-        self.n_ticks = self.n_policy_ticks = self.overruns = self.n_contact_ticks = 0
+        self.n_ticks = self.n_policy_ticks = self.overruns = self.n_contact_ticks = self.catchup_ticks = 0
         for m in (self.tick_meter, self.infer_meter, self.retarget_meter):
             m.reset()
         self._t_end = self._wall_end = None
@@ -616,6 +731,43 @@ class PolicyRunner:
                                     control_hz=self.control_hz)
             if self.instruction:
                 self.logger.instruction(self.instruction)
+
+    def _tick_input(self, t: float, tq: float, q: np.ndarray, qd: np.ndarray | None, tp: float, raw: np.ndarray
+                    ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray, np.ndarray | None, bool]:
+        """``(q, qd, raw, saturated, q_valid)`` for this tick's processor step (robot order).
+
+        - Non-finite joint readings hold the last finite one (``q_valid`` False) — the processor's
+          own rule, applied here so the policy state / taxel-frame map / safety freeze get it too.
+        - A *late* tick (started more than a quarter period after its scheduled time — the
+          catch-up after an overrun) stands for that time, but the driver returns "now": q / qd / raw are
+          interpolated between the previous tick's input and this sample at the scheduled time
+          (linear, like the preprocessing resampling; a bracketing rail sample flags the taxel
+          saturated), so qd / tactile history / FSM see uniform ticks as in training."""
+        bad = ~np.isfinite(q)
+        q_ok = not bad.any()
+        if not q_ok and self._q_meas is not None:
+            q = np.where(bad, self._q_meas, q)
+        self._q_meas = np.where(np.isfinite(q), q, self._q_meas) if self._q_meas is not None else q
+        g = None if self.sim or self._deadline is None else float(self._deadline)
+        sat = None
+        prev = self._last_in
+        if g is not None and prev is not None and t - g > 0.25 * self.dt and g > prev["t"]:
+            aq = (g - prev["t"]) / (tq - prev["t"]) if tq > prev["t"] else 1.0
+            ap = (g - prev["tp"]) / (tp - prev["tp"]) if tp > prev["tp"] else 1.0
+            aq, ap = min(max(aq, 0.0), 1.0), min(max(ap, 0.0), 1.0)
+            q = prev["q"] + aq * (q - prev["q"])
+            if qd is not None and prev["qd"] is not None:
+                qd = prev["qd"] + aq * (qd - prev["qd"])
+            rail = None
+            if ap < 1.0:
+                prail = prev["rail"] if prev["rail"] is not None else self.processor.rail_mask(prev["raw"])
+                sat = rail = self.processor.rail_mask(raw) | prail
+                raw = prev["raw"] + ap * (raw - prev["raw"])
+            self.catchup_ticks += 1
+            self._last_in = {"t": g, "q": q, "qd": qd, "tp": g, "raw": raw, "rail": rail}
+        else:
+            self._last_in = {"t": float(tq), "q": q, "qd": qd, "tp": float(tp), "raw": raw, "rail": None}
+        return q, qd, raw, sat, q_ok
 
     def _state(self, q: np.ndarray) -> np.ndarray:
         if self.kind == "robot_joint":
@@ -679,9 +831,14 @@ class PolicyRunner:
         images, valid, stamps = self._images()
         N = self.processor.layout.n
         values = frame.features if frame.features is not None else np.zeros((N, 0), np.float32)
-        obs = make_observation(proprio_states=np.stack(self._proprio), tactile_values=values, taxel_pos=frame.pos,
-                               taxel_nrm=frame.nrm, contact=frame.contact, instruction=self.instruction,
-                               proprio_normalizer=b.proprio_normalizer, images=images, vision_valid=valid)
+        pos, nrm = frame.pos, frame.nrm
+        if self.taxel_frame_map is not None:                  # into the policy's training taxel frame
+            pos, nrm = self.taxel_frame_map(pos, nrm, q)
+        dead = getattr(self.processor, "dead", None) if b.mask_dead_taxels else None
+        obs = make_observation(proprio_states=np.stack(self._proprio), tactile_values=values, taxel_pos=pos,
+                               taxel_nrm=nrm, contact=frame.contact, instruction=self.instruction,
+                               proprio_normalizer=b.proprio_normalizer, images=images, vision_valid=valid,
+                               taxel_mask=dead if dead is not None and np.any(dead) else None)
         batch = collate_vtla([obs], b.tokenizer)
         batch = {k: (v.to(self.device) if isinstance(v, torch.Tensor) else
                      ({c: x.to(self.device) for c, x in v.items()} if isinstance(v, Mapping) else v))
@@ -697,9 +854,27 @@ class PolicyRunner:
         self.infer_meter.record(infer_ms)
         rel = np.asarray(b.action_normalizer.unnormalize(chunk_n), dtype=np.float32)
         chunk = np.asarray(make_absolute(rel, state, b.action_spec, b.rel_mode), dtype=np.float64)
-        self.ensembler.add(chunk[self._chunk_skip:])
-        a = self.ensembler.step()
         q_target = self.safety.q_last.copy()
+        if not np.all(np.isfinite(chunk)):
+            # a non-finite chunk (policy output, or a state without a finite reading) is dropped:
+            # the older chunks still cover this tick, otherwise the target holds the last command
+            n_bad = int(np.sum(~np.isfinite(chunk)))
+            if hasattr(self.safety, "record"):
+                self.safety.record(t, "nonfinite_chunk", n_values=n_bad, held=not self.ensembler.ready)
+            if not self._nonfinite_warned:
+                self._nonfinite_warned = True
+                log.warning("policy tick %d: chunk with %d non-finite values dropped (counted as safety event "
+                            "'nonfinite_chunk'; further ones this rollout are not logged here)",
+                            self.n_policy_ticks, n_bad)
+            if not self.ensembler.ready:
+                self.n_policy_ticks += 1
+                if self._logging:
+                    self.logger.log_policy(t=t, action=np.full(b.action_dim, np.nan, np.float32),
+                                           q_target=q_target.astype(np.float32), state=state, inference_ms=infer_ms)
+                return q_target, stamps
+        else:
+            self.ensembler.add(chunk[self._chunk_skip:])
+        a = self.ensembler.step()
         if self.kind == "robot_joint":
             q_target[self._p_act] = a
         else:
@@ -722,8 +897,11 @@ class PolicyRunner:
             raise RuntimeError("call begin_rollout() (or run()) first")
         w0 = time.perf_counter()
         t = float(self.clock())
-        tq, q, qd, tp, raw = self._read()
-        frame = self.processor.step(raw, self._proc_q(q), qd=None if qd is None else self._proc_q(qd), t=tp)
+        n_ev = len(self.safety.events)
+        tq, q_raw, qd, tp, raw = self._read()
+        q, qd_in, raw_in, sat_in, q_ok = self._tick_input(t, tq, q_raw, qd, tp, raw)
+        frame = self.processor.step(raw_in, self._proc_q(q), qd=None if qd_in is None else self._proc_q(qd_in),
+                                    t=tp, saturated=sat_in, q_valid=q_ok)
         stamps: dict[str, float] = {"pressure": tp, "joint_state": tq}
         if self._since_policy % self.policy_every == 0:
             self._target_prev = self.safety.q_last.copy()
@@ -741,15 +919,18 @@ class PolicyRunner:
         else:
             q_des = self._target_next
         self._since_policy += 1
-        n_ev = len(self.safety.events)
-        q_cmd = self.safety.filter(q_des, q, t=t, level=frame.level, stamps=stamps)
+        # the send time (after inference on a policy tick): the filter's rate limits are in wall time
+        # (the watchdog judges the sensor stamps at the tick's own time t); the tactile freeze uses
+        # the latest real (finite) joint reading
+        t_send = t if self.sim else float(self.clock())
+        q_cmd = self.safety.filter(q_des, self._q_meas, t=t, t_send=t_send, level=frame.level, stamps=stamps)
         self.robot.send_joint_targets(q_cmd)
         self.n_ticks += 1
         self.n_contact_ticks += int(frame.any_contact)
         if self._logging:
             for ev in self.safety.events[n_ev:]:
                 self.logger.marker("safety", ev.to_dict())
-            self.logger.log_tick(t=t, q=q.astype(np.float32), q_des=q_des.astype(np.float32),
+            self.logger.log_tick(t=t, q=q_raw.astype(np.float32), q_des=q_des.astype(np.float32),
                                  q_cmd=q_cmd.astype(np.float32), level=frame.level.astype(np.int8),
                                  contact=frame.contact, stop_active=self.safety.stop_active, stale=self.safety.stale)
             self.logger.flush()
@@ -765,28 +946,74 @@ class PolicyRunner:
 
     def run(self, duration_s: float, *, startup: bool = True, baseline_s: float = 1.0, calib_s: float = 0.0,
             success: bool | None = None, close: bool = True) -> dict[str, Any]:
-        """Start-up (optional) → rollout for ``duration_s`` → metrics (and close the log)."""
-        info = self.startup(baseline_s, calib_s) if startup else {}
-        self.begin_rollout()
-        n = int(round(float(duration_s) * self.control_hz))
-        for _ in range(n):
-            self.step()
-            self._advance()
-            if self.safety.estopped and self.stop_on_estop:
-                log.warning("e-stop latched (%s): rollout stopped", self.safety.estop_reason)
-                break
-        self.end_rollout()
-        m = self.metrics()
-        m["startup"] = info
-        if self._logging and close:
-            man = self.logger.close(success=success, meta={"metrics": {k: v for k, v in m.items()
-                                                                       if k not in ("safety", "startup")},
-                                                           "safety": self.safety.summary()})
-            m["session_dir"] = str(self.logger.session_dir)
-            m["session_id"] = man.session_id
+        """Start-up (optional) → rollout for ``duration_s`` → metrics (and close the log). An
+        exception (or Ctrl-C) anywhere in between latches the e-stop (→ ``robot.estop()``), sends
+        the hold, closes the session log (marked ``aborted``) and calls ``robot.stop()`` before it
+        propagates (:meth:`abort`)."""
+        info: dict[str, Any] = {}
+        try:
+            info = self.startup(baseline_s, calib_s) if startup else {}
+            self.begin_rollout()
+            n = int(round(float(duration_s) * self.control_hz))
+            for _ in range(n):
+                self.step()
+                self._advance()
+                if self.safety.estopped and self.stop_on_estop:
+                    log.warning("e-stop latched (%s): rollout stopped", self.safety.estop_reason)
+                    break
+            self.end_rollout()
+            m = self.metrics()
+            m["startup"] = info
+            if self._logging and close:
+                man = self.logger.close(success=success, meta={"metrics": {k: v for k, v in m.items()
+                                                                           if k not in ("safety", "startup")},
+                                                               "safety": self.safety.summary()})
+                m["session_dir"] = str(self.logger.session_dir)
+                m["session_id"] = man.session_id
+        except BaseException as e:
+            self.abort(e, close=close)
+            raise
         if hasattr(self.robot, "stop"):
             self.robot.stop()
         return m
+
+    def abort(self, exc: BaseException | str, *, close: bool = True) -> None:
+        """Bring the robot to a safe state after a failure inside the loop: latch the safety e-stop
+        (its callback calls ``robot.estop()``), send the e-stop hold, end the rollout, close the
+        session log (``aborted`` marker + ``meta.deployment.aborted``: the recorded streams are
+        kept) and call ``robot.stop()``. Every step is attempted even if an earlier one fails."""
+        reason = exc if isinstance(exc, str) else f"{type(exc).__name__}: {exc}"
+        log.error("run aborted (%s): e-stop, hold, robot.stop(), session log closed", reason)
+        try:
+            t = float(self.clock())
+        except Exception:  # noqa: BLE001 - a broken clock must not prevent the stop
+            t = float("nan")
+        n_ev = len(getattr(self.safety, "events", []))
+        try:
+            self.safety.trigger_estop(f"aborted ({reason})", t)
+            if getattr(self.safety, "q_last", None) is not None:
+                self.robot.send_joint_targets(self.safety.filter(self.safety.q_last, t=t))
+        except Exception:  # noqa: BLE001
+            log.exception("abort: e-stop / hold failed")
+        try:
+            if self._rollout:
+                self.end_rollout()
+            if self._logging and close:
+                for ev in self.safety.events[n_ev:]:
+                    self.logger.marker("safety", ev.to_dict())
+                self.logger.marker("aborted", {"t": t, "error": reason})
+                m = self.metrics()
+                self.logger.close(meta={"aborted": reason,
+                                        "metrics": {k: v for k, v in m.items() if k not in ("safety", "startup")},
+                                        "safety": self.safety.summary()})
+        except Exception:  # noqa: BLE001
+            log.exception("abort: closing the session log failed")
+        finally:
+            if hasattr(self.robot, "stop"):
+                try:
+                    self.robot.stop()
+                except Exception:  # noqa: BLE001
+                    log.exception("abort: robot.stop() failed")
 
     def metrics(self) -> dict[str, Any]:
         """Loop / latency / safety summary of the last rollout."""
@@ -805,6 +1032,7 @@ class PolicyRunner:
             "loop_hz_wall": self.n_ticks / wall_s,
             "tick_ms": tick, "inference_ms": inf, "latency_p50_ms": inf["p50_ms"], "latency_p95_ms": inf["p95_ms"],
             "tick_p50_ms": tick["p50_ms"], "tick_p95_ms": tick["p95_ms"], "overruns": self.overruns,
+            "catchup_ticks": self.catchup_ticks,
             "budget_ms": 1e3 / self.control_hz,
             "tick_over_budget_frac": (float(np.mean(np.asarray(self.tick_meter.samples) > 1e3 / self.control_hz))
                                       if self.tick_meter.samples else float("nan")),

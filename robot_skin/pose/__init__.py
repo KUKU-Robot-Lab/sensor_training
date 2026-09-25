@@ -19,8 +19,8 @@ from .imu_model import (
 )
 from .glove_imu2mano import GloveImu2ManoPoseProvider, finetune_vifnet_s, load_vifnet_s
 from .vision_hand import (
-    HaMeREstimator, VisionHandEstimator, estimate_sequence, load_hand_labels, save_hand_labels,
-    smooth_hand_labels,
+    HaMeREstimator, VisionHandEstimator, estimate_sequence, load_hand_labels, register_hand_labels,
+    save_hand_labels, smooth_hand_labels,
 )
 
 __all__ = [
@@ -41,5 +41,5 @@ __all__ = [
     "to_axis_angle", "finetune_vifnet_s", "load_vifnet_s",
     # vision labels
     "HaMeREstimator", "VisionHandEstimator", "estimate_sequence", "load_hand_labels",
-    "save_hand_labels", "smooth_hand_labels",
+    "register_hand_labels", "save_hand_labels", "smooth_hand_labels",
 ]

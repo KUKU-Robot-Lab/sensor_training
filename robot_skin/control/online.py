@@ -435,7 +435,8 @@ class OnlineTactileProcessor:
             self.set_baseline(baseline_raw)
         self._bl_rows: list[np.ndarray] = []
         self._bl_t: list[float] = []
-        self._bl_n = 0
+        self._bl_rail: list[np.ndarray] = []
+        self._bl_n = self._bl_clean = 0
         self.reset()
 
     # ── construction helpers ──────────────────────────────────────────────
@@ -578,31 +579,48 @@ class OnlineTactileProcessor:
         return saturation_mask(raw=r, adc_min=pc["adc_min"], adc_max=pc["adc_max"], rail_margin=pc["rail_margin"],
                                max_abs_pct=None) | bad
 
+    def rail_mask(self, raw: np.ndarray) -> np.ndarray:
+        """``bool[N]`` (layout order): taxels of a raw sample (``raw_order``) on an ADC rail or
+        non-finite — e.g. to flag a sample interpolated between two raw samples as saturated when
+        either bracketing sample sits on a rail (the preprocessing resampling rule)."""
+        return self._rails(self._to_layout(raw))
+
     def begin_baseline(self) -> None:
-        self._bl_rows, self._bl_t = [], []
-        self._bl_n = 0
+        self._bl_rows, self._bl_t, self._bl_rail = [], [], []
+        self._bl_n = self._bl_clean = 0
 
     def add_baseline_sample(self, raw: np.ndarray, t: float | None = None) -> int:
-        """Collect one no-contact raw sample for the start-up baseline; samples with any taxel on a
-        rail are skipped (preprocessing uses frames without a saturated taxel). ``t`` defaults to
-        the sample's tick time (``index · dt``, skipped samples included — the window is real time,
-        as preprocessing's master-clock timestamps). Returns the number of usable samples."""
+        """Collect one no-contact raw sample for the start-up baseline. Samples with a taxel on a
+        rail are not used (preprocessing uses frames without a saturated taxel) — except for taxels
+        on a rail in *every* sample, which :meth:`finish_baseline` marks dead instead (a dead /
+        unplugged channel must not void the whole window). ``t`` defaults to the sample's tick time
+        (``index · dt``, skipped samples included — the window is real time, as preprocessing's
+        master-clock timestamps). Returns the number of samples so far without any rail taxel."""
         r = self._to_layout(raw)
         ts = float(self._bl_n * self.dt if t is None else t)
         self._bl_n += 1
-        if not self._rails(r).any():
-            self._bl_rows.append(r)
-            self._bl_t.append(ts)
-        return len(self._bl_rows)
+        self._bl_rows.append(r)
+        self._bl_t.append(ts)
+        rail = self._rails(r)
+        self._bl_rail.append(rail)
+        self._bl_clean += int(not rail.any())
+        return self._bl_clean
 
     def finish_baseline(self, duration_s: float | None = None) -> np.ndarray:
         """Baseline = per-taxel median over the first ``duration_s`` (default ``baseline_s``) of the
-        collected samples (:func:`common.signal.estimate_baseline`)."""
-        if len(self._bl_rows) < 2:
-            raise RuntimeError(f"only {len(self._bl_rows)} usable baseline samples (hold the hand still, without "
-                               "contact, and check for rail / dropout samples)")
-        rows = np.stack(self._bl_rows)
-        base = estimate_baseline(rows, t=np.asarray(self._bl_t), duration_s=float(duration_s or self.baseline_s))
+        usable samples (:func:`common.signal.estimate_baseline`): samples without a rail on any
+        live taxel. A taxel on a rail (or non-finite) in every sample is **dead**: baseline 0 → ΔS 0,
+        always saturated (:meth:`set_baseline`, as preprocessing marks a non-positive baseline)."""
+        n = len(self._bl_rows)
+        rails = np.stack(self._bl_rail) if n else np.zeros((0, self.layout.n), bool)
+        dead = rails.all(0) if n >= 2 else np.zeros(self.layout.n, bool)
+        use = ~rails[:, ~dead].any(1)
+        if dead.all() or int(use.sum()) < 2:
+            raise RuntimeError(f"only {int(use.sum()) if not dead.all() else 0} usable baseline samples (hold the "
+                               "hand still, without contact, and check for rail / dropout samples)")
+        rows = np.stack(self._bl_rows)[use]
+        base = estimate_baseline(rows, t=np.asarray(self._bl_t)[use], duration_s=float(duration_s or self.baseline_s))
+        base[dead] = 0.0
         self.set_baseline(base)
         return self.baseline_raw
 

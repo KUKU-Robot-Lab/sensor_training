@@ -11,6 +11,11 @@ fingertip vectors, rotated into the MANO frame and divided by the size ratio, ar
 
 Use it as ``PolicyRunner(hand_state_fn=RobotToManoEstimator(forward_retargeter))``: the wrist part
 of the state is taken from the commanded hand action, the finger part from the estimate.
+
+:class:`RobotToManoTaxelFrame` applies the same inverse map to the robot's **taxel poses**: a policy
+whose tactile encoder was trained on glove episodes (``taxel_frame = mano_wrist``: fingers −x, palm
+−y) must see the robot skin's URDF-root-frame poses re-expressed in that MANO wrist frame
+(``PolicyRunner`` does it automatically for such bundles).
 """
 from __future__ import annotations
 
@@ -18,7 +23,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
-__all__ = ["RobotToManoEstimator", "mano_tip_fk", "FLEX_LIMITS", "ABD_LIMITS"]
+__all__ = ["RobotToManoEstimator", "RobotToManoTaxelFrame", "mano_tip_fk", "FLEX_LIMITS", "ABD_LIMITS"]
 
 FLEX_LIMITS = (-0.3, 1.8)       # rad, per MANO finger joint (curl toward the palm positive)
 ABD_LIMITS = (-0.5, 0.5)        # rad, per finger (dorsal-axis rotation at the first joint)
@@ -107,3 +112,42 @@ class RobotToManoEstimator:
         a = np.zeros(HAND_MANO_DIM, np.float32) if commanded is None else np.asarray(commanded, np.float32).copy()
         a[FINGERS_AA] = self.estimate(q_robot).reshape(-1)
         return a
+
+
+class RobotToManoTaxelFrame:
+    """Robot taxel poses (URDF root frame, :func:`robot_skin.control.online.robot_pose_fn`) → the MANO
+    wrist frame of glove training data, by inverting the forward retargeter's human → robot map
+    ``v_r = s · R_hr · v_h`` (``v`` relative to the human wrist / the robot ``base_link``)::
+
+        pos_h = R_hrᵀ · R_bᵀ (pos − t_b) / s,     nrm_h = R_hrᵀ · R_bᵀ · nrm
+
+    with ``(R_b, t_b)`` the base link pose at ``q`` (:meth:`FingertipRetargeter.base_transform`;
+    identity without a base link), ``R_hr = human_to_robot`` and ``s = scale`` — the same
+    correspondence :meth:`RobotToManoEstimator.robot_tips_in_mano` uses for the fingertips, so a
+    robot fingertip pad lands near the human fingertip pad the policy was trained on. The quality
+    of the map is that of ``human_to_robot`` / ``scale`` (and of the two hands' similarity).
+
+    ``__call__(pos[N,3], nrm[N,3], q)`` with ``q`` in the retargeter's joint order (only needed
+    with a moving base link) → ``(pos, nrm)`` float32.
+    """
+
+    frame = "mano_wrist"
+
+    def __init__(self, retargeter: Any):
+        self.fwd = retargeter
+
+    def __call__(self, pos: np.ndarray, nrm: np.ndarray, q: Sequence[float] | None = None
+                 ) -> tuple[np.ndarray, np.ndarray]:
+        p = np.asarray(pos, np.float64).reshape(-1, 3)
+        n = np.asarray(nrm, np.float64).reshape(-1, 3)
+        if getattr(self.fwd, "base_link", None):
+            if q is None:
+                raise ValueError("the retargeter has a base_link: pass q (retargeter joint order)")
+            T = self.fwd.base_transform(q)
+            p, n = (p - T[:3, 3]) @ T[:3, :3], n @ T[:3, :3]            # row form of R_bᵀ(p − t_b), R_bᵀ n
+        R = np.asarray(self.fwd.human_to_robot, np.float64)
+        return (p @ R / float(self.fwd.scale)).astype(np.float32), (n @ R).astype(np.float32)
+
+    def __repr__(self) -> str:
+        return (f"RobotToManoTaxelFrame(base_link={getattr(self.fwd, 'base_link', None)!r}, "
+                f"scale={float(self.fwd.scale):.3f})")

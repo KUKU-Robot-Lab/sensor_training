@@ -125,6 +125,44 @@ def test_calibration_recovers_known_mounting_offset():
         calibrate_imu_offsets(q_meas.numpy(), np.zeros((3, 3, 3)))
 
 
+def test_world_frame_vectors_are_calibrated_with_the_world_alignment():
+    """Devices reporting WORLD-frame gyro/acc (``vec_frame="world"``): calibration must re-express
+    them in model world (``G⁻¹ v``) like the quaternions, not rotate them by the per-site mounting
+    offsets (the sensor-frame rule) — otherwise ``imu_features(vec_frame="world")`` mixes frames and
+    depends on the session's arbitrary IMU heading. Reference: ideal segment quaternions + ideal
+    world-frame vectors."""
+    lay = load_layout("glove_template")
+    sk, t, go, fp, wp = _motion(T=64)
+    ideal = synthesize_imu(lay, sk, t, go, fp, wp)
+    T, S = ideal["quat"].shape[:2]
+    R_seg = quat_to_matrix(torch.as_tensor(ideal["quat"])).numpy()
+    gw = np.einsum("tsij,tsj->tsi", R_seg, ideal["gyro"])                       # model-world vectors
+    aw = np.einsum("tsij,tsj->tsi", R_seg, ideal["acc"])
+    f_ref = imu_features(ideal["quat"], gw, aw, 0, vec_frame="world")
+    M = _rq(S, seed=11)
+    M[0] = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float64)            # wrist mount = I (as G's estimate needs)
+    R_ref = imu_reference_rotations(lay, sk)
+    q_cal = torch.as_tensor(imu_site_quats(lay, sk, np.zeros((10, 3)), np.zeros((10, 15, 3))))
+    for heading in (0.0, 1.0, 2.5):
+        G = aa_to_quat(torch.tensor([0.2, -0.1, heading], dtype=torch.float64))
+        RG = quat_to_matrix(G).numpy()
+        q_meas = quat_mul(quat_mul(G.expand(T, S, 4), torch.as_tensor(ideal["quat"])), M.expand(T, S, 4)).numpy()
+        qc = quat_mul(quat_mul(G.expand(10, S, 4), q_cal), M.expand(10, S, 4)).numpy()
+        Gh = estimate_world_alignment(qc, R_ref, index=0)
+        off = calibrate_imu_offsets(qc, R_ref, world=Gh)
+        kw = {"vec_frame": "world", "world": Gh}
+        f = imu_features(apply_imu_offsets(q_meas, off, world=Gh), apply_imu_offsets_to_vectors(gw @ RG.T, off, **kw),
+                         apply_imu_offsets_to_vectors(aw @ RG.T, off, **kw), 0, vec_frame="world")
+        np.testing.assert_allclose(f, f_ref, atol=1e-4)                        # heading-independent, exact
+    # without a world alignment world-frame vectors stay as they are; sensor-frame ones keep R_offᵀ v
+    v = np.random.default_rng(1).normal(size=(5, S, 3))
+    np.testing.assert_array_equal(apply_imu_offsets_to_vectors(v, off, vec_frame="world"), v)
+    np.testing.assert_allclose(apply_imu_offsets_to_vectors(v, off, world=Gh),
+                               np.einsum("sji,tsj->tsi", quat_to_matrix(torch.as_tensor(off)).numpy(), v))
+    with pytest.raises(ValueError, match="vec_frame"):
+        apply_imu_offsets_to_vectors(v, off, vec_frame="body")
+
+
 def test_world_alignment_two_sided_calibration():
     S, T = 7, 20
     G = _rq(seed=9)

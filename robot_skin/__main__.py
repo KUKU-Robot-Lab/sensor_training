@@ -36,9 +36,20 @@ pretrain and vtla (``data.tactile_source: derived``, never the bootstrap fallbac
 ``calibrator.json`` and the baseline model → the policy bundle's stage-1 references
 (``tactile.calibrator`` / ``tactile.baseline_model``), the pretrained encoder → ``tactile.pretrained``.
 Resumable: a stage whose ``metrics.json`` and main artefact exist (built from the same processed root
-and splits, its derived arrays still in the episodes) is skipped unless ``--force``; once a stage runs,
-every later stage runs too (its inputs changed). ``<out>/pipeline.json`` records what ran, with which
-config (``<out>/<stage>/pipeline_config.yaml``), splits (sha256) and wiring.
+and splits — its record and its metrics.json ``data_provenance`` agree — and its derived arrays still in
+the episodes) is skipped unless ``--force``. Rerun rule: once a stage runs, every later stage runs too
+(its inputs changed) — also across invocations: each stage's record keeps the fingerprints
+(:func:`stage_fingerprint`: sha256 of metrics.json + main artefact) of the upstream runs it consumed, so
+after ``pipeline --stages baseline --force`` (or a standalone ``train baseline`` into ``<out>/baseline``)
+the next ``pipeline`` retrains contact, pretrain and vtla. ``train.resume`` is honoured only for an
+interrupted attempt on the same data and upstream runs (``<out>/<stage>/pipeline_attempt.json``); a stage
+that is *retrained* starts from scratch. The default stage list skips imu_pose (``no_data``) when no episode
+has IMUs and hand labels (robot / ``--no-imu`` data) unless a stage uses ``data.q_source: hand_pose_imu``.
+Split flags only apply when ``splits.json`` is created; flags that contradict an existing file are an error.
+Every selected stage's hardware-profile ``env`` is exported once, before the first stage
+(:func:`export_pipeline_env`). ``<out>/pipeline.json`` records what ran, with which config
+(``<out>/<stage>/pipeline_config.yaml``), splits (sha256), profile env, wiring and upstream fingerprints;
+the summary lists the stages of this invocation and flags unselected ones that are now out of date.
 """
 from __future__ import annotations
 
@@ -70,9 +81,13 @@ STAGE_INPUTS = {"imu_pose": {}, "baseline": {"imu_pose": False}, "contact": {"ba
                 "pretrain": {"contact": True}, "vtla": {"baseline": False, "contact": True, "pretrain": False}}
 #: the derived array each stage-1 stage writes into the episodes (resume: still there?)
 STAGE_DERIVED = {"imu_pose": "hand_finger_pose_imu", "baseline": "residual", "contact": "residual_z"}
+#: stages whose finished run later stages consume — fingerprinted (:func:`stage_fingerprint`) in pipeline.json
+UPSTREAM_STAGES = tuple(s for s in STAGES if any(s in ins for ins in STAGE_INPUTS.values()))
 PIPELINE_RECORD = "pipeline.json"
-PIPELINE_FORMAT = 1
+PIPELINE_FORMAT = 2
 STAGE_CONFIG_NAME = "pipeline_config.yaml"
+#: written into ``<out>/<stage>`` before a stage runs: the data it trains on (``train.resume`` check)
+STAGE_ATTEMPT_NAME = "pipeline_attempt.json"
 SPLITS_NAME = "splits.json"
 #: stage config sections whose keys the stage validates itself (TrainConfig / build_transforms)
 _OPEN_SECTIONS = ("train", "image")
@@ -106,15 +121,16 @@ def _stage_module(stage: str):
 
 def stage_config_path(stage: str, explicit: str | Path | None = None, defaults: Mapping | None = None) -> Path | None:
     """The stage YAML: ``explicit`` (``--config``), else ``configs/default.yaml`` ``stages.<stage>``
-    (a bare file name is looked up in ``robot_skin/configs/stages``), else ``None`` (the stage's
-    built-in ``CONFIG_PATH``)."""
+    (a bare file name — no directory part — is always ``robot_skin/configs/stages/<name>``, never a
+    file of that name in the working directory; a path with a directory is used as given), else
+    ``None`` (the stage's built-in ``CONFIG_PATH``)."""
     if explicit is not None:
         return Path(explicit)
     ref = ((defaults if defaults is not None else _defaults()).get("stages") or {}).get(stage)
     if not ref:
         return None
     p = Path(ref)
-    if p.is_absolute() or p.exists():
+    if p.is_absolute() or len(p.parts) > 1:
         return p
     from .config import DEFAULT_CONFIG
 
@@ -137,6 +153,58 @@ def export_profile_env(hardware: Any) -> dict | None:
         return None
     apply_profile_env(prof)
     return prof
+
+
+def _stage_hardware(stage: str, overrides: Mapping[str, Any], hardware: Any, cfg_path: str | Path | None) -> Any:
+    """The profile ``stage`` runs with in the pipeline — the precedence of :func:`run_pipeline` +
+    ``load_stage_config``: ``--set [<stage>.]hardware`` > ``--hardware`` / ``default.yaml`` > the stage YAML's own."""
+    if "hardware" in overrides:
+        return overrides["hardware"]
+    if hardware:
+        return hardware
+    import yaml
+
+    p = Path(cfg_path) if cfg_path is not None else Path(_stage_module(stage).CONFIG_PATH)
+    try:
+        y = yaml.safe_load(p.read_text()) or {}
+    except OSError:
+        return None
+    return y.get("hardware") if isinstance(y, Mapping) else None
+
+
+def export_pipeline_env(stage_hardware: Mapping[str, Any]) -> dict[str, dict[str, str | None]]:
+    """Export the ``env`` of **every** stage's hardware profile once, before ``init_distributed`` and the first CUDA
+    call: variables such as ``PYTORCH_CUDA_ALLOC_CONF`` / ``NCCL_*`` are read when the allocator / communicator is
+    initialised, so a later stage cannot change them in the same process. A variable already in the environment (the
+    user's shell) wins; two profiles that set one variable to different values are an error (``SystemExit``). Returns
+    ``{stage: {var: effective value}}`` for the variables each stage's profile sets."""
+    from .train.hardware import load_hw_profile
+
+    wanted: dict[str, tuple[str, str]] = {}
+    per_stage: dict[str, dict[str, str]] = {}
+    for stage, hw in stage_hardware.items():
+        env: dict[str, str] = {}
+        if hw:
+            try:
+                prof = dict(hw) if isinstance(hw, Mapping) else load_hw_profile(hw)
+            except FileNotFoundError as e:
+                raise SystemExit(str(e)) from None
+            except ValueError:                  # auto: no built-in profile matches this GPU
+                prof = {}
+            env = {str(k): str(v) for k, v in (prof.get("env") or {}).items()}
+        for k, v in env.items():
+            if k in os.environ:
+                continue
+            if k in wanted and wanted[k][1] != v:
+                raise SystemExit(
+                    f"pipeline: the hardware profiles of {wanted[k][0]} and {stage} set {k} to {wanted[k][1]!r} and "
+                    f"{v!r}; process-level CUDA / NCCL settings cannot change between the stages of one pipeline "
+                    f"process — export {k} yourself or run these stages in separate pipeline invocations")
+            wanted.setdefault(k, (stage, v))
+        per_stage[stage] = env
+    for k, (_, v) in wanted.items():
+        os.environ[k] = v
+    return {s: {k: os.environ.get(k) for k in env} for s, env in per_stage.items()}
 
 
 def _rank() -> int:
@@ -452,6 +520,161 @@ def _derived_intact(stage: str, out_dir: Path, processed: Path) -> bool:
     return sum((d / "derived" / f"{key}.npy").is_file() for d in list_episodes(processed)) >= n
 
 
+def stage_fingerprint(stage: str, out_dir: Path) -> str | None:
+    """sha256 over a finished stage's ``metrics.json`` and main artefact (:data:`STAGE_ARTEFACTS`): the
+    identity of the run whose outputs (files and the episodes' derived arrays) later stages consume.
+    ``None`` without a finished run. Any retraining — in the pipeline or a standalone ``train <stage>`` into
+    the same directory — rewrites both files and changes it."""
+    if not _stage_done(stage, out_dir):
+        return None
+    h = hashlib.sha256()
+    for name in ("metrics.json", STAGE_ARTEFACTS[stage]):
+        h.update(name.encode() + b"\0")
+        with open(out_dir / name, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+    return h.hexdigest()
+
+
+def _input_fingerprints(stage: str, runs: Path) -> dict[str, str | None]:
+    """``{upstream: fingerprint}`` of the finished runs ``stage`` consumes (:data:`STAGE_INPUTS`) now."""
+    return {u: stage_fingerprint(u, runs / u) for u in STAGE_INPUTS[stage]}
+
+
+def _changed_inputs(stage: str, prev: Mapping[str, Any], runs: Path) -> list[str]:
+    """Upstream stages whose finished run is no longer the one ``stage`` consumed when it last ran
+    (``prev["inputs"]`` of its pipeline record) — e.g. baseline retrained by an earlier ``pipeline --stages
+    baseline --force`` or by a standalone ``train baseline`` into ``<runs>/baseline``. The pipeline's rerun
+    rule (an upstream re-run → every later stage re-runs) therefore also holds across invocations.
+    ``[]`` for a record without ``inputs`` (written before they were recorded)."""
+    rec = prev.get("inputs")
+    if not isinstance(rec, Mapping):
+        return []
+    cur = _input_fingerprints(stage, runs)
+    return [u for u in STAGE_INPUTS[stage] if rec.get(u) != cur[u]]
+
+
+def _out_of_date(stages: Sequence[str], record: Mapping[str, Any], runs: Path,
+                 ran: Sequence[str] = ()) -> dict[str, list[str]]:
+    """For the finished ``stages``: the upstream stages that changed since they ran (:func:`_changed_inputs`;
+    for an older record without ``inputs``: the upstream stages in ``ran``), or that are out of date
+    themselves (transitively, in :data:`STAGES` order). Only non-empty entries."""
+    out: dict[str, list[str]] = {}
+    for s in STAGES:
+        if s not in stages or not _stage_done(s, runs / s):
+            continue
+        prev = record.get("stages", {}).get(s) or {}
+        why = _changed_inputs(s, prev, runs) if isinstance(prev.get("inputs"), Mapping) else \
+            [u for u in STAGE_INPUTS[s] if u in ran]
+        why += [u for u in STAGE_INPUTS[s] if u in out and u not in why]
+        if why:
+            out[s] = why
+    return out
+
+
+def _foreign_data(out_dir: Path, sha: str, processed: Path) -> str | None:
+    """Why the finished results in ``out_dir`` were not trained on the pipeline's data, from their
+    ``metrics.json`` ``data_provenance`` (:func:`robot_skin.stages.data_provenance`): another splits file or
+    none at all (the stage split its own pool — e.g. a standalone ``train <stage>`` without ``data.splits``
+    into the pipeline's directory), or another processed root. ``None`` = the same data, or unknown (no
+    provenance recorded)."""
+    try:
+        prov = json.loads((out_dir / "metrics.json").read_text()).get("data_provenance")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(prov, Mapping):
+        return None
+    if prov.get("splits_sha256") != sha:
+        return f"splits {prov.get('splits') or 'none (it split its own episode pool)'}"
+    if prov.get("processed_root") and prov.get("processed_root") != str(processed):
+        return f"processed root {prov.get('processed_root')}"
+    return None
+
+
+def _split_value(key: str, v: Any) -> Any:
+    if key == "by":
+        parts = v.split(",") if isinstance(v, str) else list(v or [])
+        return tuple(str(x).strip() for x in parts)
+    if key in ("val_frac", "test_frac"):
+        return float(v)
+    if key == "seed":
+        return int(v)
+    if key == "datasets":
+        return tuple(v) if v else None
+    return v
+
+
+def check_split_flags(split_cfg: Mapping[str, Any], splits_path: Path) -> None:
+    """Explicit split settings (``--split-by`` / ``--val-frac`` / ``--test-frac`` / ``--split-seed``) only
+    apply when the splits file is created. For an existing file (``<out>/splits.json`` or ``--splits``) a
+    setting that differs from the file's recorded ``meta`` is an error (``SystemExit``) instead of a silent
+    no-op; one the file does not record is warned about."""
+    if not split_cfg:
+        return
+    try:
+        meta = json.loads(Path(splits_path).read_text()).get("meta") or {}
+    except (OSError, ValueError, AttributeError):
+        meta = {}
+    keys = [k for k in split_cfg if k != "file"]
+    diff = [k for k in keys if k in meta and _split_value(k, split_cfg[k]) != _split_value(k, meta[k])]
+    if diff:
+        raise SystemExit(
+            f"pipeline: {splits_path} exists and was made with "
+            + ", ".join(f"{k}={meta[k]!r}" for k in diff) + " — the split settings you passed ("
+            + ", ".join(f"{k}={split_cfg[k]!r}" for k in diff) + ") only apply when the file is created. To "
+            f"re-split, delete {splits_path} and run again with --force (every stage is retrained), or use "
+            "another --out.")
+    unknown = [k for k in keys if k not in meta]
+    if unknown:
+        log.warning("pipeline: %s does not record %s — the split settings %s are not applied to an existing "
+                    "splits file", splits_path, ", ".join(unknown), {k: split_cfg[k] for k in unknown})
+
+
+def _imu_pose_has_data(cfg: Mapping[str, Any]) -> bool:
+    """Whether imu_pose's training datasets hold at least one episode with IMUs and hand labels (robot
+    sessions and ``--no-imu`` glove recordings have none)."""
+    import numpy as np
+
+    from .datasets.episode import K_HAND_FINGERS, K_HAND_VALID, K_IMU_QUAT, Episode, list_episodes
+
+    d = cfg.get("data") or {}
+    if d.get("episodes"):
+        return True                                     # an explicit episode list: the stage decides
+    root = Path(d.get("processed_root") or ".")
+    for ds in d.get("datasets") or []:
+        for p in list_episodes(root, ds):
+            try:
+                ep = Episode.load(p, mmap=True)
+            except Exception:                           # noqa: BLE001 - the stage reports unreadable episodes
+                continue
+            if ep.has(K_IMU_QUAT) and ep.has(K_HAND_FINGERS) and ep.has(K_HAND_VALID) and \
+                    bool(np.asarray(ep[K_HAND_VALID]).any()):
+                return True
+    return False
+
+
+def _resume_blocker(out_dir: Path, *, retrain: bool, upstream_ran: bool, sha: str, processed: Path,
+                    inputs: Mapping[str, Any] | None = None) -> str | None:
+    """Why ``train.resume`` must not be honoured for this stage run (``None`` = it may resume). Resuming is only
+    meant for an *interrupted* attempt on the same data: a finished stage that is retrained (``--force``, stale or
+    lost results, an upstream re-run) would otherwise "resume" its old finished checkpoint — no step is taken and
+    the old model (old splits / old upstream arrays) is exported as the new one."""
+    if retrain:
+        return "its finished run is being retrained (--force, other splits / processed root, lost derived arrays " \
+               "or an upstream stage re-ran)"
+    if upstream_ran:
+        return "an upstream stage re-ran, so its inputs changed"
+    try:
+        att = json.loads((out_dir / STAGE_ATTEMPT_NAME).read_text())
+    except (OSError, ValueError):
+        return None                                    # no earlier pipeline attempt recorded
+    if att.get("splits_sha256") != sha or att.get("processed_root") != str(processed):
+        return "the interrupted attempt was trained on another processed root / splits file"
+    if inputs is not None and isinstance(att.get("inputs"), Mapping) and dict(att["inputs"]) != dict(inputs):
+        return "an upstream stage was retrained since the interrupted attempt started, so its inputs changed"
+    return None
+
+
 def run_pipeline(processed_root: str | Path, out: str | Path, *, stages: Sequence[str] | None = None,
                  hardware: Any = None, configs: Sequence[str] | Mapping[str, Any] | None = None,
                  overrides: Sequence[str] | None = None, splits: str | Path | None = None,
@@ -478,9 +701,12 @@ def run_pipeline(processed_root: str | Path, out: str | Path, *, stages: Sequenc
     if not processed.is_dir():
         raise FileNotFoundError(f"processed root {processed} does not exist (run `python -m robot_skin preprocess`)")
     hardware = hardware if hardware is not None else defaults.get("hardware")
-    export_profile_env(hardware)
     per_stage = _stage_overrides(_parse_items(overrides or ()), sel)
     cfg_paths = _stage_configs(configs, defaults)
+    # every selected stage's profile env, before init_distributed / any CUDA call (a stage's own
+    # apply_profile_env later finds its variables set and changes nothing)
+    stage_env = export_pipeline_env({s: _stage_hardware(s, per_stage.get(s) or {}, hardware, cfg_paths.get(s))
+                                     for s in sel})
     dist = init_distributed()                          # no-op without torchrun
 
     # ── one splits.json for every stage ────────────────────────────────
@@ -501,6 +727,8 @@ def run_pipeline(processed_root: str | Path, out: str | Path, *, stages: Sequenc
                                holdout=scfg.get("holdout"))
             log.info("pipeline: wrote %s (%s)", splits_path, ", ".join(f"{k}={len(v)}" for k, v in sp.items()))
         barrier(dist)
+    if not created:                                    # explicit split flags must not be silent no-ops
+        check_split_flags(dict(split_cfg or {}), splits_path)
     sha = _file_sha256(splits_path)
 
     rec_path = runs / PIPELINE_RECORD
@@ -516,32 +744,58 @@ def run_pipeline(processed_root: str | Path, out: str | Path, *, stages: Sequenc
     record.setdefault("stages", {})
 
     upstream_ran = False
+    ran: list[str] = []
+    not_sel = [s for s in STAGES if s not in sel]
     for stage in sel:
         out_dir = runs / stage
         prev = record["stages"].get(stage) or {}
+        # consumed stages this invocation does not run whose results are out of date themselves
+        ood = _out_of_date(not_sel, record, runs, ran) if any(u in not_sel for u in STAGE_INPUTS[stage]) else {}
+        for u in STAGE_INPUTS[stage]:
+            if u in ood:
+                log.warning("pipeline: %s consumes %s, whose results are out of date (upstream changed since %s ran: "
+                            "%s) — add %s to --stages (or run the whole pipeline)", stage, u, u, ", ".join(ood[u]), u)
         done = _stage_done(stage, out_dir)
-        stale = done and prev and (prev.get("splits_sha256") != sha or prev.get("processed_root") != str(processed))
-        lost = done and not force and not upstream_ran and not _derived_intact(stage, out_dir, processed)
-        if done and not (force or upstream_ran or stale or lost):
+        stale = bool(done and prev and (prev.get("splits_sha256") != sha
+                                        or prev.get("processed_root") != str(processed)))
+        foreign = _foreign_data(out_dir, sha, processed) if done and not (force or stale) else None
+        changed = _changed_inputs(stage, prev, runs) if done and not (force or stale or foreign) else []
+        lost = done and not (force or upstream_ran or stale or foreign or changed) \
+            and not _derived_intact(stage, out_dir, processed)
+        if done and not (force or upstream_ran or stale or foreign or changed or lost):
             if not prev:
                 log.warning("pipeline: %s has results in %s but no pipeline record — assuming they were trained "
                             "on %s with %s (use --force to retrain)", stage, out_dir, processed, splits_path)
+            fp = stage_fingerprint(stage, out_dir) if stage in UPSTREAM_STAGES else None
+            if fp and prev.get("fingerprint") and prev["fingerprint"] != fp:
+                log.warning("pipeline: %s's results in %s were rewritten since the pipeline recorded them (a "
+                            "standalone run into this directory?) — keeping them; every later stage that consumed "
+                            "the old ones is retrained", stage, out_dir)
             log.info("pipeline: %s done (%s) — skipped", stage, out_dir / "metrics.json")
-            record["stages"][stage] = {**prev, "status": "skipped", "out_dir": str(out_dir)}
+            record["stages"][stage] = {**prev, "status": "skipped", "out_dir": str(out_dir),
+                                       **({"fingerprint": fp} if fp else {})}
             continue
         if stale:
             log.warning("pipeline: %s was trained on another processed root / splits file — retraining", stage)
+        elif foreign:
+            log.warning("pipeline: %s's results in %s were not trained on the pipeline's data (%s; a standalone "
+                        "`train %s` into this directory?) — retraining", stage, out_dir, foreign, stage)
+        elif changed and not (force or upstream_ran):
+            log.warning("pipeline: %s consumed an earlier run of %s, which was retrained since — retraining",
+                        stage, ", ".join(changed))
         elif lost:
             log.warning("pipeline: the episodes lost %s's derived %r arrays (re-preprocessed?) — retraining",
                         stage, STAGE_DERIVED[stage])
         wired = _wiring(stage, runs)
         upstream = {u: str(runs / u) for u in STAGE_INPUTS[stage] if _stage_done(u, runs / u)}
+        inputs = _input_fingerprints(stage, runs)
         missing = [u for u, req in STAGE_INPUTS[stage].items() if req and u not in upstream]
         if missing:
             log.warning("pipeline: %s needs the output of %s, which has no finished run in %s — relying on "
                         "derived arrays already in the episodes (add it to --stages to train it here)",
                         stage, ", ".join(missing), runs)
-        ov = {"out_dir": str(out_dir), "data": {"processed_root": str(processed), "splits": str(splits_path)}}
+        ov = {"out_dir": str(out_dir), "train": {"out_dir": str(out_dir)},
+              "data": {"processed_root": str(processed), "splits": str(splits_path)}}
         from .config import deep_merge
 
         ov = deep_merge(deep_merge(ov, wired), per_stage.get(stage) or {})
@@ -549,19 +803,44 @@ def run_pipeline(processed_root: str | Path, out: str | Path, *, stages: Sequenc
             ov.setdefault("hardware", hardware)
         mod = _stage_module(stage)
         cfg = mod.load_stage_config(cfg_paths.get(stage), ov)
+        if stage == "imu_pose" and not stages and not _imu_pose_has_data(cfg):
+            needs = [s for s in sel if s in ("baseline", "contact") and _q_source(s, cfg_paths, per_stage)
+                     == "hand_pose_imu"]
+            if not needs:
+                # optional downstream (baseline / contact default to data.q_source: q): robot sessions and
+                # --no-imu glove recordings have no IMUs — skip it instead of aborting the whole pipeline
+                log.warning("pipeline: imu_pose skipped — no episode of %s under %s has IMUs and hand labels "
+                            "(robot / --no-imu data); it is only needed for data.q_source: hand_pose_imu. Pass "
+                            "--stages to choose the stages explicitly", cfg["data"].get("datasets"), processed)
+                record["stages"][stage] = {"status": "no_data", "out_dir": str(out_dir),
+                                           "processed_root": str(processed), "splits_sha256": sha,
+                                           "finished_utc": datetime.now(timezone.utc).isoformat()}
+                continue
         if cfg.get("data", {}).get("splits") != str(splits_path):
             log.warning("pipeline: %s uses data.splits=%s, not the pipeline's %s (explicit override)",
                         stage, cfg.get("data", {}).get("splits"), splits_path)
+        resume = (cfg.get("train") or {}).get("resume")
+        if resume:
+            why = _resume_blocker(out_dir, retrain=done, upstream_ran=upstream_ran, sha=sha, processed=processed,
+                                  inputs=inputs)
+            if why:
+                log.warning("pipeline: %s: ignoring train.resume=%s — %s; training from scratch", stage, resume, why)
+                cfg["train"]["resume"] = None
+        barrier(dist)                                  # every rank decided before rank 0 rewrites the attempt file
         if dist.is_main:
             import yaml
 
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / STAGE_CONFIG_NAME).write_text(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True))
+            write_json_atomic(out_dir / STAGE_ATTEMPT_NAME, {
+                "splits_sha256": sha, "processed_root": str(processed), "inputs": inputs,
+                "started_utc": datetime.now(timezone.utc).isoformat()})
         log.info("pipeline: running %s → %s", stage, out_dir)
         t0 = time.perf_counter()
         metrics = mod.run(cfg)
         seconds = time.perf_counter() - t0
         upstream_ran = True
+        ran.append(stage)
         if dist.is_main:
             if not (out_dir / "metrics.json").is_file():
                 raise RuntimeError(f"pipeline: stage {stage} finished without writing {out_dir / 'metrics.json'}")
@@ -569,17 +848,33 @@ def run_pipeline(processed_root: str | Path, out: str | Path, *, stages: Sequenc
                 "status": "ran", "out_dir": str(out_dir), "config": str(out_dir / STAGE_CONFIG_NAME),
                 "config_source": str(cfg_paths.get(stage) or mod.CONFIG_PATH), "processed_root": str(processed),
                 "splits": str(cfg.get("data", {}).get("splits")), "splits_sha256": sha,
-                "upstream": upstream, "wired": _flat(wired), "seconds": round(seconds, 3),
+                "upstream": upstream, "inputs": inputs, "wired": _flat(wired), "env": stage_env.get(stage) or {},
+                "seconds": round(seconds, 3),
                 "finished_utc": datetime.now(timezone.utc).isoformat(),
                 "best": metrics.get("best"), "steps": metrics.get("steps")}
+            if stage in UPSTREAM_STAGES:
+                record["stages"][stage]["fingerprint"] = stage_fingerprint(stage, out_dir)
             record["updated_utc"] = datetime.now(timezone.utc).isoformat()
             write_json_atomic(rec_path, record)
         barrier(dist)
     if dist.is_main:
+        # what this invocation selected, and finished stages it did not select that are now out of date
+        # (printed by `pipeline`; the next full run retrains them)
+        record["last_invocation"] = {
+            "stages": sel, "force": bool(force), "finished_utc": datetime.now(timezone.utc).isoformat(),
+            "out_of_date": _out_of_date(not_sel, record, runs, ran)}
         record["updated_utc"] = datetime.now(timezone.utc).isoformat()
         write_json_atomic(rec_path, record)
     return record
 
+
+def _q_source(stage: str, cfg_paths: Mapping[str, Path | None], per_stage: Mapping[str, Mapping]) -> Any:
+    """``data.q_source`` of ``stage`` as the pipeline would configure it (``None`` if it cannot be loaded)."""
+    try:
+        cfg = _stage_module(stage).load_stage_config(cfg_paths.get(stage), per_stage.get(stage) or {})
+    except Exception:                                  # noqa: BLE001 - the stage reports its config errors
+        return None
+    return (cfg.get("data") or {}).get("q_source")
 
 def cmd_pipeline(argv: Sequence[str]) -> int:
     d = _defaults()
@@ -595,7 +890,9 @@ def cmd_pipeline(argv: Sequence[str]) -> int:
     _add_common(ap, config_help="per-stage YAML: STAGE=YAML, or a directory of <stage>.yaml files (repeatable); "
                                 "default configs/default.yaml `stages`", multi_config=True)
     ap.add_argument("--splits", default=None, help="use this splits.json instead of creating <out>/splits.json")
-    ap.add_argument("--split-by", default=None, help=f"make_splits group key (default {sd.get('by', 'subject')})")
+    ap.add_argument("--split-by", default=None,
+                    help=f"make_splits group key (default {sd.get('by', 'subject')}); the split flags only apply "
+                         "when <out>/splits.json is created — contradicting an existing file is an error")
     ap.add_argument("--val-frac", type=float, default=None)
     ap.add_argument("--test-frac", type=float, default=None)
     ap.add_argument("--split-seed", type=int, default=None)
@@ -615,14 +912,33 @@ def cmd_pipeline(argv: Sequence[str]) -> int:
     finally:
         cleanup()
     if _rank() == 0:
-        print(f"pipeline {rec['runs']}  (splits {rec['splits']['path']})")
-        for s, r in rec["stages"].items():
-            best = (r.get("best") or {})
-            val = best.get("value") if isinstance(best, Mapping) else None
-            extra = f"  best {best.get('monitor')}={val:.4g}" if isinstance(val, (int, float)) else ""
-            secs = f"  {r['seconds']:.1f} s" if r.get("status") == "ran" and r.get("seconds") is not None else ""
-            print(f"  {s:9s} {r.get('status', '?'):8s}{secs}{extra}")
+        print(format_summary(rec))
     return 0
+
+
+def format_summary(rec: Mapping[str, Any]) -> str:
+    """The run summary of ``pipeline``: the stages this invocation selected with their status (``ran`` /
+    ``skipped`` / ``no_data``); earlier stages of the record as ``not selected`` — flagged when an upstream
+    stage changed since they ran (the next full ``pipeline`` retrains them)."""
+    inv = rec.get("last_invocation") or {}
+    sel = inv.get("stages") or list(rec.get("stages") or {})
+    ood = inv.get("out_of_date") or {}
+    lines = [f"pipeline {rec['runs']}  (splits {rec['splits']['path']})"]
+    for s in STAGES:
+        r = (rec.get("stages") or {}).get(s)
+        if r is None:
+            continue
+        if s not in sel:
+            note = (f" — OUT OF DATE (upstream changed since it ran: {', '.join(ood[s])}); the next `pipeline` "
+                    f"retrains it (or add it to --stages)") if ood.get(s) else ""
+            lines.append(f"  {s:9s} not selected{note}")
+            continue
+        best = (r.get("best") or {})
+        val = best.get("value") if isinstance(best, Mapping) else None
+        extra = f"  best {best.get('monitor')}={val:.4g}" if isinstance(val, (int, float)) else ""
+        secs = f"  {r['seconds']:.1f} s" if r.get("status") == "ran" and r.get("seconds") is not None else ""
+        lines.append(f"  {s:9s} {r.get('status', '?'):8s}{secs}{extra}")
+    return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────────────────────── deploy / pass-through
@@ -645,10 +961,40 @@ def _with_default_config(key: str, module: str, argv: Sequence[str]) -> list[str
     return ["--config", str(p), *argv]
 
 
+def _preprocess_paths(argv: Sequence[str]) -> list[str]:
+    """``--raw`` / ``--out`` from configs/default.yaml ``paths.raw_root`` / ``paths.processed_root`` for
+    whatever neither the command line nor the preprocess config (``--config`` YAML / ``--set``) sets —
+    so ``preprocess`` reads and writes where ``record`` and ``pipeline`` do."""
+    ap = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    ap.add_argument("--raw", action="append", default=None)
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--config", default=None)
+    ap.add_argument("--set", action="append", default=[])
+    a, _ = ap.parse_known_args(list(argv))
+    from .datasets.build import DEFAULTS, _parse_set, load_preprocess_config
+
+    try:
+        cfg = load_preprocess_config(a.config, _parse_set(a.set))
+    except Exception:                                   # noqa: BLE001 - datasets.build reports it
+        return []
+    paths = _defaults().get("paths") or {}
+    extra: list[str] = []
+    if not a.raw and cfg["raw_root"] == DEFAULTS["raw_root"] and paths.get("raw_root"):
+        extra += ["--raw", str(paths["raw_root"])]
+    if a.out is None and cfg["out_root"] == DEFAULTS["out_root"] and paths.get("processed_root"):
+        extra += ["--out", str(paths["processed_root"])]
+    return extra
+
+
 def cmd_preprocess(argv: Sequence[str]) -> int:
-    """``datasets.build.main`` (the config default follows configs/default.yaml ``stages.preprocess``)."""
+    """``datasets.build.main`` (the config default follows configs/default.yaml ``stages.preprocess``;
+    ``--raw`` / ``--out`` default to configs/default.yaml ``paths.raw_root`` / ``paths.processed_root``
+    unless the preprocess config sets ``raw_root`` / ``out_root``)."""
     mod = "robot_skin.datasets.build"
-    return _call_main(mod, _with_default_config("preprocess", mod, argv))
+    argv = _with_default_config("preprocess", mod, argv)
+    if any(x in ("-h", "--help") for x in argv):
+        return _call_main(mod, argv)
+    return _call_main(mod, [*argv, *_preprocess_paths(argv)])
 
 
 def cmd_deploy(argv: Sequence[str]) -> int:

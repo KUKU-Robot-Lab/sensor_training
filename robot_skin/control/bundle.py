@@ -17,7 +17,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
-__all__ = ["PolicyBundle", "load_policy_bundle"]
+__all__ = ["PolicyBundle", "load_policy_bundle", "LAYOUT_TAXEL_FRAME"]
+
+#: ``layout.parent_frame`` → frame of the processed episodes' ``taxel_pos`` (``datasets.build``)
+LAYOUT_TAXEL_FRAME = {"mano": "mano_wrist", "urdf": "urdf_root"}
 
 
 @dataclass
@@ -66,6 +69,13 @@ class PolicyBundle:
     @property
     def tactile_source(self) -> str:
         return str((self.tactile or {}).get("source", "derived"))
+
+    @property
+    def mask_dead_taxels(self) -> bool:
+        """Whether the policy was trained with dead channels hidden (``tactile.mask_dead_taxels``,
+        vtla ``data.mask_dead_taxels``): control then hides the session's dead channels
+        (``OnlineTactileProcessor.dead``) through ``taxel_pad`` the same way. Older bundles: False."""
+        return bool((self.tactile or {}).get("mask_dead_taxels", False))
 
     @property
     def uses_tactile(self) -> bool:
@@ -120,6 +130,27 @@ class PolicyBundle:
                 names.add(Path(x).stem)
         return name in names
 
+    @property
+    def taxel_frames(self) -> tuple[str, ...]:
+        """Frames of the taxel poses the tactile encoder was trained on (``meta.preprocessing.
+        taxel_frame`` of the training episodes: ``mano_wrist`` for gloves, ``urdf_root`` for robots,
+        ``layout`` for static poses), recorded by the vtla stage as ``tactile.taxel_frames``. Older
+        bundles: inferred from ``tactile.layouts`` (MANO-parented layout → ``mano_wrist``, URDF →
+        ``urdf_root``); ``()`` when unknown."""
+        from common.layouts import load_layout
+
+        tac = self.tactile or {}
+        if tac.get("taxel_frames"):
+            return tuple(sorted({str(f) for f in tac["taxel_frames"]}))
+        out = set()
+        for x in tac.get("layouts") or []:
+            try:
+                pf = load_layout(str(x)).parent_frame
+            except Exception:  # noqa: BLE001 - a moved / foreign layout file: frame unknown
+                continue
+            out.add(LAYOUT_TAXEL_FRAME.get(pf, "layout"))
+        return tuple(sorted(out))
+
     def check_deployable(self, *, allow_bootstrap: bool = False) -> None:
         """Raise if the bundle must not drive hardware: tactile levels from the **bootstrap**
         stand-in (``tactile.source`` bootstrap / mixed: a static reference without the motion-artefact
@@ -137,7 +168,8 @@ class PolicyBundle:
                 "obs_history": self.obs_history, "head": self.head, "cameras": list(self.cameras),
                 "obs_mode": None if self.feature_spec is None else self.feature_spec.obs_mode,
                 "tactile_source": self.tactile_source, "contact_rule": self.contact_rule,
-                "ensemble_k": self.ensemble_k}
+                "mask_dead_taxels": self.mask_dead_taxels,
+                "taxel_frames": list(self.taxel_frames), "ensemble_k": self.ensemble_k}
 
 
 def load_policy_bundle(bundle: Any, *, device: str | Any = "cpu", allow_bootstrap: bool = True) -> PolicyBundle:

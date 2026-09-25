@@ -7,16 +7,21 @@
 # configs/hardware/. Conventions everywhere: ΔS in % (SATS sign: press → negative), time in s,
 # positions in m, quaternions wxyz, 6D rotation = first two matrix columns, MANO joint order.
 
+# Unknown keys are errors (robot_skin.config.SCHEMA). `train <stage>` does not read `paths` (its stage YAML's
+# data.processed_root / train.out_dir, or --set); every other command does.
 paths:
-  raw_root: robot_skin/data/raw              # recorded sessions (acquisition loggers --root; preprocess --raw)
-  processed_root: robot_skin/data/processed  # episodes <dataset>/<episode_id> (preprocess --out; stage data.processed_root)
+  raw_root: robot_skin/data/raw              # recorded sessions (`record` default --root; `preprocess` default --raw)
+  processed_root: robot_skin/data/processed  # episodes <dataset>/<episode_id> (`preprocess` default --out; `splits` /
+                                             #   `pipeline` default --processed)
   runs_root: robot_skin/runs                 # pipeline --out: <runs_root>/<stage>/, splits.json, pipeline.json
-  synthetic_root: robot_skin/data/synthetic  # `synth` output (synthetic raw sessions — keep apart from real data)
+  synthetic_root: robot_skin/data/synthetic  # `synth` and `record --fake` output (synthetic raw sessions — keep apart
+                                             #   from real data)
 
 hardware: null          # default --hardware for train / pipeline / deploy: rtx5090 | rtx4090 | rtx3090 | a100 |
                         # cpu | auto | a profile YAML path | null (each stage YAML's own `hardware`)
 
-stages:                 # stage config files (bare names: robot_skin/configs/stages/<name>)
+stages:                 # stage config files (bare names: robot_skin/configs/stages/<name>, never the working directory;
+                        # a path with a directory is used as given)
   preprocess: preprocess.yaml
   imu_pose: imu_pose.yaml
   baseline: baseline.yaml
@@ -28,7 +33,8 @@ stages:                 # stage config files (bare names: robot_skin/configs/sta
 pipeline:
   stages: [imu_pose, baseline, contact, pretrain, vtla]   # always run in this order
   splits:               # one splits.json (datasets.splits.make_splits) shared by every stage
-    file: splits.json   # <runs>/splits.json, created once (delete it — and --force — to re-split)
+    file: splits.json   # <runs>/splits.json, created once (delete it — and --force — to re-split; split flags that
+                        # contradict an existing file are an error)
     by: subject         # group key: subject | session | object | task | dataset | kind | episode_id
     val_frac: 0.15
     test_frac: 0.15

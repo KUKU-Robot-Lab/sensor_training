@@ -15,7 +15,9 @@ checked live and can be repeated), logs the instruction and the success verdict 
 
 1. **sync** — 3-tap cross-correlation, timestamps corrected in place (``sync.sync_session``);
 2. **IMU calibration** — flat-hand block → ``manifest.calibration`` (``calibration.calibrate_session_imu``);
-3. **QC** — ``qc.session_qc`` → ``qc.json``.
+3. **segments** — ``manifest.segments`` re-derived from ``events.jsonl`` (:func:`refresh_segments`; after a
+   manual boundary fix the CLI below brings the manifest in line with the events);
+4. **QC** — ``qc.session_qc`` → ``qc.json``.
 
 Operators: :class:`AutoOperator` follows the nominal timeline exactly (synthetic ``--fake`` runs
 under a :class:`~robot_skin.acquisition.sources.SimClock`); :class:`ConsoleOperator` prompts a
@@ -38,14 +40,14 @@ from .calibration import calibrate_session_imu, compute_imu_calibration
 from .manifest import SessionManifest, StreamInfo
 from .protocol import EpisodePlan, SessionPlan, Step, SyncSpec, TimedStep, Timing, make_session_id
 from .qc import format_report, session_qc
-from .recorder import TIME_EPS, Recorder, segments_from_events
+from .recorder import TIME_EPS, Recorder, load_events, segments_from_events, session_segments
 from .sources import Clock, MonotonicClock
 from .sync import ClockModel, apply_clock_models, sync_session
 
 __all__ = [
     "AutoOperator", "ConsoleOperator", "Operator", "adhoc_plan", "copy_imu_calibration", "fake_source_factory",
     "planned_streams",
-    "postprocess_session", "record_episode", "run_plan", "write_dry_run",
+    "postprocess_session", "record_episode", "refresh_segments", "run_plan", "write_dry_run",
 ]
 
 log = logging.getLogger(__name__)
@@ -374,12 +376,34 @@ def copy_imu_calibration(session_dir: str | Path, source_session: str | Path) ->
     return {k: src[k] for k in keys}
 
 
+def refresh_segments(session_dir: str | Path) -> dict:
+    """Re-derive ``manifest.segments`` of a recorded session from its (possibly hand-edited)
+    ``events.jsonl`` (:func:`~robot_skin.acquisition.recorder.session_segments`: phase segments from
+    the events + the explicit ones) and save the manifest when they changed. Sessions not written
+    by the recorder keep their segments. Returns ``{"updated", "segments", "notes"}``."""
+    d = Path(session_dir)
+    m = SessionManifest.load(d)
+    rec = m.meta.get("recorder") if isinstance(m.meta.get("recorder"), Mapping) else {}
+    t_end = rec.get("duration_s")
+    segs, notes = session_segments(m, load_events(d), None if t_end is None else float(t_end))
+    key = lambda s: (float(s["t0"]), float(s["t1"]), str(s["label"]))  # noqa: E731
+    updated = bool(rec) and sorted(map(key, segs)) != sorted(map(key, m.segments))
+    if updated:
+        m.segments = [dict(s) for s in segs]
+        m.validate()
+        m.save(d)
+        log.info("%s: manifest segments re-derived from events.jsonl (%d segments)", d, len(segs))
+    return {"updated": updated, "segments": segs, "notes": notes}
+
+
 def postprocess_session(session_dir: str | Path, *, sync: bool = True, calibrate: bool = True, qc: bool = True,
                         sync_from: str | Path | None = None, calibration_from: str | Path | None = None) -> dict:
     """Sync (or apply another session's clock models), IMU calibration (or copy it from
-    ``calibration_from`` when this session has no calibration block), QC (``qc.json``)."""
+    ``calibration_from`` when this session has no calibration block), manifest segments re-derived
+    from ``events.jsonl`` (:func:`refresh_segments` — a hand-corrected phase boundary reaches the
+    segments, labels and baseline window), QC (``qc.json``)."""
     d = Path(session_dir)
-    out: dict[str, Any] = {"sync": None, "calibration": None, "qc": None}
+    out: dict[str, Any] = {"sync": None, "calibration": None, "segments": None, "qc": None}
     if sync_from is not None:
         src = SessionManifest.load(sync_from).calibration.get("sync") or {}
         models = {n: ClockModel.from_dict(e) for n, e in src.get("streams", {}).items() if e.get("offset_s") is not None}
@@ -395,6 +419,7 @@ def postprocess_session(session_dir: str | Path, *, sync: bool = True, calibrate
         out["calibration"] = calibrate_session_imu(d)
         if out["calibration"] is None and calibration_from is not None:
             out["calibration"] = copy_imu_calibration(d, calibration_from)
+    out["segments"] = refresh_segments(d)
     if qc:
         out["qc"] = session_qc(d, write=True)
     out["manifest"] = SessionManifest.load(d)
@@ -445,7 +470,8 @@ def run_plan(plan: SessionPlan, *, kind: str, source_factory: Callable[[EpisodeP
 # ── CLI: re-run post-processing on recorded sessions ─────────────────────────
 def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="python -m robot_skin.acquisition.session",
-                                description="Re-run sync / IMU calibration / QC on recorded session dirs.")
+                                description="Re-run sync / IMU calibration / segments (from events.jsonl) / QC "
+                                            "on recorded session dirs.")
     p.add_argument("sessions", nargs="+", type=Path)
     p.add_argument("--no-sync", action="store_true")
     p.add_argument("--no-calibrate", action="store_true")

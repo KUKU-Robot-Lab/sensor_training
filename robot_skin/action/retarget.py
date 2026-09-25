@@ -118,8 +118,7 @@ class FingertipRetargeter:
                       ("smooth_weight", smooth_weight), ("lr", lr), ("tol", tol), ("ftol", ftol)):
             if not (math.isfinite(v) and v >= 0):
                 raise ValueError(f"{nm} must be finite and >= 0, got {v}")
-        if not (math.isfinite(scale) and scale > 0):
-            raise ValueError(f"scale must be > 0, got {scale}")
+        self.scale = scale                     # validated (finite, > 0) by the property setter
         self.dtype, self.device = dtype, torch.device(device)
         self.method = method
         self.iters = int(iters if iters is not None else _DEFAULT_ITERS[method])
@@ -127,7 +126,6 @@ class FingertipRetargeter:
             raise ValueError("iters must be >= 1")
         self.lr, self.tol, self.ftol = float(lr), float(tol), float(ftol)
         self.jacobian = jacobian
-        self.scale = float(scale)
         self.tip_weight, self.pair_weight = float(tip_weight), float(pair_weight)
         self.reg_weight, self.smooth_weight = float(reg_weight), float(smooth_weight)
         self.pinch_threshold = None if pinch_threshold is None else float(pinch_threshold)
@@ -218,6 +216,24 @@ class FingertipRetargeter:
         self._last: torch.Tensor | None = None
         self.last_info: dict = {}
 
+    @property
+    def scale(self) -> float:
+        """Robot/human size ratio multiplying the human vectors (constructor ``scale``). Assignments
+        are validated like the constructor argument: a non-finite or non-positive factor (e.g. a
+        ``scale: 0`` config typo) would collapse or mirror every target — a flat human hand would
+        command a fist — so it raises instead."""
+        return self._scale
+
+    @scale.setter
+    def scale(self, value: float) -> None:
+        try:
+            s = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"scale must be a finite number > 0, got {value!r}") from None
+        if not (math.isfinite(s) and s > 0):
+            raise ValueError(f"scale must be > 0, got {s}")
+        self._scale = s
+
     @classmethod
     def from_config(cls, fk, cfg: Mapping | None = None) -> "FingertipRetargeter":
         """Build from a plain dict (YAML ``retarget:`` block): keys are the constructor arguments
@@ -292,6 +308,21 @@ class FingertipRetargeter:
                     p = (p[..., None, :] @ base_R)[..., 0, :]
             pts[f] = p
         return pts
+
+    def base_transform(self, q) -> np.ndarray:
+        """``[4,4]`` pose of ``base_link`` in the FK output (URDF root) frame at one configuration
+        ``q[D]`` — the frame :meth:`robot_points` expresses the robot keypoints in (identity without
+        a base link; a position-only base output gives an identity rotation)."""
+        T = np.eye(4)
+        if not self.base_link:
+            return T
+        with torch.no_grad():
+            b = self._fk(self._q_batch(q, 1, "q"))[self.base_link].to(self.dtype)
+        b = b.detach().cpu().numpy().astype(np.float64)
+        if b.shape[-2:] == (4, 4):
+            return b.reshape(-1, 4, 4)[0].copy()
+        T[:3, 3] = b.reshape(-1, 3)[0]
+        return T
 
     def robot_vectors(self, q: torch.Tensor) -> torch.Tensor:
         """``[B,V,3]`` robot keypoint vectors (``self.vectors`` order)."""

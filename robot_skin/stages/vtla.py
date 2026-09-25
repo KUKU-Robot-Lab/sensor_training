@@ -14,7 +14,9 @@ Model: :class:`robot_skin.vtla.VTLAPolicy` (ACT chunk regression or flow-matchin
 2. split: ``data.splits`` (a ``datasets.splits`` ``splits.json``: dirs or ids) or
    :func:`robot_skin.datasets.splits.make_splits` grouped by ``data.split_by`` (leakage-safe);
 3. datasets at ``policy.policy_hz`` ticks inside ``data.phases``; the action normalizer (on the
-   relative chunks) and the proprio normalizer are fit on the **train** split only;
+   relative chunks) and the proprio normalizer are fit on the **train** split only; each episode's
+   dead channels (``meta.preprocessing.dead_taxels``) are hidden via ``taxel_pad``
+   (``data.mask_dead_taxels``, default on — they would hold a ``level_ge_weak`` ContactGate open);
 4. model (tactile branch optionally initialised from ``tactile.pretrained`` = the pretrain stage's
    ``encoder_state.pt``, optionally frozen); image transforms from ``image`` (train augmentation /
    matching eval transform); optional frozen-vision feature cache (``vision.cache_features``: the
@@ -86,6 +88,7 @@ DEFAULTS: dict[str, Any] = {
         "tactile_source": "auto",
         "bootstrap": {},
         "contact_rule": "level_ge_weak",
+        "mask_dead_taxels": True,
         "aux_target": "label",
     },
     "policy": {"policy_hz": 20.0, "horizon": 16, "obs_history": 1, "chunk_offset": 1,
@@ -137,11 +140,34 @@ _OPEN_SECTIONS = ("train", "image")
 
 # ─────────────────────────────────────────────────────────────── config
 
+def _report_dead_taxels(eps: Sequence[Any], ds_kw: Mapping[str, Any]) -> None:
+    """Dead channels (``meta.preprocessing.dead_taxels``: saturated in every frame) of the usable
+    episodes: logged when ``data.mask_dead_taxels`` hides them (``taxel_pad``), a warning when they
+    reach the policy under ``level_ge_weak`` (they hold the hard ContactGate open on every sample).
+    Silent without a tactile branch (``features.obs_mode: none``)."""
+    from ..vtla.dataset import episode_dead_taxels
+
+    if int(getattr(ds_kw.get("feature_spec"), "dim", 1)) == 0:
+        return
+    dead = {e.meta.episode_id: np.flatnonzero(episode_dead_taxels(e)).tolist() for e in eps}
+    dead = {k: v for k, v in dead.items() if v}
+    if not dead:
+        return
+    head = f"{len(dead)}/{len(eps)} episodes have dead tactile channels (e.g. {next(iter(dead.items()))})"
+    if ds_kw.get("mask_dead_taxels", True):
+        log.info("vtla: %s — masked from the policy input (data.mask_dead_taxels)", head)
+    elif ds_kw.get("contact_rule") == "level_ge_weak":
+        warnings.warn(f"{head}: with data.mask_dead_taxels=false and contact_rule level_ge_weak they count as "
+                      "contact in every frame, so the ContactGate never closes on those episodes — set "
+                      "data.mask_dead_taxels=true (or contact_rule weak_or_strong)", stacklevel=2)
+
+
 def check_config(cfg: Mapping[str, Any]) -> None:
     """Raise ``ValueError`` for keys unknown to :data:`DEFAULTS` (top level and one level into
-    every section except ``train`` / ``image``) and for non-mapping sections — a typo in the YAML or
-    a ``--set`` must not be silently ignored. Architecture keys the stage derives itself (e.g.
-    ``model.horizon`` ← ``policy.horizon``) are therefore rejected in ``model`` too."""
+    every section except ``train`` / ``image``; ``train`` keys must be ``TrainConfig`` fields) and for
+    non-mapping sections — a typo in the YAML or a ``--set`` must not be silently ignored.
+    Architecture keys the stage derives itself (e.g. ``model.horizon`` ← ``policy.horizon``) are
+    therefore rejected in ``model`` too."""
     bad = sorted(set(cfg) - set(DEFAULTS))
     if bad:
         raise ValueError(f"{STAGE}: unknown config keys {bad}; valid: {sorted(DEFAULTS)}")
@@ -159,6 +185,10 @@ def check_config(cfg: Mapping[str, Any]) -> None:
         bad = sorted(set(v) - set(dv))
         if bad:
             raise ValueError(f"{STAGE}: unknown keys {bad} in section {sec!r}; valid: {sorted(dv)}")
+    from . import check_train_keys
+
+    check_train_keys(cfg, STAGE)            # train: TrainConfig fields (open in DEFAULTS)
+
 
 def apply_hardware(cfg: Mapping[str, Any]) -> dict:
     """Apply ``cfg["hardware"]`` (profile name / path / mapping / ``"auto"``) once: export its
@@ -194,8 +224,9 @@ def load_stage_config(path: str | Path | None = None,
         raise FileNotFoundError(f"stage config not found: {p}")
     else:
         cfg = copy.deepcopy(DEFAULTS)
-    ov = dict(overrides or {})
-    hw_keys = {k: ov.pop(k) for k in ("hardware", "hardware_applied") if k in ov}
+    from . import hardware_overrides
+
+    hw_keys, ov = hardware_overrides(cfg, overrides)     # another profile than a saved config's: re-applied
     cfg = apply_hardware(deep_merge(cfg, hw_keys))
     cfg = _replace_encoders(deep_merge(cfg, ov), ov)
     check_config(cfg)
@@ -512,15 +543,17 @@ def run(cfg: Mapping[str, Any] | None = None) -> dict:
     """Train the VTLA policy; returns (and writes) the metrics dict; writes ``policy_bundle.pt``."""
     from ..representation.encoder import load_pretrained_encoder
     from ..train import TrainConfig, Trainer, barrier, seed_everything
-    from ..train.checkpoint import BEST_NAME
     from ..train.distributed import init_distributed
     from ..vtla.dataset import VTLACollator, VTLADataset, eval_transform_to_dict
     from ..vtla.losses import vtla_loss
     from ..vtla.model import POLICY_BUNDLE_NAME, VTLAPolicy, save_policy_bundle
 
+    from . import data_provenance
+
     cfg = resolve_config(cfg)
     out_dir = Path(cfg["out_dir"])
     d_cfg, p_cfg, a_cfg, t_cfg = cfg["data"], cfg["policy"], cfg["action"], cfg["tactile"]
+    provenance = data_provenance(d_cfg)            # the splits file / processed root this run trains on
     spec = TactileFeatureSpec.from_dict(cfg["features"])
 
     # pretrained tactile encoder (its feature spec is authoritative)
@@ -554,9 +587,11 @@ def run(cfg: Mapping[str, Any] | None = None) -> dict:
                  min_valid_steps=int(d_cfg.get("min_valid_steps", 1)),
                  require_valid_state=bool(d_cfg.get("require_valid_state", True)),
                  contact_rule=d_cfg.get("contact_rule", "level_ge_weak"),
+                 mask_dead_taxels=bool(d_cfg.get("mask_dead_taxels", True)),
                  aux_target=d_cfg.get("aux_target", "label"),
                  tactile_source=d_cfg.get("tactile_source", "auto"),
                  bootstrap=d_cfg.get("bootstrap") or {})
+    _report_dead_taxels(eps, ds_kw)
     train_ds = VTLADataset(split["train"], **ds_kw)
     if len(train_ds) == 0:
         raise ValueError(f"{len(split['train'])} training episodes but no sample ticks (phases "
@@ -620,6 +655,7 @@ def run(cfg: Mapping[str, Any] | None = None) -> dict:
         "stage": STAGE,
         "out_dir": str(out_dir),
         "bundle_path": str(out_dir / POLICY_BUNDLE_NAME),
+        "data_provenance": provenance,
         "n_episodes": {"found": len(dirs), "skipped": len(skipped),
                        **{k: len(v) for k, v in split.items()}},
         "n_samples": {"train": len(train_ds),
@@ -634,11 +670,9 @@ def run(cfg: Mapping[str, Any] | None = None) -> dict:
         "final_train_loss": history[-1].get("train/loss") if history else None,
     }
     if trainer.dist.is_main:
-        best = out_dir / BEST_NAME
-        if best.is_file():
-            Trainer.load_model_weights(model, best, use_ema=True)
-        elif trainer.ema is not None:
-            trainer.ema.apply_to(model)
+        from . import restore_best_weights
+
+        restore_best_weights(trainer, model)   # this run's best (EMA) weights, never another run's file
         model.eval()
         e_cfg = cfg.get("eval") or {}
         eval_sets = {k: others.get(k) for k in (e_cfg.get("splits") or ["val", "test"])
@@ -662,13 +696,19 @@ def run(cfg: Mapping[str, Any] | None = None) -> dict:
                      "history": int(p_cfg["obs_history"])},
             tactile={"feature_spec": spec.to_dict(), "obs_mode": spec.obs_mode,
                      "contact_rule": ds_kw["contact_rule"], "source": train_ds.tactile_source,
+                     # control masks the deployment session's dead channels like training did
+                     "mask_dead_taxels": ds_kw["mask_dead_taxels"],
                      "bootstrap": (dict(d_cfg.get("bootstrap") or {})
                                    if train_ds.tactile_source in ("bootstrap", "mixed") else None),
                      "calibrator": t_cfg.get("calibrator"),
                      "calibrator_state": _calibrator_state(t_cfg.get("calibrator")),
                      "baseline_model": t_cfg.get("baseline_model"),
                      "pretrained_encoder": t_cfg.get("pretrained"), "frozen": bool(t_cfg.get("freeze")),
-                     "layouts": sorted({e.meta.layout for e in eps})},
+                     "layouts": sorted({e.meta.layout for e in eps}),
+                     # frame of the taxel poses the encoder saw (glove mano_wrist / robot urdf_root):
+                     # deployment re-expresses the skin's poses in it (control.PolicyRunner)
+                     "taxel_frames": sorted({str((e.meta.preprocessing or {}).get("taxel_frame"))
+                                             for e in eps if (e.meta.preprocessing or {}).get("taxel_frame")})},
             vision={"cameras": list(cameras), "encoder": model.cfg.vision, "frozen": model.cfg.vision_frozen,
                     "cached_features_key": cache_key, "eval_transform": eval_transform_to_dict(eval_tf),
                     "transform_config": cfg.get("image")},

@@ -61,7 +61,11 @@ torchrun --standalone --nproc_per_node=2 -m robot_skin train vtla --hardware rtx
 - `--set KEY=V` 는 그 키를 가진 모든 stage 에, `--set <stage>.KEY=V` 는 한 stage 에만 (stage 지정이 우선).
   어느 stage 에도 없는 키는 오류.
 - 재개: `metrics.json` + 주 산출물이 있고 같은 processed root·splits 로 학습된 stage 는 건너뛴다(`--force` 로
-  재학습). 한 stage 가 다시 돌면 그 뒤 stage 도 모두 다시 돈다(입력이 바뀌었으므로).
+  재학습; stage 가 `metrics.json` 에 남기는 `data_provenance` 로 다른 run 이 쓴 결과도 가려낸다). 한 stage 가 다시 돌면
+  그 뒤 stage 도 모두 다시 돈다(입력이 바뀌었으므로) — 다음 실행에서도: `pipeline.json` 이 각 stage 가 소비한 앞 stage
+  run 의 지문을 기록한다(`--stages baseline --force` 뒤의 `pipeline` 은 contact·pretrain·vtla 를 다시 학습). split 옵션은
+  splits.json 을 만들 때만 쓰이고, 이미 있는 파일과 다르면 오류. 기본 stage 목록에서 imu_pose 는 IMU 데이터가 없으면
+  (로봇, `--no-imu`) `no_data` 로 건너뛴다.
 
 ## 모듈
 
@@ -85,7 +89,7 @@ torchrun --standalone --nproc_per_node=2 -m robot_skin train vtla --hardware rtx
 | `stages/` | `imu_pose`, `baseline`, `contact`, `pretrain`, `vtla`, `deploy` 러너 (`run(cfg) -> metrics`) | — |
 | `policy/`, `sim/`, `eval/` | 관측 ablation 빌더, per-taxel 도메인 랜덤화, 지표(환각률·분리도·포화 복구) | RL 학습, touch-grid 환경 |
 
-설정: `configs/default.yaml`(최상위: 경로·stage 설정 파일·파이프라인), `configs/stages/<stage>.yaml`(각 stage 가
-직접 읽고 키를 검증), `configs/hardware/*.yaml`. 데이터·산출물: `data/`, `runs/` (git-ignored).
+설정: `configs/default.yaml`(최상위: 경로·stage 설정 파일·파이프라인; 키 검증), `configs/stages/<stage>.yaml`(각 stage 가
+직접 읽고 키를 검증 — `train:` 은 `TrainConfig` 필드), `configs/hardware/*.yaml`. 데이터·산출물: `data/`, `runs/` (git-ignored).
 인용은 [`docs/REFERENCES.md`](../docs/REFERENCES.md) 에 있는 논문만.
 `deformable_sats` 는 import 하지 않는다 — 공유 규약은 전부 `common/`.

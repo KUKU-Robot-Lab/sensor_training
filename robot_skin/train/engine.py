@@ -59,8 +59,8 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 
 from .checkpoint import (BEST_NAME, LAST_NAME, find_last, load_checkpoint, save_checkpoint,
                          strip_state_dict_prefixes)
-from .distributed import (DistInfo, all_reduce_sum, init_distributed, make_eval_sampler,
-                          make_sampler, unwrap_model, wrap_ddp)
+from .distributed import (DistInfo, all_ranks_equal, all_reduce_sum, init_distributed,
+                          make_eval_sampler, make_sampler, unwrap_model, wrap_ddp)
 from .hardware import (_PRECISION_ALIASES, describe_environment, enable_tf32, resolve_device,
                        resolve_precision)
 from .logging_utils import JsonlLogger
@@ -68,7 +68,10 @@ from .optim import EMA, OPTIMIZERS, SCHEDULES, build_optimizer, build_scheduler
 
 log = logging.getLogger("robot_skin.train")
 
-__all__ = ["TrainConfig", "Trainer", "seed_everything", "seed_worker", "move_to_device",
+#: sub-directory of ``out_dir`` that receives an earlier run's files when a fresh run starts there
+PREVIOUS_RUN_DIR = "previous"
+
+__all__ =["TrainConfig", "Trainer", "seed_everything", "seed_worker", "move_to_device",
            "maybe_compile"]
 
 
@@ -434,7 +437,8 @@ class Trainer:
             ``DataLoader`` (used as-is).
         collate_fn: passed to the DataLoaders built here.
         extra_state: dict (or zero-arg callable returning one) stored as ``ckpt["extra"]`` —
-            normalisers, model config, anything inference needs. Restored on resume.
+            normalisers, model config, anything inference needs. Restored on resume only when
+            none is given (the caller's freshly computed state wins).
         optimizer: optional ``Optimizer`` or ``callable(model) -> Optimizer`` replacing
             :func:`~robot_skin.train.optim.build_optimizer`.
         callbacks: ``cb(trainer, row) -> dict | None`` called at each epoch end (after
@@ -464,8 +468,9 @@ class Trainer:
 
         self.device = resolve_device(c.device,
                                      local_rank=self.dist.local_rank if self.dist.distributed else None)
-        if c.tf32 and self.device.type == "cuda":
-            enable_tf32(True)
+        # process-global: set it for *this* run either way — an earlier Trainer in the same process
+        # (pipeline, sweep) may have enabled TF32, and `tf32: false` / a CPU run must not inherit it
+        enable_tf32(bool(c.tf32 and self.device.type == "cuda"))
         self.precision = resolve_precision(c.precision, self.device)
         self._non_blocking = self.device.type == "cuda" and c.pin_memory
         self.out_dir = Path(c.out_dir)
@@ -492,6 +497,7 @@ class Trainer:
             self.total_steps = None
 
         # optimisation
+        self._own_optimizer = optimizer is None   # resume re-applies the config's lr / weight decay
         if optimizer is None:
             self.optimizer = build_optimizer(self.model, c.optimizer, c.lr, c.weight_decay,
                                              c.betas, eps=c.eps, lr_mult=c.lr_mult)
@@ -534,6 +540,7 @@ class Trainer:
         self.bad_epochs = 0
         self.should_stop = False
         self.stopped_early = False
+        self._finished_early = False  # resumed a run that had already stopped early → nothing to do
         self.resumed_from: Path | None = None
         self.logger: JsonlLogger | None = None
         self._monitor_used: str | None = None
@@ -591,6 +598,26 @@ class Trainer:
         for p in self._params():
             if p.grad is not None:
                 p.grad.mul_(factor)
+
+    @torch.no_grad()
+    def _all_reduce_grads(self) -> None:
+        """Average the gradients over the DDP ranks outside DDP's hooks (what its backward
+        all-reduce does): params without a gradient on some rank contribute zeros; params without
+        one on every rank keep ``grad=None``. Same parameter order on every rank."""
+        import torch.distributed as tdist
+
+        group = getattr(self._ddp, "process_group", None)
+        world = tdist.get_world_size(group)
+        params = [p for p in self._params() if p.requires_grad]
+        has = torch.tensor([float(p.grad is not None) for p in params], device=self.device)
+        tdist.all_reduce(has, group=group)
+        for p, n in zip(params, has.tolist()):
+            if n == 0:
+                continue
+            if p.grad is None:
+                p.grad = torch.zeros_like(p)
+            tdist.all_reduce(p.grad, group=group)
+            p.grad.div_(world)
 
     def _zero_grad(self) -> None:
         """Clear optimizer *and* model grads (params excluded via ``lr_mult: 0`` still receive
@@ -717,8 +744,13 @@ class Trainer:
                 break
         else:
             if pending:  # unknown-length loader ended mid accumulation group
+                if self._ddp is not None:
+                    # every micro-batch of this group ran under no_sync (gsize = accum) → no
+                    # all-reduce happened; average by hand or each replica steps with its own
+                    # local gradient and the replicas drift apart (an IterableDataset must still
+                    # yield the same batch count on every rank)
+                    self._all_reduce_grads()
                 # each micro-batch was weighted 1/accum → renormalise to the group actually seen
-                # (DDP: an IterableDataset must yield the same batch count on every rank anyway)
                 if pending < accum:
                     self._scale_grads(accum / pending)
                 grad_norm = self._optimizer_step()
@@ -854,6 +886,8 @@ class Trainer:
 
     def _budget_done(self) -> bool:
         c = self.cfg
+        if self._finished_early:
+            return True
         if c.max_steps is not None:
             return self.step >= c.max_steps
         return self.epoch >= c.max_epochs
@@ -871,8 +905,29 @@ class Trainer:
         tmp.write_text(json.dumps(obj, indent=2, default=str))
         os.replace(tmp, self.out_dir / name)
 
+    def _set_aside_previous_run(self) -> None:
+        """A fresh (not resumed) run into an ``out_dir`` holding another run's files: move that
+        run's checkpoints, ``metrics.jsonl`` and ``history.json`` to ``out_dir/previous/``
+        (replacing an older set). Otherwise a stale ``ckpt_best.pt`` could be exported as this
+        run's model (when this run never records a finite monitor value) and ``metrics.jsonl``
+        would interleave two runs."""
+        names = (LAST_NAME, BEST_NAME, "metrics.jsonl", "history.json")
+        stale = [self.out_dir / n for n in names if (self.out_dir / n).is_file()]
+        if not stale:
+            return
+        prev = self.out_dir / PREVIOUS_RUN_DIR
+        shutil.rmtree(prev, ignore_errors=True)
+        prev.mkdir(parents=True, exist_ok=True)
+        for f in stale:
+            os.replace(f, prev / f.name)
+        log.warning("fresh run (no resume) in %s: moved the previous run's %s to %s/", self.out_dir,
+                    ", ".join(f.name for f in stale), PREVIOUS_RUN_DIR)
+
     def _open_run(self) -> None:
         c = self.cfg
+        if (self.dist.is_main and self.resumed_from is None and self.step == 0
+                and not self.history):
+            self._set_aside_previous_run()
         if self.logger is None:
             self.logger = JsonlLogger(
                 self.out_dir, enabled=self.dist.is_main, tensorboard=c.tensorboard,
@@ -980,9 +1035,17 @@ class Trainer:
             "best": {"value": self.best_value, "epoch": self.best_epoch, "step": self.best_step,
                      "monitor": self._monitor_used or self.cfg.monitor},
             "bad_epochs": self.bad_epochs,
+            "stopped_early": self.stopped_early,
             "history": [dict(r) for r in self.history],
+            "data": self._data_fingerprint(),
             "rng": _rng_state(self._loader_gen),
         }
+
+    def _data_fingerprint(self) -> dict:
+        """What the run trains on, stored in the checkpoint: a resume onto another training set
+        (other split / processed root) warns instead of silently continuing the old model."""
+        return {"train_samples": _safe_len(getattr(self.train_loader, "dataset", None)),
+                "batches_per_epoch": self.batches_per_epoch, "world_size": self.dist.world_size}
 
     def save_checkpoint(self, path: str | Path | None = None) -> Path:
         """Atomically write :meth:`state_dict` (default ``out_dir/ckpt_last.pt``)."""
@@ -990,12 +1053,22 @@ class Trainer:
                                **self.state_dict())
 
     def load_state_dict(self, ckpt: Mapping[str, Any]) -> None:
-        """Restore everything saved by :meth:`state_dict`."""
+        """Restore everything saved by :meth:`state_dict`.
+
+        With the optimizer built here (no ``optimizer=`` argument) the *current* config's ``lr``
+        (× ``lr_mult``), ``weight_decay``, ``betas`` / ``eps`` are re-applied over the restored
+        optimizer state, and the LR at the restored step is recomputed from them (a run can be
+        continued with a lower ``lr``); the moments / momentum buffers are kept. A user-supplied
+        optimizer keeps the checkpoint's hyper-parameters (plain PyTorch semantics)."""
         self.model.load_state_dict(strip_state_dict_prefixes(ckpt["model"]))
+        fresh = ([{k: v for k, v in g.items() if k != "params"} for g in self.optimizer.param_groups]
+                 if self._own_optimizer and ckpt.get("optimizer") is not None else None)
         if ckpt.get("optimizer") is not None:
             self.optimizer.load_state_dict(ckpt["optimizer"])
         if ckpt.get("scheduler") is not None and self.scheduler is not None:
             self.scheduler.load_state_dict(ckpt["scheduler"])
+        if fresh is not None:
+            self._reapply_optimizer_config(fresh)
         if ckpt.get("scaler") is not None:
             if self.scaler is not None:
                 self.scaler.load_state_dict(ckpt["scaler"])
@@ -1016,36 +1089,115 @@ class Trainer:
         self.best_value, self.best_epoch, self.best_step = (best.get("value"), best.get("epoch"),
                                                             best.get("step"))
         self.bad_epochs = int(ckpt.get("bad_epochs", 0))
-        if ckpt.get("extra") is not None and not callable(self.extra_state):
-            self.extra_state = ckpt["extra"]
+        if ckpt.get("extra") is not None and self.extra_state is None:
+            self.extra_state = ckpt["extra"]           # the caller's own extra_state wins
         old = ckpt.get("config") or {}
         changed = [k for k in ("batch_size", "grad_accum", "seed")
                    if k in old and old[k] != getattr(self.cfg, k)]
         if changed:
             warnings.warn(f"resuming with changed {changed}: data order / effective batch differ "
                           "from the original run", stacklevel=2)
+        old_n = (ckpt.get("data") or {}).get("train_samples")
+        new_n = self._data_fingerprint()["train_samples"]
+        if old_n is not None and new_n is not None and old_n != new_n:
+            warnings.warn(f"resuming on a different training set ({old_n} → {new_n} samples): the "
+                          "checkpoint was trained on other data (another split / processed root?) "
+                          "— set train.resume: null to train from scratch", stacklevel=2)
+        self.stopped_early = bool(ckpt.get("stopped_early", False))
+        self._finished_early = False
+        if self.stopped_early:
+            if self._early_stop_relaxed(old):
+                self.stopped_early = False             # patience / budget raised: keep training
+            else:
+                self._finished_early = True            # already done: fit() takes no step
         if ckpt.get("rng") is not None and not self.dist.distributed:
             _set_rng_state(ckpt["rng"], self._loader_gen)
         elif self.dist.distributed:  # keep per-rank streams distinct after resume
             seed_everything(self.cfg.seed + self.dist.rank + 1000003 * self.step,
                             self.cfg.deterministic)
 
+    #: optimizer-group keys reported when a resume re-applies a changed config value
+    _HPARAM_KEYS = ("initial_lr", "weight_decay", "betas", "eps", "momentum", "lr_mult")
+
+    def _reapply_optimizer_config(self, fresh: Sequence[Mapping[str, Any]]) -> None:
+        """After loading optimizer / scheduler state: put back the hyper-parameters the current
+        config built (``fresh``: the groups before loading) and recompute the LR at the restored
+        step from them — the checkpoint's lr / weight decay would otherwise silently win."""
+        groups = self.optimizer.param_groups
+        if len(groups) != len(fresh):  # pragma: no cover - load_state_dict already checks this
+            return
+        changed = sorted({("lr" if k == "initial_lr" else k) for g, f in zip(groups, fresh)
+                          for k in self._HPARAM_KEYS if k in f and k in g and g[k] != f[k]})
+        for g, f in zip(groups, fresh):
+            g.update({k: v for k, v in f.items() if k != "lr"})
+        if self.scheduler is not None:
+            sch = self.scheduler
+            sch.base_lrs = [g.get("initial_lr", f["lr"]) for g, f in zip(groups, fresh)]
+            lams = getattr(sch, "lr_lambdas", None)
+            if lams is not None and len(lams) == len(groups):
+                lrs = [b * lam(sch.last_epoch) for b, lam in zip(sch.base_lrs, lams)]
+            else:  # pragma: no cover - build_scheduler always returns a LambdaLR
+                lrs = list(sch.base_lrs)
+            for g, lr in zip(groups, lrs):
+                g["lr"] = lr
+            sch._last_lr = list(lrs)
+        else:
+            for g, f in zip(groups, fresh):
+                g["lr"] = f["lr"]
+        if changed:
+            warnings.warn(f"resuming with changed optimizer settings {changed}: the current config's "
+                          "values are used (optimizer moments are kept)", stacklevel=3)
+
+    def _early_stop_relaxed(self, old: Mapping[str, Any]) -> bool:
+        """Whether the current config lets a run that stopped early keep training: early stopping
+        disabled or its patience raised, or a larger budget than the checkpoint's."""
+        c = self.cfg
+        op = old.get("early_stop_patience")
+        if c.early_stop_patience is None or (op is not None and c.early_stop_patience > op):
+            return True
+        if c.max_steps is not None:
+            om = old.get("max_steps")
+            return om is None or c.max_steps > int(om)
+        if old.get("max_steps") is not None:
+            return True
+        return c.max_epochs > int(old.get("max_epochs", c.max_epochs))
+
     def resume(self, path: str | Path = "auto") -> Path | None:
         """Load a checkpoint (``"auto"`` → :func:`find_last` in ``out_dir``; returns ``None`` if
-        there is nothing to resume). Returns the path loaded."""
+        there is nothing to resume). Returns the path loaded.
+
+        Under DDP this is collective (``fit()`` calls it on every rank): the ranks must agree on
+        whether a checkpoint exists and on its step / epoch — otherwise (e.g. node-local
+        ``out_dir``s where only rank 0's node holds the checkpoint) the replicas would resume from
+        different states, so a ``RuntimeError`` is raised on every rank. Multi-node resume needs a
+        shared ``out_dir`` or the checkpoint copied to every node."""
         if str(path) == "auto":
             p = find_last(self.out_dir)
-            if p is None:
-                log.info("resume='auto': no checkpoint in %s — starting fresh", self.out_dir)
-                return None
         else:
             p = Path(path)
+        found = p is not None and p.exists()
+        self._check_ranks_agree("whether a checkpoint to resume exists", [float(found)], p)
+        if not found:
+            if str(path) != "auto":
+                raise FileNotFoundError(f"checkpoint not found: {p}")
+            log.info("resume='auto': no checkpoint in %s — starting fresh", self.out_dir)
+            return None
         ckpt = load_checkpoint(p, map_location="cpu")
         self.load_state_dict(ckpt)
+        self._check_ranks_agree("the resume point (step, epoch, batch_in_epoch)",
+                                [self.step, self.epoch, self.batch_in_epoch], p)
         self.resumed_from = p
         if self.dist.is_main:
             log.info("resumed from %s (epoch %d, step %d)", p, self.epoch, self.step)
         return p
+
+    def _check_ranks_agree(self, what: str, values: Sequence[float], path: Path | None) -> None:
+        if not self.dist.distributed or all_ranks_equal(values):
+            return
+        raise RuntimeError(
+            f"DDP resume: the ranks disagree on {what} (rank {self.dist.rank}: {list(values)}, "
+            f"checkpoint {path}); every rank must see the same checkpoint — use an out_dir shared by "
+            "all nodes or copy the checkpoint to every node's out_dir (only rank 0 writes checkpoints)")
 
     @staticmethod
     def load_model_weights(model: nn.Module, path: str | Path, use_ema: bool = True,

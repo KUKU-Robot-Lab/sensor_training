@@ -15,7 +15,10 @@ inside the selected phases:
   (derived ``residual_z`` / ``contact_level`` + ``saturated``) — the *same* function
   (:func:`~robot_skin.representation.tactile_value_features`) the pretrainer and online control
   use; ``taxel_pos`` / ``taxel_nrm [N,3]`` (hand / robot base frame); ``contact [N]`` for the
-  :class:`~robot_skin.vtla.adapter.ContactGate` (:func:`contact_from_level`);
+  :class:`~robot_skin.vtla.adapter.ContactGate` (:func:`contact_from_level`); ``taxel_pad [N]`` flags
+  taxels hidden from the model — non-finite poses and (``mask_dead_taxels``, default) the episode's
+  **dead channels** (``meta.preprocessing.dead_taxels``: saturated in every frame, so under
+  ``level_ge_weak`` they would hold the ContactGate open on every sample);
 - ``images {cam: [(k,)3,h,w]}`` through the image transform (train augmentation or eval), or cached
   frozen-encoder features ``vision_feats {cam: [(k,)P,D]}`` (:mod:`robot_skin.vision.feature_cache`);
   ``vision_valid {cam: [k]}`` is False before a camera's first frame;
@@ -55,7 +58,8 @@ from ..representation.encoder import TactileFeatureSpec
 __all__ = [
     "TASK_PHASES", "CONTACT_RULES", "AUX_TARGETS", "TACTILE_SOURCES", "BOOTSTRAP_DEFAULTS",
     "PSEUDO_LABEL_KEY",
-    "bootstrap_tactile_arrays", "episode_tactile", "contact_from_level", "sample_phase_mask",
+    "bootstrap_tactile_arrays", "episode_tactile", "episode_dead_taxels", "contact_from_level",
+    "sample_phase_mask",
     "history_ticks", "eval_transform_to_dict", "eval_transform_from_dict", "make_observation",
     "VTLADataset", "VTLACollator", "collate_vtla",
 ]
@@ -149,6 +153,18 @@ def episode_tactile(ep: Episode, source: str = "auto", bootstrap: Mapping[str, f
         return ep.derived(D_RESIDUAL_Z), ep.derived(D_LEVEL), sat, "derived"
     z, lv, sat = bootstrap_tactile_arrays(ep, **dict(bootstrap or {}))
     return z, lv, sat, "bootstrap"
+
+
+def episode_dead_taxels(ep: Episode) -> np.ndarray:
+    """``[N]`` bool: the episode's dead channels (``meta.preprocessing.dead_taxels``, written by
+    :mod:`robot_skin.datasets.build` for a baseline ≤ 0 — ΔS 0 and saturated in every frame)."""
+    n = int(ep.meta.n_taxels)
+    out = np.zeros(n, bool)
+    for i in (ep.meta.preprocessing or {}).get("dead_taxels") or ():
+        if not 0 <= int(i) < n:
+            raise ValueError(f"episode {ep.meta.episode_id!r}: dead taxel {i} outside 0…{n - 1}")
+        out[int(i)] = True
+    return out
 
 
 def contact_from_level(level: Any, saturated: Any = None, rule: str = "level_ge_weak") -> np.ndarray:
@@ -245,7 +261,8 @@ def make_observation(*, proprio_states: Any, tactile_values: Any, taxel_pos: Any
                      proprio_normalizer: ActionNormalizer | None = None,
                      images: Mapping[str, Any] | None = None,
                      vision_feats: Mapping[str, Any] | None = None,
-                     vision_valid: Mapping[str, Any] | None = None) -> dict[str, Any]:
+                     vision_valid: Mapping[str, Any] | None = None,
+                     taxel_mask: Any = None) -> dict[str, Any]:
     """One observation as the model consumes it (unbatched torch tensors; batch with
     :func:`collate_vtla`). Shared by :class:`VTLADataset` and online control.
 
@@ -256,6 +273,10 @@ def make_observation(*, proprio_states: Any, tactile_values: Any, taxel_pos: Any
             :class:`~robot_skin.representation.TactileHistory`); ``taxel_pos``/``taxel_nrm``
             ``[N,3]`` (non-finite poses are zeroed and the taxel flagged in ``taxel_pad``);
             ``contact`` ``[N]`` bool (:func:`contact_from_level`).
+        taxel_mask: optional ``[N]`` bool, True = hide the taxel (e.g. a dead channel —
+            :func:`episode_dead_taxels` offline, the online processor's ``dead`` at deployment):
+            flagged in ``taxel_pad`` like a non-finite pose, so it is invisible to the tactile
+            encoder / adapter and never opens the ContactGate.
         images: ``{cam: float [(k,)3,h,w]}`` already transformed (eval transform online), or
         vision_feats: ``{cam: [(k,)P,D]}``; ``vision_valid``: ``{cam: bool [k]}`` (default True).
     """
@@ -274,6 +295,11 @@ def make_observation(*, proprio_states: Any, tactile_values: Any, taxel_pos: Any
         raise ValueError(f"tactile_values [N,F] / contact [N] do not match {pos.shape[0]} taxels "
                          f"(got {vals.shape} / {con.shape})")
     bad = ~(np.isfinite(pos).all(-1) & np.isfinite(nrm).all(-1))
+    if taxel_mask is not None:
+        tm = np.asarray(taxel_mask, dtype=bool)
+        if tm.shape != bad.shape:
+            raise ValueError(f"taxel_mask must be [{bad.shape[0]}] bool, got {tm.shape}")
+        bad = bad | tm
     obs: dict[str, Any] = {
         "proprio": torch.from_numpy(np.ascontiguousarray(st.reshape(-1))),
         "tactile_values": torch.as_tensor(vals),
@@ -322,6 +348,9 @@ class VTLADataset(Dataset):
         min_valid_steps: minimum valid chunk steps for a tick to be sampled.
         require_valid_state: skip ticks whose current state is invalid (``hand_pose_valid``).
         contact_rule: :data:`CONTACT_RULES`; aux_target: :data:`AUX_TARGETS`.
+        mask_dead_taxels: hide each episode's dead channels (:func:`episode_dead_taxels`) through
+            ``taxel_pad`` (not when that would hide every taxel of the episode); :attr:`dead_taxels`
+            lists them per episode either way.
         tactile_source: :data:`TACTILE_SOURCES`; bootstrap: :data:`BOOTSTRAP_DEFAULTS` overrides.
     """
 
@@ -336,7 +365,8 @@ class VTLADataset(Dataset):
                  phases: str | Sequence[str] | None = "task", sample_stride: int | None = None,
                  min_valid_steps: int = 1, require_valid_state: bool = True,
                  contact_rule: str = "level_ge_weak", aux_target: str = "label",
-                 tactile_source: str = "auto", bootstrap: Mapping[str, float] | None = None) -> None:
+                 tactile_source: str = "auto", bootstrap: Mapping[str, float] | None = None,
+                 mask_dead_taxels: bool = True) -> None:
         if horizon < 1 or obs_history < 1 or chunk_offset < 0 or min_valid_steps < 0:
             raise ValueError("need horizon >= 1, obs_history >= 1, chunk_offset >= 0, min_valid_steps >= 0")
         if rel_mode not in REL_MODES:
@@ -420,6 +450,20 @@ class VTLADataset(Dataset):
             z, lv, sat, used = episode_tactile(ep, tactile_source, bootstrap)
             self._tactile.append((z, lv, sat))
             self.tactile_sources[ep.meta.episode_id] = used
+        # dead channels (preprocessing: baseline ≤ 0 → saturated in every frame)
+        self.mask_dead_taxels = bool(mask_dead_taxels)
+        self.dead_taxels: dict[str, list[int]] = {}
+        self._taxel_mask: list[np.ndarray | None] = []
+        for ep in self.episodes:
+            dead = episode_dead_taxels(ep)
+            if not dead.any():
+                self._taxel_mask.append(None)
+                continue
+            self.dead_taxels[ep.meta.episode_id] = [int(i) for i in np.flatnonzero(dead)]
+            if self.mask_dead_taxels and dead.all():
+                warnings.warn(f"episode {ep.meta.episode_id!r}: every taxel is a dead channel — not masked "
+                              "(the tactile encoder needs ≥ 1 visible taxel)", stacklevel=2)
+            self._taxel_mask.append(dead if self.mask_dead_taxels and not dead.all() else None)
         n_boot = sum(s == "bootstrap" for s in self.tactile_sources.values())
         if n_boot and tactile_source == "auto":
             warnings.warn(f"{n_boot}/{len(self.episodes)} episodes lack the contact stage's derived "
@@ -578,7 +622,7 @@ class VTLADataset(Dataset):
         obs = make_observation(proprio_states=a[hist], tactile_values=values, taxel_pos=pos,
                                taxel_nrm=nrm, contact=contact, instruction=ep.meta.instruction or "",
                                proprio_normalizer=self.proprio_normalizer, images=images,
-                               vision_feats=feats, vision_valid=valid)
+                               vision_feats=feats, vision_valid=valid, taxel_mask=self._taxel_mask[e])
         tgt, tmask = self._aux_target(ep, t, N, lv_t, sat_t)
         obs.update({
             "actions": torch.from_numpy(np.ascontiguousarray(act, dtype=np.float32)),

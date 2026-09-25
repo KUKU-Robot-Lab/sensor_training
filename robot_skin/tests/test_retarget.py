@@ -285,6 +285,20 @@ def test_constructor_validation():
         make().retarget(np.zeros((5, 3)))                                    # 5 tips for 2 human names
 
 
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf"), "big"])
+def test_scale_is_validated_on_assignment_too(bad):
+    """``scale`` must be finite and > 0 whether passed to the constructor or assigned later (the
+    deploy stage sets it after building the retargeter): 0 collapses every target, < 0 mirrors it."""
+    with pytest.raises(ValueError, match="scale"):
+        make(scale=bad)
+    rt = make(scale=1.5)
+    with pytest.raises(ValueError, match="scale"):
+        rt.scale = bad
+    assert rt.scale == 1.5                                                   # unchanged after the rejection
+    rt.scale = 2                                                             # ints are fine
+    assert rt.scale == 2.0 and isinstance(rt.scale, float)
+
+
 def test_spec_positional_order_and_input_validation():
     # spec order: fk, tip_links, lower, upper, human_tip_names, scale, reg_weight, smooth_weight, iters, lr
     rt = FingertipRetargeter(toy_fk, TIPS, LO, HI, HUMAN, 1.0, 1e-12, 1e-6, 40, 0.02)

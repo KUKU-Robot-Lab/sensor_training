@@ -11,7 +11,8 @@ Masks (``masks="auto"``) keep the statistics honest:
 - hand-pose keys, and ``q`` / ``qd`` of glove episodes (they are the vision finger pose), use only
   ``hand_pose_valid`` frames — for ``qd`` additionally eroded by the derivative filter's footprint
   (:func:`qd_valid_mask`), so the velocity spikes where a held label jumps back after a gap never
-  inflate the scale.
+  inflate the scale; robot ``q`` / ``qd`` likewise use ``joint_state_valid`` (frames the joint
+  state measured: inside its span, no sample gap), IMU features ``imu_valid``.
 
 ``method``: ``std`` (mean / std, accumulated per episode with Chan's parallel update, so episodes are
 never concatenated), ``robust`` (median / IQR·/1.349 on at most ``max_samples`` frames per episode,
@@ -31,7 +32,7 @@ from common.signal import NormStats
 
 from .episode import (
     D_BASELINE_PRED, D_RESIDUAL, D_RESIDUAL_Z, K_DELTA, K_HAND_FINGERS, K_HAND_GLOBAL, K_HAND_VALID, K_HAND_WRIST,
-    K_PRESSURE_RAW, K_Q, K_QD, K_SATURATED, Episode,
+    K_IMU_VALID, K_JOINT_VALID, K_PRESSURE_RAW, K_Q, K_QD, K_SATURATED, Episode,
 )
 
 __all__ = [
@@ -71,11 +72,28 @@ def _q_from_hand(ep: Episode) -> bool:
     return src == "hand_pose" or (src is None and ep.meta.kind == "glove")
 
 
+def _q_mask_key(ep: Episode) -> str | None:
+    """Array that says which frames' ``q`` is measured: ``hand_pose_valid`` (glove, q = vision finger
+    pose), ``joint_state_valid`` (robot joint state), ``imu_valid`` (``q_source: hand_pose_imu``
+    views: q = the IMU pose model's output); None when the episode has none of them."""
+    src = (ep.meta.preprocessing or {}).get("q_source")
+    if ep.has(K_HAND_VALID) and _q_from_hand(ep):
+        return K_HAND_VALID
+    if src == "joint_state" and ep.has(K_JOINT_VALID):
+        return K_JOINT_VALID
+    if src == "hand_pose_imu" and ep.has(K_IMU_VALID):
+        return K_IMU_VALID
+    return None
+
+
 def q_valid_mask(ep: Episode) -> np.ndarray:
     """``[T]`` frames whose ``q`` is a measurement: ``hand_pose_valid`` for glove episodes (q = vision
-    finger pose; invalid frames hold the last label), all frames for joint-state q."""
-    if ep.has(K_HAND_VALID) and _q_from_hand(ep):
-        return np.asarray(ep[K_HAND_VALID], dtype=bool)
+    finger pose; invalid frames hold the last label), ``joint_state_valid`` for joint-state q (frames
+    outside the joint stream's span or inside a sample gap are edge-held / bridged), ``imu_valid``
+    for IMU-model q; all frames for episodes without such an array (built before them)."""
+    key = _q_mask_key(ep)
+    if key is not None:
+        return np.asarray(ep[key], dtype=bool)
     return np.ones(ep.T, dtype=bool)
 
 
@@ -84,7 +102,8 @@ def qd_valid_mask(ep: Episode) -> np.ndarray:
     the preprocessing derivative filter (``datasets.build.qd_support`` with the episode's
     ``meta.preprocessing.config.qd``). Around a hand-label gap the held ``q`` jumps back to the true
     pose, which the Savitzky–Golay derivative turns into a velocity spike on frames whose own ``q``
-    is valid; those frames are excluded here. Joint-state ``q`` → all frames."""
+    is valid; those frames are excluded here (the same for a joint-state gap). Driver velocities
+    (``qd_source: file``) → :func:`q_valid_mask` itself."""
     qv = q_valid_mask(ep)
     if qv.all():
         return qv
@@ -105,17 +124,20 @@ def qd_valid_mask(ep: Episode) -> np.ndarray:
 
 def default_mask(ep: Episode, key: str) -> np.ndarray | None:
     """The ``masks="auto"`` rule: ``~saturated`` ``[T,N]`` for ΔS-like keys, ``hand_pose_valid``
-    ``[T]`` for hand keys and glove ``q`` (:func:`q_valid_mask`), :func:`qd_valid_mask` for glove
-    ``qd``, else None (all frames)."""
+    ``[T]`` for hand keys, :func:`q_valid_mask` / :func:`qd_valid_mask` for ``q`` / ``qd`` (glove:
+    hand-valid frames; robot: ``joint_state_valid``), ``imu_valid`` for :data:`IMU_FEATURES`, else
+    None (all frames)."""
     if key in SATURATION_MASKED and ep.has(K_SATURATED):
         return ~np.asarray(ep[K_SATURATED], dtype=bool)
     if ep.has(K_HAND_VALID) and key in HAND_MASKED:
         return np.asarray(ep[K_HAND_VALID], dtype=bool)
-    if ep.has(K_HAND_VALID) and _q_from_hand(ep):
+    if _q_mask_key(ep) is not None:
         if key == K_Q:
             return q_valid_mask(ep)
         if key == K_QD:
             return qd_valid_mask(ep)
+    if key == IMU_FEATURES and ep.has(K_IMU_VALID):
+        return np.asarray(ep[K_IMU_VALID], dtype=bool)
     return None
 
 

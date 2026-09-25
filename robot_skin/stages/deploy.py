@@ -16,7 +16,9 @@ the skin the policy was trained on, usually the glove). ``run(cfg) -> metrics``
 Steps: load the bundle (:func:`robot_skin.control.load_policy_bundle`; bootstrap-trained bundles are
 refused unless ``allow_bootstrap``) → tactile processor (:class:`~robot_skin.control.
 OnlineTactileProcessor`: robot stage-1 models from ``stage1.*``, bundle references only when they
-belong to this skin) → retargeter for ``hand_mano`` bundles (:func:`build_retargeter`) → safety
+belong to this skin) → retargeter for ``hand_mano`` bundles (:func:`build_retargeter`; it also maps the
+robot skin's URDF-root taxel poses into the MANO wrist frame for a glove-trained tactile encoder — the
+runner's ``taxel_frame="auto"``, reported in ``notes``) → safety
 filter (limits, velocity / acceleration, tactile stop per kinematic chain, sensor watchdog, e-stop
 → ``robot.estop``) → :class:`~robot_skin.control.PolicyRunner` (start-up baseline capture and
 optional bring-up calibration, rollout for ``duration_s``) → deployment session log (RAW format,
@@ -24,7 +26,8 @@ re-ingestible) → optional policy latency benchmark → ``<out_dir>/metrics.jso
 
 Metrics: ``loop_hz`` (simulated / host clock) and ``loop_hz_wall``, ``latency_p50_ms`` /
 ``latency_p95_ms`` (policy inference), ``tick_p50_ms`` / ``tick_p95_ms`` (whole control tick),
-``overruns``, ``safety_counts`` / ``safety_events`` / ``estop``, ``contact_frac``, ``n_policy_ticks``,
+``overruns`` / ``catchup_ticks`` (ticks run late, fed samples interpolated at their scheduled time),
+``safety_counts`` / ``safety_events`` / ``estop``, ``contact_frac``, ``n_policy_ticks``,
 ``session_dir`` and ``benchmark`` (``latency.benchmark_policy``).
 """
 from __future__ import annotations
@@ -156,7 +159,8 @@ def build_retargeter(model: Any, layout: Any, cfg: Mapping[str, Any] | None = No
     a dict, or null), ``human_to_robot`` (default :data:`~robot_skin.control.interfaces.
     SYNTHETIC_HAND_HUMAN_TO_ROBOT` for the synthetic hand, else identity with a warning), ``scale``
     (``auto``: :meth:`~robot_skin.action.FingertipRetargeter.estimate_scale` between the flat MANO
-    hand and the robot at q = 0 — the AnyTeleop convention, the factor multiplies human vectors)."""
+    hand and the robot at q = 0 — the AnyTeleop convention, the factor multiplies human vectors; an
+    explicit value must be finite and > 0, else ``ValueError``)."""
     from ..action.retarget import FingertipRetargeter, human_fingertips
     from ..control.interfaces import FINGERS, SYNTHETIC_HAND_HUMAN_TO_ROBOT, layout_tip_offsets, urdf_tip_fk
 
@@ -183,7 +187,11 @@ def build_retargeter(model: Any, layout: Any, cfg: Mapping[str, Any] | None = No
     if scale == "auto" or scale is None:
         flat = human_fingertips(np.zeros((15, 3)))
         scale = rt.estimate_scale(flat, q_ref=np.clip(np.zeros(model.n_dof), model.lower, model.upper))
-    rt.scale = float(scale)
+    try:
+        rt.scale = scale                     # validated setter: finite and > 0
+    except ValueError as e:
+        # 0 collapses every target (a flat human hand commands a fist), < 0 mirrors the fingers
+        raise ValueError(f"retarget.scale must be 'auto' or a finite number > 0, got {scale!r} ({e})") from None
     return rt
 
 
@@ -373,6 +381,8 @@ def run(cfg: Mapping[str, Any] | None = None, *, robot: Any = None, cameras: Any
                           control_hz=control_hz, policy_hz=cfg["policy_hz"], instruction=instruction, clock=clock,
                           logger=logger, hand_state_fn=hand_state_fn, hand_state_init=cfg["hand_state"]["init"],
                           device=device, seed=int(cfg["seed"]), allow_bootstrap=bool(cfg["allow_bootstrap"]))
+    if runner.taxel_frame_info:
+        notes.append(runner.taxel_frame_info)
     st = cfg["startup"]
     m = runner.run(float(cfg["duration_s"]), baseline_s=float(st["baseline_s"]), calib_s=float(st["calib_s"] or 0.0))
 

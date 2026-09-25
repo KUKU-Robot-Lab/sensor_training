@@ -25,7 +25,7 @@ def _one_thread():
 
 def make_bundle(path, kind="robot_joint", *, cams=("ego",), head="chunk", action_offset=None, calibrator=True,
                 source="derived", obs_history=1, fsm=None, layouts=None, rel_mode="delta", cal_logvar=False,
-                baseline_ref=None):
+                baseline_ref=None, taxel_frames=None, mask_dead_taxels=None):
     """A small untrained VTLA bundle written with the vtla APIs (the way stages/vtla.py does).
     ``action_offset``: robot_joint actions ≈ this constant (normalizer offset, tiny scale);
     ``cal_logvar``: the embedded calibrator used the baseline log-variance (contact-stage default);
@@ -66,6 +66,10 @@ def make_bundle(path, kind="robot_joint", *, cams=("ego",), head="chunk", action
            "baseline_model": baseline_ref}
     if layouts is not None:
         tac["layouts"] = list(layouts)
+    if taxel_frames is not None:
+        tac["taxel_frames"] = list(taxel_frames)
+    if mask_dead_taxels is not None:
+        tac["mask_dead_taxels"] = bool(mask_dead_taxels)
     return save_policy_bundle(
         path, m, action={"spec": spec.to_dict(), "normalizer": an.to_dict(), "rel_mode": rel_mode, "chunk_offset": 1},
         proprio={"normalizer": pn.to_dict(), "history": obs_history, "source": "action_state"}, tactile=tac,
@@ -306,6 +310,34 @@ def test_baseline_capture_window_is_real_time_when_rail_samples_are_skipped():
     np.testing.assert_array_equal(proc.finish_baseline(), np.median(kept))   # ticks 0-4 only
 
 
+def test_baseline_capture_marks_a_rail_stuck_channel_dead_instead_of_failing():
+    """A dead / unplugged channel (on the ADC rail in every sample) must not void the whole window
+    (every frame has a rail taxel → "only 0 usable samples"): it is marked dead (baseline 0 → ΔS 0,
+    always saturated) as preprocessing does, the other taxels get their median over the frames
+    without a rail on a *live* taxel."""
+    from robot_skin.control import OnlineTactileProcessor
+
+    proc = OnlineTactileProcessor("robot_hand_template", None, None, raw_order="layout", baseline_s=0.05)
+    proc.begin_baseline()
+    for i in range(20):
+        r = np.full(9, 1.0e6 + i)
+        r[4] = ADC_MIN                                                  # dead channel
+        if i == 3:
+            r[0] = ADC_MIN                                              # a transient rail on a live taxel
+        proc.add_baseline_sample(r)
+    base = proc.finish_baseline()
+    assert proc.dead.tolist() == [i == 4 for i in range(9)] and base[4] == 0.0
+    live = [i for i in range(9) if i != 4]
+    np.testing.assert_array_equal(base[live], np.median([1.0e6 + i for i in range(10) if i != 3]))
+    fr = proc.step(np.full(9, 1.0e6), pos=np.zeros((9, 3)), nrm=np.tile([0.0, 0.0, 1.0], (9, 1)))
+    assert fr.saturated[4] and fr.delta[4] == 0.0 and fr.level[4] == ContactLevel.SATURATED
+    proc.begin_baseline()
+    for _ in range(5):
+        proc.add_baseline_sample(np.full(9, ADC_MIN))
+    with pytest.raises(RuntimeError, match="usable baseline"):
+        proc.finish_baseline()                                          # every channel dead: refuse
+
+
 def test_startup_calibrator_matches_noise_level():
     from robot_skin.control import OnlineTactileProcessor, startup_calibrator
     from robot_skin.representation import TactileFeatureSpec
@@ -420,6 +452,98 @@ def test_safety_watchdog_holds_then_estops():
     s.filter([0.9], t=2.2, stamps={"pressure": 1.0})
     assert s.estopped and "stale" in s.estop_reason
     assert s.summary()["estop"] is True
+
+
+def test_safety_watchdog_ages_streams_reported_only_now_and_then():
+    """The runner reports camera stamps on policy ticks only (1 tick in 10): a frozen camera must stay
+    stale in between and escalate to the e-stop — not toggle stale_on / stale_off every tick."""
+    from robot_skin.control import SafetyFilter
+
+    s = SafetyFilter([-1], [1], dt=0.005, watchdog={"max_age_s": {"pressure": 0.05, "camera_*": 0.5},
+                                                    "estop_after_s": 0.5})
+    s.reset([0.0])
+    t = 0.0
+    for k in range(400):
+        t = 0.005 * k
+        st = {"pressure": t}
+        if k % 10 == 0:
+            st["camera_ego"] = 0.0                                      # the camera froze at t = 0
+        q = s.filter([0.5], t=t, stamps=st)
+        if t > 0.5:
+            assert s.stale and q[0] == s.q_last[0]                      # held on every tick, not 1 in 10
+        if s.estopped:
+            break
+    assert s.estopped and "camera_ego" in s.estop_reason
+    assert 1.0 <= t <= 1.02                                             # stale after 0.5 s, e-stop 0.5 s later
+    assert s.counts["stale_on"] == 1 and "stale_off" not in s.counts
+    s.reset([0.0])                                                      # a restart forgets the old stamps
+    s.filter([0.5], t=10.0, stamps={"pressure": 10.0})
+    assert not s.stale
+
+
+def test_safety_reset_never_starts_from_a_nonfinite_position():
+    """A single NaN joint reading at (re)start must not become the filter's position: every later
+    command is ``prev + clipped step`` and would be NaN forever (the non-finite *target* rule falls
+    back to that NaN ``prev``). reset keeps the previous command for such joints, or refuses."""
+    from robot_skin.control import SafetyFilter
+
+    s = SafetyFilter([-1, -1], [1, 1], dt=0.01, max_vel=1.0)
+    with pytest.raises(ValueError, match="non-finite"):
+        s.reset([0.2, np.nan])                                          # nothing to fall back to
+    s.reset([0.2, 0.3])
+    s.reset([0.25, np.nan])
+    np.testing.assert_allclose(s.q_last, [0.25, 0.3])                   # the glitched joint keeps its command
+    q = np.stack([s.filter([0.5, 0.5], [np.nan, 0.3], t=0.01 * i) for i in range(5)])
+    assert np.isfinite(q).all() and q[-1, 1] > 0.3
+    with pytest.raises(ValueError, match="non-finite"):
+        SafetyFilter([-1], [1], dt=0.01).filter([0.0], [np.nan], t=0.0)  # the first call seeds from q_current
+    est = SafetyFilter([-1], [1], dt=0.01)
+    est.reset([0.1])
+    est.trigger_estop("test", 0.0, q_hold=[np.nan])
+    np.testing.assert_allclose(est.filter([0.9], t=0.1), [0.1])         # an e-stop never holds NaN
+
+
+@pytest.mark.parametrize("mode", ["freeze_closing", "hold"])
+def test_safety_tactile_stop_precedes_the_acceleration_limit(mode):
+    """With ``max_acc`` a joint closing at max_vel when the tactile stop engages must stop at the
+    freeze (measured) position — the acceleration clamp must not let it coast v²/(2a) ≈ 0.22 rad
+    further into the object (the stop is rule 4, acceleration rule 7). The velocity limit still holds."""
+    from robot_skin.control import SafetyFilter
+
+    s = SafetyFilter([0.0], [3.0], dt=0.005, max_vel=3.0, max_acc=20.0,
+                     tactile_stop={"min_ticks": 1, "mode": mode})
+    s.reset([0.0])
+    none, strong = np.array([ContactLevel.NONE]), np.array([ContactLevel.STRONG])
+    q_meas, cmds = 0.0, [0.0]
+    for k in range(60):                                                 # 0.3 s closing: 3 rad/s reached
+        cmds.append(float(s.filter([3.0], [q_meas], t=k * 0.005, level=none)[0]))
+        q_meas += 0.5 * (cmds[-1] - q_meas)                             # a lagging position servo
+    assert s.v_last[0] == pytest.approx(3.0)
+    q_freeze = q_meas                                                   # measured when the stop engages
+    after = []
+    for k in range(60, 120):
+        after.append(float(s.filter([3.0], [q_meas], t=k * 0.005, level=strong)[0]))
+        q_meas += 0.5 * (after[-1] - q_meas)
+    assert s.stop_active
+    assert max(after) <= q_freeze + 1e-9                                # never closes past the freeze
+    assert np.all(np.abs(np.diff(cmds + after)) <= 3.0 * 0.005 + 1e-9)  # velocity limit respected
+    assert s.counts.get("tactile_freeze_override", 0) >= 1
+
+
+def test_safety_margin_start_holds_the_measured_pose_and_ramps_into_the_band():
+    """A joint starting outside the ``margin`` band (an open hand at its lower limit) must not be
+    stepped to the band edge in one tick: the filter starts at the measured pose and ramps in under
+    the velocity limit; it never moves further out."""
+    from robot_skin.control import SafetyFilter
+
+    s = SafetyFilter([0.0, -1.0], [1.0, 1.0], dt=0.005, max_vel=0.5, margin=0.1)
+    s.reset([0.0, 0.0])
+    np.testing.assert_array_equal(s.q_last, [0.0, 0.0])                 # no jump to 0.1
+    qs = np.stack([np.zeros(2)] + [s.filter([0.0, 0.0], t=0.005 * k) for k in range(1, 60)])
+    assert np.abs(np.diff(qs, axis=0)).max() <= 0.5 * 0.005 + 1e-12
+    assert np.all(np.diff(qs[:, 0]) >= 0) and qs[-1, 0] == pytest.approx(0.1)   # ramped into [0.1, 0.9]
+    np.testing.assert_array_equal(qs[:, 1], 0.0)
+    np.testing.assert_allclose(s.filter([-5.0, 5.0], t=1.0), [0.1, 0.0025])     # then clamped as usual
 
 
 # ─────────────────────────────────────────────────────────────── fake hardware
@@ -622,6 +746,107 @@ def test_runner_hand_mano_retargets_and_bundle_checks(bundles):
         PolicyRunner(hand, load_policy_bundle(bundles["joint"]), runner.processor)
 
 
+def _first_policy_batch(runner):
+    """Run start-up + one control tick (a policy tick) and return the batch the policy received and
+    the processor's frame of that tick."""
+    b = runner.bundle
+    batches, orig = [], b.policy.predict
+
+    def predict(batch, *a, **kw):
+        batches.append(batch)
+        return orig(batch, *a, **kw)
+
+    b.policy.predict = predict
+    runner.startup(0.1)
+    runner.begin_rollout()
+    batches.clear()
+    frame = runner.step()
+    b.policy.predict = orig
+    return batches[0], frame
+
+
+def test_runner_feeds_a_glove_trained_policy_mano_frame_taxel_poses(bundles, tmp_path):
+    """A hand_mano bundle trained on glove episodes (taxel_frame mano_wrist) deployed on the robot
+    skin (URDF root frame: fingers +z, pads +x) must see the robot's taxel poses in the MANO wrist
+    frame (fingers −x, palm −y): R_hrᵀ (p − t_base) / scale, n → R_hrᵀ n — close to the glove poses
+    the tactile encoder was trained on, instead of rotated by ~90° and centimetres away."""
+    from robot_skin.control import load_policy_bundle
+    from robot_skin.control.online import glove_pose_fn
+
+    glove = make_bundle(tmp_path / "glove_hand", "hand_mano", cams=(), taxel_frames=["mano_wrist"])
+    assert load_policy_bundle(glove).taxel_frames == ("mano_wrist",)
+    runner, hand = _fake_setup(glove)
+    assert runner.taxel_frame_map is not None and "MANO wrist" in runner.taxel_frame_info
+    batch, frame = _first_policy_batch(runner)
+    rt = runner.retargeter
+    R, s = np.asarray(rt.human_to_robot), float(rt.scale)
+    pos, nrm = batch["taxel_pos"][0].numpy(), batch["taxel_nrm"][0].numpy()
+    np.testing.assert_allclose(pos, frame.pos @ R / s, atol=1e-6)            # row form of R_hrᵀ p / s
+    np.testing.assert_allclose(nrm, frame.nrm @ R, atol=1e-6)
+    # the robot starts flat (q = 0): its mapped taxel poses are near the flat-glove training poses
+    # (the hands differ: ≈ 7–47 mm apart after the map vs 57–266 mm before)
+    gp, gn = glove_pose_fn(load_layout("glove_template"))(np.zeros(45))
+    err, err_raw = np.linalg.norm(pos - gp, axis=1), np.linalg.norm(frame.pos - gp, axis=1)
+    assert err.max() < 0.06 and np.all(err < 0.3 * err_raw) and np.all(err[5:] < 0.015)   # palm pads
+    assert np.mean(np.sum(nrm * gn, -1)) > 0.85 and np.mean(np.sum(frame.nrm * gn, -1)) < 0.0
+    # older bundles: the frame is inferred from the training layouts
+    inferred = make_bundle(tmp_path / "glove_hand2", "hand_mano", cams=(), layouts=["glove_template"])
+    assert load_policy_bundle(inferred).taxel_frames == ("mano_wrist",)
+    with pytest.warns(UserWarning, match="stage-1 references"):          # (the glove calibrator is not used)
+        assert _fake_setup(inferred)[0].taxel_frame_map is not None
+    # a policy trained on the robot skin itself, or without frame information: poses unchanged
+    for path in (make_bundle(tmp_path / "robot_hand", "hand_mano", cams=(), taxel_frames=["urdf_root"]),
+                 bundles["hand"]):
+        r2, _ = _fake_setup(path)
+        assert r2.taxel_frame_map is None and r2.taxel_frame_info is None
+        b2, f2 = _first_policy_batch(r2)
+        np.testing.assert_array_equal(b2["taxel_pos"][0].numpy(), f2.pos)
+    # a mismatch the runner cannot map (no retargeter) warns
+    joint_glove = make_bundle(tmp_path / "joint_glove", cams=(), taxel_frames=["mano_wrist"])
+    with pytest.warns(UserWarning, match="out of distribution"):
+        r3, _ = _fake_setup(joint_glove)
+    assert r3.taxel_frame_map is None
+    # explicit override: None feeds the processor's poses, a callable maps them
+    from robot_skin.control import PolicyRunner
+
+    b = load_policy_bundle(glove)
+    proc = runner.processor
+    assert PolicyRunner(hand, b, proc, retargeter=rt, instruction="x", taxel_frame=None).taxel_frame_map is None
+    f = PolicyRunner(hand, b, proc, retargeter=rt, instruction="x", taxel_frame=lambda p, n, q: (p, n)).taxel_frame_map
+    assert f(1, 2, None) == (1, 2)
+    with pytest.raises(ValueError, match="taxel_frame"):
+        PolicyRunner(hand, b, proc, retargeter=rt, instruction="x", taxel_frame="mano")
+
+
+def test_robot_to_mano_taxel_frame_undoes_a_moving_base_link():
+    """With a base link the poses are first expressed in its frame (R_bᵀ (p − t_b)), like the
+    retargeter's robot keypoints."""
+    from robot_skin.control.interfaces import SYNTHETIC_HAND_HUMAN_TO_ROBOT, load_urdf_model
+    from robot_skin.stages.deploy import build_retargeter
+    from robot_skin.transfer import RobotToManoTaxelFrame
+
+    model, _ = load_urdf_model()
+    lay = load_layout("robot_hand_template")
+    rt = build_retargeter(model, lay, {"iters": 2, "scale": 1.0}, synthetic=True)
+    # a base link that moves with q (the synthetic palm_link is fixed at the root)
+    rt_b = build_retargeter(model, lay, {"iters": 2, "scale": 1.0, "base_link": "index_proximal_link"},
+                            synthetic=True)
+    q = 0.5 * (model.lower + model.upper)
+    T = rt_b.base_transform(q)
+    T_ref = model.fk_numpy(q)["index_proximal_link"]
+    np.testing.assert_allclose(T, T_ref, atol=1e-9)
+    assert not np.allclose(T, np.eye(4))
+    rng = np.random.default_rng(0)
+    p, n = rng.normal(size=(9, 3)), rng.normal(size=(9, 3))
+    R = np.asarray(SYNTHETIC_HAND_HUMAN_TO_ROBOT)
+    pm, nm = RobotToManoTaxelFrame(rt_b)(p, n, q)
+    np.testing.assert_allclose(pm, ((p - T[:3, 3]) @ T[:3, :3]) @ R, atol=1e-5)
+    np.testing.assert_allclose(nm, (n @ T[:3, :3]) @ R, atol=1e-5)
+    np.testing.assert_allclose(RobotToManoTaxelFrame(rt)(p, n)[0], p @ R, atol=1e-5)   # no base link
+    with pytest.raises(ValueError, match="base_link"):
+        RobotToManoTaxelFrame(rt_b)(p, n)
+
+
 class _DriverOrderHand:
     """A robot driver that reports joints in reverse URDF order and measures no velocities."""
 
@@ -723,6 +948,361 @@ def test_runner_honours_chunk_offset_and_blanks_cameras_before_their_first_frame
     np.testing.assert_allclose(steps[0], 0.02, atol=1e-6)                     # chunk[1]: chunk[0] is "now"
 
 
+def _glitch_joint(hand, joint=5):
+    """Patch ``hand.read_state``: the next ``box["n"]`` readings have NaN at ``joint`` (a driver glitch)."""
+    box = {"n": 0}
+    read = hand.read_state
+
+    def read_state():
+        t, q, qd = read()
+        if box["n"] > 0:
+            box["n"] -= 1
+            q = q.copy()
+            q[joint] = np.nan
+        return t, q, qd
+
+    hand.read_state = read_state
+    return box
+
+
+def _record_sends(hand, clock=None):
+    sent = []
+    send = hand.send_joint_targets
+
+    def send_joint_targets(q):
+        sent.append((None if clock is None else clock(), np.array(q, dtype=np.float64)))
+        send(q)
+
+    hand.send_joint_targets = send_joint_targets
+    return sent
+
+
+@pytest.mark.parametrize("kind", ["joint", "hand"])
+def test_runner_nonfinite_joint_reading_at_start_never_reaches_the_robot(bundles, kind):
+    """DEPLOYMENT.md §7.1 expects drivers to return non-finite q now and then. One such reading on
+    the start-up / rollout-start read used to become the safety filter's position (NaN commands on
+    every tick; hand_mano: the retargeter reset raised): the runner re-reads until finite."""
+    runner, hand = _fake_setup(bundles[kind])
+    box, sent = _glitch_joint(hand), _record_sends(hand)
+    box["n"] = 1                                                        # the start-up read
+    runner.startup(0.1)
+    box["n"] = 2                                                        # begin_rollout's read + first re-read
+    runner.begin_rollout()
+    for _ in range(30):
+        runner.step()
+        runner._advance()
+    q = np.stack([s[1] for s in sent])
+    assert q.shape[0] > 40 and np.isfinite(q).all()
+    assert not runner.safety.counts.get("nonfinite_target")
+    # a driver that never delivers a finite reading: start-up refuses before commanding anything
+    fresh, hand2 = _fake_setup(bundles[kind])
+    box2, sent2 = _glitch_joint(hand2), _record_sends(hand2)
+    box2["n"] = 10 ** 6
+    with pytest.raises(RuntimeError, match="non-finite"):
+        fresh.startup(0.1)
+    assert sent2 == []
+
+
+def test_runner_frozen_camera_escalates_to_the_estop(bundles):
+    """The deploy watchdog's camera limit (camera_*: 0.5 s, e-stop after 0.5 s) through the runner:
+    camera stamps arrive on policy ticks only, and a frozen camera must still hold the hand and
+    e-stop it instead of toggling stale on / off between policy ticks."""
+    from robot_skin.control import FakeCamera, FakeRobotHand, OnlineTactileProcessor, PolicyRunner, SafetyFilter, \
+        load_policy_bundle
+
+    class FrozenCamera:
+        """Frames until ``t_die``, then the last frame with its old timestamp forever."""
+
+        def __init__(self, name, hand, t_die):
+            self.name, self.cam, self.t_die, self.last = name, FakeCamera(name, hand), t_die, None
+
+        def read(self):
+            t, f = self.cam.read()
+            if t < self.t_die or self.last is None:
+                self.last = (t, f)
+            return self.last
+
+    b = load_policy_bundle(bundles["joint"])
+    hand = FakeRobotHand(clock=SimClock(0.0), obj=None, seed=0)
+    proc = OnlineTactileProcessor.from_policy_bundle(b, hand.layout, urdf=hand.model, raw_order="channel")
+    wd = {"max_age_s": {"pressure": 0.05, "joint_state": 0.05, "camera_*": 0.5}, "estop_after_s": 0.5}
+    safety = SafetyFilter(hand.lower, hand.upper, dt=0.005, max_vel=3.0, joint_names=hand.joint_names, watchdog=wd)
+    runner = PolicyRunner(hand, b, proc, cameras={"ego": FrozenCamera("ego", hand, 0.3)}, safety=safety,
+                          instruction="x")
+    m = runner.run(2.0, baseline_s=0.1)
+    assert m["estop"] and "camera_ego" in m["safety"]["estop_reason"]
+    types = [e["type"] for e in m["safety"]["events"]]
+    assert types == ["stale_on", "estop"]
+    ev = {e["type"]: e["t"] for e in m["safety"]["events"]}
+    assert ev["estop"] - ev["stale_on"] == pytest.approx(0.5, abs=0.006) and ev["estop"] < 1.4
+
+
+class _ManualClock:
+    """A host clock the test moves: ``sleep`` and simulated computation advance it — the runner's
+    real-time path (deadline scheduling, overruns), deterministic."""
+
+    def __init__(self, t0=100.0):
+        self.t = float(t0)
+
+    def __call__(self):
+        return self.t
+
+    def sleep(self, d):
+        self.t += max(0.0, float(d))
+
+
+def test_runner_overrun_catch_up_keeps_max_vel_in_wall_time_and_uniform_tactile_ticks(bundles, monkeypatch):
+    """Synchronous 40 ms inference on a real-time clock (the CPU case, DEPLOYMENT.md §6): the missed
+    ticks catch up back to back. Their commands must respect max_vel in *wall time* (not max_vel·dt
+    per tick sent 0.3 ms apart, ≈ 10× too fast), and the tactile processor must get the joint
+    samples at the ticks' scheduled times (interpolated), so its causal qd follows the true
+    velocity on the tick grid — a burst of near-identical readings gave wrong-sign qd."""
+    import time as _time
+    import types
+
+    import robot_skin.control.runner as rmod
+    from robot_skin.control import FakeRobotHand, OnlineTactileProcessor, PolicyRunner, SafetyFilter, \
+        load_policy_bundle
+    from robot_skin.datasets.build import joint_velocity
+
+    clock = _ManualClock()
+    monkeypatch.setattr(rmod, "time", types.SimpleNamespace(sleep=clock.sleep, perf_counter=_time.perf_counter))
+    b = load_policy_bundle(bundles["squeeze"])                          # closes every joint toward 1.2 rad
+    predict = b.policy.predict
+
+    def slow_predict(*a, **kw):
+        clock.t += 0.040
+        return predict(*a, **kw)
+
+    b.policy.predict = slow_predict
+    hand = FakeRobotHand(clock=clock, obj=None, seed=0)
+    truth = []
+    integrate = hand._integrate
+
+    def integrate_and_record(dt):
+        integrate(dt)
+        truth.append((hand._t0 + (hand._k + 1) * hand.sim_dt, hand._q.copy()))
+
+    monkeypatch.setattr(hand, "_integrate", integrate_and_record)
+    read_state = hand.read_state
+
+    def read_state_costs_time():
+        clock.t += 0.0003                                               # every tick takes 0.3 ms
+        return read_state()
+
+    hand.read_state = read_state_costs_time
+    sent = _record_sends(hand, clock)
+    proc = OnlineTactileProcessor.from_policy_bundle(b, hand.layout, urdf=hand.model, raw_order="channel",
+                                                     baseline_raw=hand.baseline_raw[hand.layout.channels])
+    vmax, dt = 1.0, 0.005
+    # the watchdog judges sensor ages at the tick's sensing time, not after the 40 ms inference
+    wd = {"max_age_s": {"pressure": 0.03, "joint_state": 0.03}}
+    runner = PolicyRunner(hand, b, proc, safety=SafetyFilter(hand.lower, hand.upper, dt=dt, max_vel=vmax, watchdog=wd,
+                                                             joint_names=hand.joint_names), instruction="x")
+    assert not runner.sim
+    runner.begin_rollout()
+    frames, grid = [], []
+    for _ in range(300):
+        grid.append(runner._deadline)                                   # the tick's scheduled time
+        frames.append(runner.step())
+        runner._advance()
+    T, Q = np.array([s[0] for s in sent]), np.stack([s[1] for s in sent])
+    assert runner.overruns > 20 and np.sum(np.diff(T) < 0.001) > 100   # the catch-up did send back to back
+    step = np.abs(np.diff(Q, axis=0)).max(1)
+    assert np.all(step <= vmax * np.minimum(np.diff(T), dt) + 1e-9)    # max_vel in wall time
+    tt, qq = np.array([x[0] for x in truth]), np.stack([x[1] for x in truth])
+    g = np.asarray(grid)
+    q_grid = np.stack([np.interp(g, tt, qq[:, j]) for j in range(qq.shape[1])], 1)
+    ref = joint_velocity(q_grid, 200.0, method="savgol_causal")        # offline qd of the true grid samples
+    qd = np.stack([f.qd for f in frames])[40:, 0]
+    err = np.abs(qd - ref[40:, 0])
+    assert qd.min() > 0.0                                               # the joint only closes
+    assert np.median(err) < 0.1 and err.max() < 0.15
+    assert runner.metrics()["catchup_ticks"] > 100
+    assert "stale_on" not in runner.safety.counts
+
+
+def test_runner_drops_nonfinite_chunks_and_aborts_safely(bundles, tmp_path):
+    """DEPLOYMENT.md §5 rule 3: a non-finite chunk must not kill the loop (TemporalEnsembler.add
+    raised → no robot.stop, no e-stop, no log): it is dropped — older chunks cover the tick, else
+    the last command holds. A NaN joint reading on a policy tick does not reach the proprio state.
+    Any exception inside run() latches the e-stop, holds, closes the log and stops the robot."""
+    import json
+
+    from robot_skin.control.runner import DEPLOY_LOG_NAME
+
+    runner, hand = _fake_setup(bundles["joint"], logger_dir=tmp_path / "s1")
+    calls = {"n": 0}
+    predict = runner.bundle.policy.predict
+
+    def flaky(*a, **kw):
+        calls["n"] += 1
+        out = predict(*a, **kw)
+        if calls["n"] in (3, 7, 8):              # (2 warm-up calls) rollout inferences 1, 5 and 6: NaN
+            out = out.clone()
+            out[0, :, 3] = float("nan")
+        return out
+
+    runner.bundle.policy.predict = flaky
+    box = _glitch_joint(hand)
+    tick = runner.step
+
+    def step():
+        box["n"] = int(runner.n_ticks == 40)                            # NaN reading on a policy tick
+        return tick()
+
+    runner.step = step
+    m = runner.run(0.5, baseline_s=0.1)
+    assert m["n_ticks"] == 100 and m["n_policy_ticks"] == 10 and not m["estop"]
+    assert m["safety_counts"]["nonfinite_chunk"] == 3
+    held = [e for e in m["safety"]["events"] if e["type"] == "nonfinite_chunk"]
+    assert [e["detail"]["held"] for e in held] == [True, False, False]  # the first had no older chunk
+    log = np.load(tmp_path / "s1" / DEPLOY_LOG_NAME)
+    assert np.isfinite(log["tick_q_cmd"]).all() and np.isfinite(log["policy_q_target"]).all()
+    # an exception in the loop: e-stop (→ robot.estop), hold, log closed with the recorded streams, stop
+    runner2, hand2 = _fake_setup(bundles["joint"], logger_dir=tmp_path / "s2")
+    seen = {"stop": 0, "estop": 0, "n": 0}
+    hand2.stop = lambda: seen.__setitem__("stop", seen["stop"] + 1)
+    estop = hand2.estop
+    hand2.estop = lambda: (seen.__setitem__("estop", seen["estop"] + 1), estop())
+    predict2 = runner2.bundle.policy.predict
+
+    def boom(*a, **kw):
+        seen["n"] += 1
+        if seen["n"] == 6:
+            raise RuntimeError("boom")
+        return predict2(*a, **kw)
+
+    runner2.bundle.policy.predict = boom
+    with pytest.raises(RuntimeError, match="boom"):
+        runner2.run(0.5, baseline_s=0.1)
+    assert seen["stop"] == 1 and seen["estop"] == 1 and runner2.safety.estopped
+    files = {p.name for p in (tmp_path / "s2").iterdir()}
+    assert {"session.json", "pressure.npz", "joint_state.npz", DEPLOY_LOG_NAME} <= files
+    man = json.loads((tmp_path / "s2" / "session.json").read_text())
+    assert "boom" in man["meta"]["deployment"]["aborted"]
+    events = (tmp_path / "s2" / "events.jsonl").read_text()
+    assert "aborted" in events and "estop" in events
+
+
+def test_runner_warns_when_the_policy_rate_differs_from_training(bundles):
+    """chunk[i] is trained as the action i *training* periods ahead; an explicit policy_hz override
+    that differs from the bundle's replays the chunk at another time scale — it must warn (the
+    warning used to be skipped exactly when policy_hz was given)."""
+    from robot_skin.control import FakeRobotHand, OnlineTactileProcessor, PolicyRunner, load_policy_bundle
+
+    b = load_policy_bundle(bundles["squeeze"])
+    hand = FakeRobotHand(clock=SimClock(0.0), obj=None, seed=0)
+    proc = OnlineTactileProcessor.from_policy_bundle(b, hand.layout, urdf=hand.model, raw_order="channel")
+    with pytest.warns(UserWarning, match=r"trained at 20 Hz.*0\.5× as fast"):
+        r = PolicyRunner(hand, b, proc, instruction="x", policy_hz=10.0)
+    assert r.policy_every == 20
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        PolicyRunner(hand, b, proc, instruction="x", policy_hz=20.0)   # explicit, but the training rate
+        PolicyRunner(hand, b, proc, instruction="x")
+    assert not [x for x in w if "trained at" in str(x.message)]
+
+
+def test_runner_startup_holds_still_with_a_margin_and_survives_a_dead_channel(bundles):
+    """(a) With ``safety.margin`` the start-up hold is the measured pose — clipping it into the
+    margin band stepped every joint at its limit by ``margin`` in one tick during the "hold still"
+    baseline window. (b) A tactile channel stuck on the ADC rail no longer aborts start-up: the
+    documented dead-taxel path (ΔS 0, always SATURATED, warning) runs."""
+    from robot_skin.control import FakeRobotHand, OnlineTactileProcessor, PolicyRunner, SafetyFilter, \
+        load_policy_bundle
+
+    b = load_policy_bundle(bundles["squeeze"])
+    hand = FakeRobotHand(clock=SimClock(0.0), obj=None, seed=0)         # q = 0: 8 joints at their lower limit
+    _, q0, _ = hand.read_state()
+    assert np.isclose(hand.lower, q0).sum() >= 4
+    sent = _record_sends(hand)
+    dead_ch = int(hand.layout.channels[4])
+    read_pressure = hand.read_pressure
+
+    def dead_channel():
+        t, raw = read_pressure()
+        raw = raw.copy()
+        raw[dead_ch] = ADC_MIN
+        return t, raw
+
+    hand.read_pressure = dead_channel
+    proc = OnlineTactileProcessor.from_policy_bundle(b, hand.layout, urdf=hand.model, raw_order="channel")
+    vmax, dt = 0.5, 0.005
+    safety = SafetyFilter(hand.lower, hand.upper, dt=dt, max_vel=vmax, margin=0.1, joint_names=hand.joint_names)
+    runner = PolicyRunner(hand, b, proc, safety=safety, instruction="x")
+    with pytest.warns(UserWarning, match="dead tactile channels"):
+        info = runner.startup(baseline_s=0.2)
+    assert info["dead_taxels"] == [4] and info["baseline_samples"] == 40
+    start = np.stack([s[1] for s in sent])
+    np.testing.assert_array_equal(start, np.broadcast_to(q0, start.shape))   # the hand did not move
+    runner.begin_rollout()
+    for _ in range(20):
+        fr = runner.step()
+        runner._advance()
+    assert fr.saturated[4] and fr.delta[4] == 0.0
+    q = np.stack([s[1] for s in sent])
+    assert np.abs(np.diff(q, axis=0)).max() <= vmax * dt + 1e-12
+
+
+@pytest.mark.parametrize("mask", [True, None])
+def test_runner_masks_dead_channels_like_training(tmp_path, monkeypatch, mask):
+    """VTLA-2 at deployment: a bundle trained with ``data.mask_dead_taxels`` (``tactile.mask_dead_taxels``)
+    hides the session's dead channels (processor ``dead``) from the policy through ``taxel_pad`` — as
+    VTLADataset hides ``meta.preprocessing.dead_taxels`` — so an always-SATURATED channel cannot hold
+    the level_ge_weak ContactGate open. Bundles without the key (trained unmasked) keep feeding it."""
+    from robot_skin.control import FakeRobotHand, OnlineTactileProcessor, PolicyRunner, load_policy_bundle
+
+    b = load_policy_bundle(make_bundle(tmp_path / "b", cams=(), mask_dead_taxels=mask))
+    assert b.mask_dead_taxels is bool(mask) and b.summary()["mask_dead_taxels"] is bool(mask)
+    hand = FakeRobotHand(clock=SimClock(0.0), obj=None, seed=0)
+    dead_ch = int(hand.layout.channels[4])
+    read_pressure = hand.read_pressure
+
+    def dead_channel():
+        t, raw = read_pressure()
+        raw = raw.copy()
+        raw[dead_ch] = ADC_MIN
+        return t, raw
+
+    hand.read_pressure = dead_channel
+    proc = OnlineTactileProcessor.from_policy_bundle(b, hand.layout, urdf=hand.model, raw_order="channel")
+    runner = PolicyRunner(hand, b, proc, instruction="x")
+    with pytest.warns(UserWarning, match="hidden from the policy input" if mask else "the policy sees them"):
+        runner.startup(baseline_s=0.2)
+    seen, predict = [], b.policy.predict
+
+    def spy(batch, *a, **kw):
+        seen.append({k: batch[k].detach().cpu().clone() for k in ("taxel_pad", "contact")})
+        return predict(batch, *a, **kw)
+
+    monkeypatch.setattr(b.policy, "predict", spy)
+    runner.begin_rollout()
+    for _ in range(25):
+        runner.step()
+        runner._advance()
+    assert len(seen) >= 2
+    live = np.arange(9) != 4
+    for obs in seen:
+        assert bool(obs["taxel_pad"][0, 4]) is bool(mask) and not obs["taxel_pad"][0, live].any()
+        assert bool(obs["contact"][0, 4]) is (not mask)            # SATURATED = contact unless hidden
+
+
+def test_runner_restart_logs_clearing_a_latched_estop(bundles, tmp_path, caplog):
+    """A latched e-stop is cleared by an explicit restart only, with a warning — run() used to clear
+    it silently in startup() (so begin_rollout's warning never fired); the session log records it."""
+    import logging
+
+    runner, hand = _fake_setup(bundles["squeeze"], logger_dir=tmp_path / "s")
+    runner.safety.reset(hand.read_state()[1])
+    runner.safety.trigger_estop("operator e-stop", 0.0)
+    with caplog.at_level(logging.WARNING, logger="robot_skin.control.runner"):
+        runner.run(0.05, baseline_s=0.05)
+    assert "startup: clearing the latched e-stop (operator e-stop)" in caplog.text
+    assert not runner.safety.estopped
+    assert "estop_cleared" in (tmp_path / "s" / "events.jsonl").read_text()
+
+
 # ─────────────────────────────────────────────────────────────── deploy stage
 
 def test_deploy_stage_yaml_mirrors_defaults_and_validates():
@@ -739,6 +1319,21 @@ def test_deploy_stage_yaml_mirrors_defaults_and_validates():
         deploy.run({"robot": "allegro", "bundle": "x"})
     with pytest.raises(ValueError, match="bundle"):
         deploy.run({"robot": "fake"})
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan")])
+def test_build_retargeter_rejects_invalid_scale(bad):
+    """``retarget.scale`` from deploy.yaml goes through the same check as the constructor: scale 0
+    would drive a flat human hand to a closed robot hand, −1 mirrors the fingers."""
+    from robot_skin.control.interfaces import load_urdf_model
+    from robot_skin.stages.deploy import build_retargeter
+
+    model, _ = load_urdf_model()
+    lay = load_layout("robot_hand_template")
+    with pytest.raises(ValueError, match="retarget.scale"):
+        build_retargeter(model, lay, {"scale": bad, "iters": 2}, synthetic=True)
+    assert build_retargeter(model, lay, {"scale": 1.25, "iters": 2}, synthetic=True).scale == 1.25
+    assert build_retargeter(model, lay, {"scale": "auto", "iters": 2}, synthetic=True).scale > 0
 
 
 def test_deploy_stage_fake_robot_end_to_end(bundles, tmp_path):

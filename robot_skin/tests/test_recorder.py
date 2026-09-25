@@ -420,3 +420,69 @@ def test_fake_imu_quaternions_agree_with_gravity():
     f = np.einsum("tsij,tsj->tsi", R, s["acc"][m]).mean(0)
     np.testing.assert_allclose(f, np.tile([0.0, 0.0, 9.81], (7, 1)), atol=0.1)
     assert abs(sc.imu_world[1]) < 1e-12 and abs(sc.imu_world[2]) < 1e-12    # rotation about z only
+
+
+def test_events_jsonl_is_the_source_of_truth_for_segments(tmp_path):
+    """Regression: an operator's boundary fix in events.jsonl (DATA_ACQUISITION §9, then re-running the
+    post-processing CLI) never reached the manifest segments, so contact labels and the baseline window
+    kept the old span. Segments are re-derived from the events; explicit ones (add_segment) are kept."""
+    from robot_skin.datasets.build import preprocess_session
+
+    rng = np.random.default_rng(0)
+    srcs = [s for s in _sources(rng) if s.name in ("pressure", "imu", "hand_pose")]
+    m = SessionManifest(kind="glove", layout="glove_template", dataset="motion", subject="S01")
+    rec = Recorder(srcs, tmp_path / "S", m, clock=SimClock(t0=100.0), sim_dt=0.01).start()
+    with rec.phase("rest", contact="none"):
+        rec.run_until(0.6)
+    with rec.phase("pinch", contact="self"):
+        rec.run_until(1.0)
+    with rec.phase("free", contact="none"):
+        rec.run_until(1.9)
+    rec.add_segment(1.2, 1.4, "task")
+    man = rec.stop()
+    d = tmp_path / "S"
+    key = lambda ss: sorted((s["t0"], s["t1"], s["label"]) for s in ss)  # noqa: E731
+    before, ev0 = key(man.segments), load_events(d)
+
+    # the operator moves the end of "free" from 1.9 to 1.5 s (subject touched the palm afterwards)
+    lines = (d / EVENTS_NAME).read_text().splitlines()
+    evs = [json.loads(ln) for ln in lines]
+    k = next(i for i, ev in enumerate(evs) if (ev["type"], ev["name"]) == ("phase_end", "free"))
+    e = json.loads(lines[k])
+    e["t"] = 1.5
+    lines[k] = json.dumps(e)
+    (d / EVENTS_NAME).write_text("\n".join(lines) + "\n")
+
+    # preprocessing labels follow the edited events even before the manifest is refreshed
+    ep = preprocess_session(d, None)
+    t, lab = ep.t, np.asarray(ep["contact_label"])
+    cut = (t >= 1.5) & (t < 1.9)
+    assert cut.any() and (np.asarray(ep["phase_id"])[cut] == -1).all()
+    assert not (lab[cut] == 0).any() and (lab[(t >= 1.0) & (t < 1.5)] == 0).all()
+    assert any("differ from events.jsonl" in n for n in ep.meta.preprocessing["notes"])
+
+    from robot_skin.acquisition.recorder import session_segments
+    from robot_skin.acquisition.session import postprocess_session, refresh_segments
+
+    assert man.meta["recorder"]["explicit_segments"] == [{"t0": 1.2, "t1": 1.4, "label": "task"}]
+    segs, notes = session_segments(SessionManifest.load(d), load_events(d))
+    nc = [(a, b) for a, b, lab_ in key(segs) if lab_ == "no_contact"]
+    assert nc[-1] == (pytest.approx(1.0), 1.5) and len(nc) == 2
+    assert (1.2, 1.4, "task") in key(segs) and any("differ from events.jsonl" in n for n in notes)
+    # a recording made before explicit_segments existed: labels no phase produces are kept
+    old = SessionManifest.load(d)
+    old.meta["recorder"].pop("explicit_segments")
+    assert key(session_segments(old, load_events(d))[0]) == key(segs)
+    # a manifest not written by the recorder (synthetic: trimmed no_contact spans) is used as written
+    syn = SessionManifest.load(d)
+    syn.meta.pop("recorder")
+    s2, n2 = session_segments(syn, load_events(d))
+    assert key(s2) == key(syn.segments) and any("outside every events.jsonl phase" in n for n in n2)
+    # the post-processing CLI brings session.json in line with the events (QC reads it too)
+    r = postprocess_session(d, sync=False, calibrate=False, qc=False)
+    assert r["segments"]["updated"] and key(SessionManifest.load(d).segments) == key(segs)
+    assert not refresh_segments(d)["updated"]
+    assert not any("events.jsonl" in n for n in preprocess_session(d, None).meta.preprocessing["notes"])
+    # the unedited recording: nothing to re-derive
+    segs0, notes0 = session_segments(man, ev0)
+    assert key(segs0) == before and notes0 == []

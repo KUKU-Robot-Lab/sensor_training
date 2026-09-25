@@ -67,10 +67,17 @@ ACT 방식(Zhao et al., arXiv:2304.13705): 매 정책 틱에 새 chunk 를 `Temp
 
 1. **정지·무접촉 baseline** (`startup.baseline_s`, 기본 1 s): 손을 편 채 아무것도 닿지 않게 둔다. 이 창의
    raw 중앙값이 taxel 별 기준값이 된다 — 전처리와 같은 추정기(`common.signal.estimate_baseline`), 레일 샘플이
-   있는 프레임 제외(창은 실제 시간: 건너뛴 샘플도 시간을 쓴다). 죽은 채널(기준 ≤ 0)은 ΔS = 0 + 항상 포화로
-   표시되고 경고가 나온다 — SATURATED 가 촉각 정지 레벨이면 그 taxel 의 체인은 계속 닫히지 못한다(fail safe;
-   채널을 고치거나 `safety.tactile_stop.levels` 에서 SATURATED 를 뺀다). 세션 로그에 `baseline` phase
-   (`no_contact` 세그먼트)로 남아 재전처리 때도 같은 창이 baseline 이 된다.
+   있는 프레임 제외(창은 실제 시간: 건너뛴 샘플도 시간을 쓴다). 창 전체에서 레일(또는 비유한)에 붙어 있는 채널은
+   이 제외 규칙에서 빠지고 **죽은 채널**(기준 0)이 된다 — 그 채널 하나 때문에 모든 프레임이 버려져 시작이 실패하지
+   않는다. 죽은 채널(기준 ≤ 0)은 ΔS = 0 + 항상 포화로 표시되고 경고가 나온다(`startup.dead_taxels`) — SATURATED 가
+   촉각 정지 레벨이면 그 taxel 의 체인은 계속 닫히지 못한다(fail safe; 채널을 고치거나
+   `safety.tactile_stop.levels` 에서 SATURATED 를 뺀다). 전처리도 같은 세션의 그 taxel 을 죽은 채널로 표시한다.
+   정책 입력에서는 번들이 `tactile.mask_dead_taxels` 로 학습됐으면(vtla `data.mask_dead_taxels`, 기본) 죽은 채널을
+   `taxel_pad` 로 가려 ContactGate 를 늘 열어 두지 않는다(학습 데이터셋과 같은 규칙; 이 키가 없는 옛 번들은 그대로 본다).
+   세션 로그에 `baseline` phase (`no_contact` 세그먼트)로 남아 재전처리 때도 같은 창이 baseline 이 된다.
+   이 동안 손은 **측정 자세**를 그대로 유지한다(`safety.margin` 밴드 밖이어도 옮기지 않는다 — rollout 에서 속도
+   제한 아래로 밴드 안으로 들어간다). 시작 자세 읽기에 비유한 관절이 있으면 한 주기 간격으로 다시 읽는다(≈ 50 ms;
+   끝내 비유한이면 아무 명령도 보내기 전에 `RuntimeError`).
 2. **보정**: 로봇 스킨의 `calibrator.json` 이 있으면 그대로 쓴다(권장). 없고 `startup.calib_s > 0` 이면 정지 상태
    residual 로 **bring-up 용** calibrator 를 맞춘다(`control.online.startup_calibrator`; 움직임 artefact 를 모르므로
    움직일 때 σ 가 낙관적 → 실제 운용 전 contact 스테이지를 돌릴 것).
@@ -92,23 +99,33 @@ ACT 방식(Zhao et al., arXiv:2304.13705): 매 정책 틱에 새 chunk 를 `Temp
 상태가 없어 명령한 손 행동을 쓴다(`hand_state.estimate: true` 면 손가락은 로봇 q 에서
 `transfer.RobotToManoEstimator` 로 추정). 손목 자세 행동은 팔 제어기가 없으면 쓰이지 않는다.
 
+**taxel pose 프레임**: 처리기(와 로봇 baseline 모델)는 로봇 스킨의 URDF 루트 프레임 pose 를 쓰지만, 정책의 촉각
+인코더는 학습한 프레임의 pose 를 받는다(`PolicyBundle.taxel_frames`). 글러브 D2 로 학습한 번들(`mano_wrist`)을
+URDF 스킨에서 돌리면 `PolicyRunner(taxel_frame="auto")` 가 정책 틱마다 로봇 pose 를 리타게터의 역변환
+`transfer.RobotToManoTaxelFrame` (`p ↦ R_hrᵀ R_bᵀ (p − t_b) / scale`, `n ↦ R_hrᵀ R_bᵀ n`; `retarget.human_to_robot`
+·`scale`·`base_link`)으로 MANO 손목 프레임에 옮긴다 — `metrics.notes` 에 기록된다. 그래서 `human_to_robot` 은
+리타게팅뿐 아니라 촉각 입력에도 쓰인다. 옮길 수 없는 불일치(리타게터 없는 `robot_joint` 번들이 글러브 pose 로
+학습된 경우)는 경고한다.
+
 ## 5. 안전
 
 `SafetyFilter` 가 모든 명령을 거른다 (먼저 해당하는 규칙이 우선):
 
 | 순서 | 규칙 | 동작 | 설정 |
 |---|---|---|---|
-| 1 | e-stop 래치 | e-stop 순간 자세 유지(촉각 e-stop 은 **측정** 자세 — 마지막 명령을 유지하면 서보 지연만큼 계속 조인다), `robot.estop()` 1 회 호출 | `SafetyFilter.reset` 으로만 해제 (새 rollout 시작 = 운영자의 명시적 재시작, 경고 로그) |
-| 2 | 센서 watchdog | 스트림이 `max_age_s` 보다 오래되면 마지막 명령 유지, `estop_after_s` 지속 시 e-stop | `safety.watchdog` (pressure/joint 50 ms, camera 0.5 s, e-stop 0.5 s) |
-| 3 | 비유한 목표 | NaN/inf 관절 → 마지막 명령 | 항상 |
-| 4 | **촉각 정지** | 어떤 taxel 이 STRONG/SATURATED 로 `min_ticks`(10 틱 = 50 ms) 지속 → 그 taxel 의 **운동 체인 관절만** 닫는 방향 동결(여는 방향은 허용), `release_ticks` 조용하면 해제. 동결 위치는 **측정 자세**(서보 지연만큼 더 조이지 않도록) | `safety.tactile_stop` (`mode`: freeze_closing / hold / estop), `closing_sign`, `per_taxel_joints` |
-| 5 | 관절 한계 | `[lower+margin, upper−margin]` 로 자르기 | `safety.margin` |
-| 6 | 속도 | 틱당 `|Δq| ≤ max_vel·dt` | `safety.max_vel` (3 rad/s) |
-| 7 | 가속도 | `|Δv| ≤ max_acc·dt` | `safety.max_acc` |
+| 1 | e-stop 래치 | e-stop 순간 자세 유지(촉각 e-stop 은 **측정** 자세 — 마지막 명령을 유지하면 서보 지연만큼 계속 조인다), `robot.estop()` 1 회 호출 | `SafetyFilter.reset` 으로만 해제 (`startup` / 새 rollout 시작 = 운영자의 명시적 재시작, 경고 로그 + `estop_cleared` safety marker) |
+| 2 | 센서 watchdog | 스트림이 `max_age_s` 보다 오래되면 마지막 명령 유지, `estop_after_s` 지속 시 e-stop. 필터가 스트림마다 마지막 타임스탬프를 기억해 **매 틱** 검사한다 — 정책 틱에만 보고되는 카메라도 그 사이에 나이를 먹는다 | `safety.watchdog` (pressure/joint 50 ms, camera 0.5 s, e-stop 0.5 s) |
+| 3 | 비유한 값 | NaN/inf 관절 목표 → 마지막 명령. 비유한 정책 chunk 는 버린다(이전 chunk 가 이 틱을 덮으면 그 앙상블, 아니면 마지막 명령; safety 이벤트 `nonfinite_chunk`). 명령 자체는 절대 비유한이 되지 않는다(`reset` 이 비유한 자세를 거부) | 항상 |
+| 4 | **촉각 정지** | 어떤 taxel 이 STRONG/SATURATED 로 `min_ticks`(10 틱 = 50 ms) 지속 → 그 taxel 의 **운동 체인 관절만** 닫는 방향 동결(여는 방향은 허용), `release_ticks` 조용하면 해제. 동결 위치는 **측정 자세**(서보 지연만큼 더 조이지 않도록). 가속도 제한(7)보다 우선: 닫던 관절은 즉시 멈춘다(`v²/2a` 만큼 더 미끄러져 들어가지 않는다; 동결 위치 너머의 명령은 `max_vel` 로 물러난다) | `safety.tactile_stop` (`mode`: freeze_closing / hold / estop), `closing_sign`, `per_taxel_joints` |
+| 5 | 관절 한계 | `[lower+margin, upper−margin]` 로 자르기. 밴드 밖에서 시작하면(편 손 = 하한) 그 자리에서 시작해 속도 제한 아래로 밴드 안으로 들어간다(한 틱에 `margin` 만큼 뛰지 않는다) | `safety.margin` |
+| 6 | 속도 | `|Δq| ≤ max_vel·h`, `h` = 직전 명령 이후의 **실제 시간**(최대 한 주기 `dt`) — overrun 뒤 연달아 보내는 틱도 벽시계 기준 `max_vel` 을 넘지 않는다 | `safety.max_vel` (3 rad/s) |
+| 7 | 가속도 | `|Δv| ≤ max_acc·h` | `safety.max_acc` |
 
 SATURATED 에는 ADC 레일 드롭아웃도 포함되므로 센서 고장도 "강한 접촉"처럼 멈추는 쪽(fail-safe)이다. 이벤트
 (`tactile_stop_on/off`, `stale_on/off`, `estop`)는 세션 `events.jsonl` 에 `safety` marker 로 남고, 클램프는
-`metrics.safety_counts` 로 집계된다. **이 소프트웨어 층은 하드웨어 e-stop 과 핸드 자체의 전류/토크 제한을
+`metrics.safety_counts` 로 집계된다. `PolicyRunner.run` 안에서 예외(또는 Ctrl-C)가 나면 e-stop 을 래치하고
+(`robot.estop()`), 유지 명령을 보내고, 세션 로그를 닫고(`aborted` marker, `meta.deployment.aborted`; 기록된
+스트림은 남는다) `robot.stop()` 을 부른 뒤 예외를 다시 던진다. **이 소프트웨어 층은 하드웨어 e-stop 과 핸드 자체의 전류/토크 제한을
 대체하지 않는다.** 첫 실행은 `max_vel` 을 낮추고(예: 0.5 rad/s), 물체 없이 시작한다.
 
 ## 6. 지연 예산
@@ -128,8 +145,13 @@ SATURATED 에는 ADC 레일 드롭아웃도 포함되므로 센서 고장도 "�
 - 첫 추론은 지연 초기화로 수백 ms 걸릴 수 있어, 시작 절차에서 baseline 캡처 직후 손을 멈춘 채 더미 추론
   2 회로 워밍업한다(`startup.warmup_ms` 로 기록). rollout 시작 시 마감 시각(deadline)을 다시 잡는다.
 - 정책 추론·리타게팅은 **제어 틱 안에서 동기로** 돈다(학습 타이밍과 같고 결정적). 5 ms 를 넘기면 그 틱이 늦어지고
-  `overruns` 가 오른다. ACT chunk + 앙상블 덕분에 로봇은 이전 목표를 계속 따라가므로 가끔의 overrun 은 매끄러움만
-  해친다. CPU 에서는 정책 틱마다 overrun 이 생기므로 **GPU 권장**. 비동기 추론 스레드는 TODO.
+  `overruns` 가 오른다. 밀린 틱은 곧바로 이어서 실행되지만(10 주기 넘게 밀리면 재동기화) — 처리기에는 각 틱의
+  **예정 시각으로 보간한** 관절·압력 샘플을 넣고(`catchup_ticks`; 레일 샘플에 걸친 보간은 포화 표시, 전처리의 재표본화와
+  같은 규칙) qd·촉각 history·FSM 이 학습 때처럼 균일한 틱을 본다. 명령은 `SafetyFilter` 가 **실제 시간** 기준으로
+  제한하므로 연달아 보내도 `max_vel` 을 넘지 않는다. 대신 추론하는 동안에는 명령이 나가지 않아 손이 느려진다(40 ms
+  추론이면 대략 `max_vel` 의 1/4 수준). ACT chunk + 앙상블 덕분에 로봇은 이전 목표를 계속 따라가므로 overrun 은
+  매끄러움·추종을 해칠 뿐 안전을 해치지 않는다. CPU 에서는 정책 틱마다 overrun 이 생기므로 **GPU 권장**. 비동기 추론
+  스레드는 TODO.
 - GPU(RTX 5090)에서의 값은 이 박스에서 측정하지 못했다 — 실행 후 `metrics.json` 의 `latency_p50_ms`,
   `latency_p95_ms`, `tick_p95_ms`, `overruns`, `benchmark`(`control.latency.benchmark_policy`) 를 확인한다.
   대략 CPU 보다 한 자릿수 빠를 것으로 예상하지만 **측정 전에는 가정하지 말 것**.
@@ -142,7 +164,8 @@ SATURATED 에는 ADC 레일 드롭아웃도 포함되므로 센서 고장도 "�
    - `joint_names` (구동 관절, 드라이버 순서 — URDF 순서와 달라도 된다: 러너가 이름으로 처리기(URDF / baseline
      모델 순서)·정책 행동 순서로 바꾼다), `lower`/`upper` (rad), (선택) `velocity_limits`
    - `read_state() -> (t, q[D], qd[D] | None)` (속도를 재지 않으면 None — 로그에 가짜 0 속도를 남기지 않는다;
-     비유한 q 는 처리기가 직전 값으로 유지), `read_pressure() -> (t, raw[C])` — raw 는 촉각 프런트엔드의
+     비유한 q 는 직전 유한 값으로 유지 — 처리기·정책 proprio·taxel 자세 모두; 시작/rollout 시작 읽기는 유한해질
+     때까지 다시 읽는다), `read_pressure() -> (t, raw[C])` — raw 는 촉각 프런트엔드의
      **채널 순서**(`pressure.npz` 와 같음). mk555 `.bin` 파싱은 `deformable_sats/sats/preprocessing/bin_merge.py` 가
      정본이다(복사하지 말고 파서를 감쌀 것)
    - `send_joint_targets(q[D])` — 위치 목표, 오래 막히지 않게
@@ -157,7 +180,9 @@ SATURATED 에는 ADC 레일 드롭아웃도 포함되므로 센서 고장도 "�
 4. **리타게팅** (`hand_mano` 정책): `retarget.tip_links` (손가락 → 끝 링크), `retarget.human_to_robot`
    (MANO 손 좌표계: 손가락 −x, 엄지쪽 +z, 손바닥 −y → 로봇 base 좌표계로의 3×3 회전; 합성 손의 값은
    `control.interfaces.SYNTHETIC_HAND_HUMAN_TO_ROBOT`), `scale: auto`(편 손 ↔ q = 0 에서 `estimate_scale`, 사람 벡터에
-   곱하는 AnyTeleop 규약), `tip_offsets` (끝 링크 원점 → 실제 손가락 끝).
+   곱하는 AnyTeleop 규약; 숫자로 주면 유한한 양수여야 한다 — 0 이면 편 손이 주먹이 된다), `tip_offsets` (끝 링크 원점
+   → 실제 손가락 끝). `human_to_robot`·`scale` 은 글러브로 학습한 정책의 촉각 입력(로봇 taxel pose → MANO 손목
+   프레임, §4)에도 쓰이므로 대강 맞추면 안 된다.
 5. **안전 설정**: `closing_sign` (관절별 닫는 방향; 외전 관절은 0), `max_vel` 낮게 시작, watchdog 한계를 실제 센서
    주기에 맞게.
 6. **실행**:
@@ -204,7 +229,8 @@ python -m robot_skin.datasets.build --raw robot_skin/runs/deploy/sessions --out 
 
 ## 10. 설정 요약 (`robot_skin/configs/stages/deploy.yaml`)
 
-`robot`, `bundle`, `device`, `duration_s`, `control_hz`/`policy_hz` (null → 번들), `instruction`, `seed`,
+`robot`, `bundle`, `device`, `duration_s`, `control_hz`/`policy_hz` (null → 번들; 번들의 학습 주기와 다른 실효 정책
+주기는 경고한다 — chunk 항목은 학습 주기 간격이라 궤적의 시간 척도가 그 비율만큼 바뀐다), `instruction`, `seed`,
 `allow_bootstrap`, `realtime` (fake: 시뮬레이션 클록 vs 실시간), `layout`/`urdf`, `stage1.*`, `startup.*`,
 `tactile.*` (전처리 pressure 설정과 같게), `fake_robot.*` (가상 물체 `object.angle/compliance_rad/palm`),
 `cameras.*`, `retarget.*`, `hand_state.*`, `safety.*`, `log.*`, `latency.*`. 알 수 없는 키는 오류.

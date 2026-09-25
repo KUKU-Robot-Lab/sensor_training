@@ -33,6 +33,11 @@ target_scale:                   # per-taxel ΔS scale (RMS of no-contact ΔS) in
   enabled: true
   floor_pct: 0.05
 
+crossfit:                       # out-of-fold derived arrays for the TRAIN episodes (contact / pretrain train on
+                                #   them; in-sample residuals are much tighter than on unseen data → leakage)
+  folds: 3                      # extra models, one per fold (0 / 1 → off: train residuals stay in-sample)
+  by: auto                      # auto (splits.json grouping, else data.split_by) | episode | subject
+
 model:                          # baseline.temporal.TemporalBaselinePredictor
   window: 32                    # history frames (160 ms at 200 Hz)
   hidden: 64

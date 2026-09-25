@@ -63,13 +63,18 @@ _PRECISION_ALIASES = {
     "fp32": "fp32", "float32": "fp32", "32": "fp32", "full": "fp32", "none": "fp32",
 }
 
-# substring of torch.cuda.get_device_name() → profile name (checked in order)
-_GPU_NAME_TO_PROFILE: tuple[tuple[str, str], ...] = (
-    ("5090", "rtx5090"),
-    ("4090", "rtx4090"),
-    ("3090", "rtx3090"),
-    ("A100", "a100"),
+# whole model token in torch.cuda.get_device_name() → profile name (checked in order): a plain
+# substring test would map "RTX A1000" (6-8 GB) to the 80 GB a100 profile
+_GPU_NAME_TO_PROFILE: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bRTX\s*5090\b", re.I), "rtx5090"),
+    (re.compile(r"\bRTX\s*4090\b", re.I), "rtx4090"),
+    (re.compile(r"\bRTX\s*3090\b", re.I), "rtx3090"),
+    (re.compile(r"\bA100\b", re.I), "a100"),
 )
+#: laptop / mobile variants share the desktop model number but not its memory or power budget
+_MOBILE_GPU_RE = re.compile(r"\b(laptop|mobile|max-q)\b", re.I)
+#: a GPU with less memory than this fraction of the profile's ``gpu.memory_gb`` gets no profile
+_MIN_MEMORY_FRAC = 0.9
 
 __all__ = [
     "PROFILES_DIR", "PrecisionPlan", "resolve_device", "resolve_precision", "cuda_capability",
@@ -322,20 +327,41 @@ def apply_profile_env(profile: Mapping[str, Any], override: bool = False) -> dic
     return applied
 
 
-def detect_hw_profile(gpu_names: Sequence[str] | None = None) -> str | None:
-    """Pick a built-in profile from the first visible GPU's name (``"cpu"`` without CUDA);
-    ``None`` for an unknown GPU. ``gpu_names`` overrides the query (tests)."""
+def _profile_memory_gb(name: str) -> float | None:
+    try:
+        return float(((load_hw_profile(name).get("gpu") or {}).get("memory_gb")))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def detect_hw_profile(gpu_names: Sequence[str] | None = None,
+                      memory_gb: Sequence[float] | None = None) -> str | None:
+    """Pick a built-in profile from the first visible GPU (``"cpu"`` without CUDA); ``None`` for
+    an unknown GPU — the stages then keep their defaults (warning) instead of guessing. The model
+    must appear as a whole token (``RTX A1000`` is not an ``A100``), laptop / mobile variants never
+    match, and a GPU with clearly less memory than the profile's ``gpu.memory_gb`` (e.g. an A100
+    40 GB vs the 80 GB profile) gets ``None``. ``gpu_names`` / ``memory_gb`` (GiB) override the
+    query (tests; the memory check is skipped when names are given without it)."""
     if gpu_names is None:
         if not torch.cuda.is_available():
             return "cpu"
-        gpu_names = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
+        n = torch.cuda.device_count()
+        gpu_names = [torch.cuda.get_device_name(i) for i in range(n)]
+        if memory_gb is None:
+            memory_gb = [torch.cuda.get_device_properties(i).total_memory / 2**30 for i in range(n)]
     if not gpu_names:
         return "cpu"
     name = gpu_names[0]
-    for needle, prof in _GPU_NAME_TO_PROFILE:
-        if needle.lower() in name.lower():
-            return prof
-    return None
+    if _MOBILE_GPU_RE.search(name):
+        return None
+    prof = next((p for pat, p in _GPU_NAME_TO_PROFILE if pat.search(name)), None)
+    if prof is None:
+        return None
+    if memory_gb:
+        need = _profile_memory_gb(prof)
+        if need is not None and float(memory_gb[0]) < _MIN_MEMORY_FRAC * need:
+            return None
+    return prof
 
 
 # ───────────────────────────────────────────────────────────────────────────── diagnostics
@@ -379,7 +405,8 @@ def describe_environment() -> dict:
         except Exception:
             info["nccl"] = None
     info["gpus"] = gpus
-    info["profile_guess"] = detect_hw_profile([g["name"] for g in gpus]) if gpus else (
+    info["profile_guess"] = detect_hw_profile([g["name"] for g in gpus],
+                                              [g["memory_gb"] for g in gpus]) if gpus else (
         "cpu" if not info["cuda_available"] else None)
     keys = ("CUDA_VISIBLE_DEVICES", "RANK", "WORLD_SIZE", "LOCAL_RANK", "MASTER_ADDR",
             "MASTER_PORT", "NCCL_SOCKET_IFNAME", "GLOO_SOCKET_IFNAME", "NCCL_P2P_DISABLE",

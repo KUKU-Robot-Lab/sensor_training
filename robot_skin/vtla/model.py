@@ -40,8 +40,11 @@ Module attribute names (for ``train.lr_mult`` prefixes): ``text_encoder``, ``tex
 
 ContactGate caveat: with the default ``contact_rule: level_ge_weak`` a SATURATED taxel counts as
 contact (a rail-clipped press is contact). A *permanently* saturated taxel — a dead channel, which
-preprocessing marks saturated in every frame — therefore keeps the gate open for every sample; mask
-such taxels (``taxel_pad``) or use ``weak_or_strong`` on hardware with dead channels.
+preprocessing marks saturated in every frame (``meta.preprocessing.dead_taxels``) — would keep the
+gate open for every sample, so :class:`~robot_skin.vtla.dataset.VTLADataset` hides dead channels
+through ``taxel_pad`` (``mask_dead_taxels``; stage ``data.mask_dead_taxels``, default on). The bundle
+records it (``tactile.mask_dead_taxels``) and control hides the session's dead channels the same
+way. ``weak_or_strong`` is the alternative (it also drops rail-clipped presses from the gate).
 
 Bundle (``policy_bundle.pt``, written by ``stages/vtla.py``): everything control needs to rebuild
 the policy — :func:`save_policy_bundle`, :func:`read_policy_bundle`,
@@ -589,7 +592,10 @@ def save_policy_bundle(path: str | Path, policy: VTLAPolicy, *, action: Mapping[
     - ``action``: ``spec`` (ActionSpec dict), ``normalizer`` (ActionNormalizer dict), ``rel_mode``,
       ``chunk_offset``; ``proprio``: ``normalizer``, ``history``, ``source``;
     - ``tactile``: ``feature_spec``, ``contact_rule``, ``source`` (derived | bootstrap), references
-      to the stage-1 ``calibrator`` / ``baseline_model`` and the ``pretrained_encoder``;
+      to the stage-1 ``calibrator`` / ``baseline_model`` and the ``pretrained_encoder``, the training
+      ``layouts`` and ``taxel_frames`` (frame of the training taxel poses: ``mano_wrist`` /
+      ``urdf_root`` — deployment maps the skin's poses into it), ``mask_dead_taxels`` (dead channels
+      hidden via ``taxel_pad`` — control does the same with the session's dead channels);
     - ``vision``: ``cameras``, ``encoder`` cfg, ``eval_transform`` params, ``cached_features_key``;
       ``language``: ``encoder`` cfg; ``timing``: ``policy_hz``, ``source_hz``, ``stride``,
       ``horizon``, ``obs_history``; ``head``; ``meta``.

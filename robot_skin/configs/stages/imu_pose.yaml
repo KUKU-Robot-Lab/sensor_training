@@ -23,7 +23,7 @@ data:
 features:                       # pose.imu_model.imu_features
   gyro: true
   acc: true
-  vec_frame: sensor             # sensor | world
+  vec_frame: sensor             # sensor | world — must match the episodes' preprocessing imu.vec_frame
 
 stats:
   method: std                   # feature normalisation (stored inside the model)

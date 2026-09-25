@@ -10,29 +10,24 @@
   `robot_skin/`) + 프레임워크 전체 (acquisition, datasets, pose, train, vision, language, action,
   baseline, contact, representation, vtla, control, transfer, stages, CLI `python -m robot_skin`) + docs.
 - 테스트: 루트 `pytest` → legacy 250 passed (main 과 동일한 12 failed/4 errors: raw 데이터·zarr 3 관련),
-  robot_skin + common 621 passed.
+  robot_skin + common 695 passed (최종 리뷰 수정 반영 후).
 - 브랜치 `restructure/robot-skin`: merge 후 후속 작업용으로 최신 main 에서 다시 시작함.
 
-## 2. 진행 중이던 작업 A — 최종 적대적 리뷰 수정 (클라우드 세션이 마무리 중)
+## 2. 작업 A — 최종 적대적 리뷰 수정 (완료)
 
 6개 차원 리뷰어가 찾고 반박 검증자가 재현한 **51건** (high 8 / medium 13 / low 30):
 `docs/dev/as_built/FINAL_REVIEW_FINDINGS.md`.
 
-수정 상태 (클라우드 세션이 차원별로 직렬 수정 중; 완료분은 이 브랜치에 커밋됨):
+수정 상태: **완료 (클라우드 세션, 이 브랜치에 커밋됨)** — 48건 수정 + 2건은 앞선 수정에 이미 포함(CTRL-4, CLI-3),
+1건 보류(DP-11, low: `--fake` 취득 장면의 누름 신호와 기하 self-touch 라벨 불일치 — 테스트 픽스처 충실도 문제).
+각 수정에는 회귀 테스트가 붙어 있음 (robot_skin + common: 695 passed; legacy 결과는 main 과 동일).
 
-| 차원 | 상태 |
-|---|---|
-| geometry | 수정 완료 (클라우드) |
-| data | 수정 중 (클라우드) |
-| online (control/safety) | 대기 |
-| train (engine/hardware/sweep) | 대기 |
-| vtla | 대기 |
-| cli_docs | 대기 |
+주요 수정: glove 학습 정책의 로봇 배포 taxel 좌표계(URDF root → MANO wrist 변환), `hand_pose.npz` 전처리 누락,
+events.jsonl 수정이 라벨에 반영, 안전필터 NaN 전파·카메라 watchdog·가속 제한 vs 촉각 정지, sweep/hardware
+프로파일 덮어쓰기, resume=auto 오동작, CUDA 에서 flow head 노이즈 디바이스, pipeline 하위 단계 재실행 누락,
+전처리 버전 `robot_skin.datasets.build/3` (기존 processed 데이터는 `--force` 로 재빌드 권장).
 
-→ 클라우드 세션이 끝까지 마치면 이 표를 갱신해 push 한다. **로컬 세션은 이 커밋이 올라오기 전까지
-아래 목록의 파일은 건드리지 말 것** (충돌 방지): `robot_skin/datasets/build.py`, `robot_skin/control/*`,
-`robot_skin/train/*`, `robot_skin/vtla/*`, `robot_skin/__main__.py`, `robot_skin/stages/*`, docs/*.md(기존 파일).
-클라우드 세션이 중단된 경우: FINAL_REVIEW_FINDINGS.md 의 남은 항목을 차원별로 재현 → 수정 → 회귀 테스트.
+→ 로컬 세션: 이제 HANDOFF §3 의 모든 파일을 수정해도 된다 (`git pull --rebase` 후).
 
 ## 3. 지금 할 일 B — IMU + 비전 손동작 추종 (사용자 요구: 스텁 없이 전부 실제 동작)
 
@@ -43,7 +38,7 @@
    `robot_skin/pose/keypoints.py`, `robot_skin/pose/ik.py`, `robot_skin/eval/hand_metrics.py`,
    `robot_skin/vision/cameras.py`, `robot_skin/vision/calibration.py` + 테스트.
    (`datasets/synthetic.py` 의 `vision_keypoints` 옵션은 작업 A 의 data 수정이 올라온 뒤에.)
-2. 작업 A 가 push 되면 `git pull` 후 **[VBACK]** (MediaPipe/HaMeR/WiLoR/키포인트파일 백엔드, 세션 일괄
+2. (작업 A 완료 — `git pull --rebase` 후 바로) **[VBACK]** (MediaPipe/HaMeR/WiLoR/키포인트파일 백엔드, 세션 일괄
    추출 → `hand_pose.npz`, viz) 와 **[VIFUSE]** (시각-관성 융합, 온라인 추적 `CausalImuPoseStream` /
    `OnlineHandTracker`, VIFNet-S 범용 어댑터 `ExternalImuPoseModel`, imu_pose stage 확장).
 3. **[TELEOP+INTEG+DOCS]**: `control/teleop.py`, CLI `handpose`/`track`/`teleop`, `docs/HAND_TRACKING.md`,

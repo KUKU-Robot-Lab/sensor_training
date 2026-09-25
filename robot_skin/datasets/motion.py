@@ -34,7 +34,7 @@ from common.signal import NormStats
 
 from .episode import (
     D_RESIDUAL_Z, K_CONTACT_LABEL, K_DELTA, K_HAND_FINGERS, K_HAND_GLOBAL, K_HAND_VALID, K_IMU_ACC, K_IMU_GYRO,
-    K_IMU_QUAT, K_Q, K_QD, K_SATURATED, K_TAXEL_NRM, K_TAXEL_POS, Episode,
+    K_IMU_QUAT, K_IMU_VALID, K_Q, K_QD, K_SATURATED, K_TAXEL_NRM, K_TAXEL_POS, Episode,
 )
 from .stats import IMU_FEATURES, as_episodes, q_valid_mask, qd_valid_mask
 
@@ -86,11 +86,21 @@ def imu_wrist_index(ep: Episode) -> int:
 def episode_imu_features(ep: Episode, *, gyro: bool = True, acc: bool = True, vec_frame: str = "sensor",
                          wrist_index: int | None = None) -> np.ndarray:
     """``pose.imu_model.imu_features`` of the (calibrated) episode IMU arrays → ``[T,F]`` float32
-    (per site: 6D orientation relative to the wrist IMU | gyro | acc in the wrist frame)."""
+    (per site: 6D orientation relative to the wrist IMU | gyro | acc in the wrist frame).
+
+    ``vec_frame`` must be the frame the episode stores gyro/acc in (``meta.preprocessing.imu.
+    vec_frame``, the preprocessing ``imu.vec_frame``; calibrated episodes without the record are
+    sensor-frame): a mismatch would rotate vectors of one frame as if they were in the other."""
     from robot_skin.pose.imu_model import imu_features
 
     if not ep.has(K_IMU_QUAT):
         raise ValueError(f"episode {ep.meta.episode_id!r} has no IMU arrays")
+    imu_pre = (ep.meta.preprocessing or {}).get("imu") or {}
+    stored = imu_pre.get("vec_frame") or ("sensor" if imu_pre.get("calibrated") else None)
+    if (gyro or acc) and stored is not None and stored != vec_frame:
+        raise ValueError(f"episode {ep.meta.episode_id!r} stores {stored}-frame gyro/acc (preprocessing "
+                         f"imu.vec_frame) but features with vec_frame={vec_frame!r} were requested: set "
+                         f"features.vec_frame: {stored} or re-preprocess with imu.vec_frame: {vec_frame}")
     # np.array copies: the arrays are usually read-only memmaps (torch warns on those)
     g = np.array(ep[K_IMU_GYRO]) if gyro and ep.has(K_IMU_GYRO) else None
     a = np.array(ep[K_IMU_ACC]) if acc and ep.has(K_IMU_ACC) else None
@@ -280,8 +290,10 @@ class ImuPoseWindowDataset(_WindowDataset):
 
     Sample: ``feat[W,F]`` (``episode_imu_features`` normalised with ``imu_stats`` — a NormStats or the
     ``compute_stats`` dict with key ``imu_features``), ``finger_pose[15,3]`` and ``global_orient[3]``
-    (axis-angle labels at ``t``), ``episode``, ``t_index``. Only frames with ``hand_pose_valid``.
-    All episodes must list the same ``meta.imu_sites`` (feature columns are per site, in that order)."""
+    (axis-angle labels at ``t``), ``episode``, ``t_index``. Only frames with ``hand_pose_valid`` whose
+    whole feature window was measured by the IMUs (``imu_valid``, when the episode has it: no edge-held
+    span or bridged sample gap). All episodes must list the same ``meta.imu_sites`` (feature columns
+    are per site, in that order)."""
 
     def __init__(self, episodes: Iterable[Episode | str | Path], *, window: int = 32, stride: int = 1,
                  imu_stats: NormStats | Mapping[str, NormStats] | None = None, gyro: bool = True, acc: bool = True,
@@ -300,7 +312,10 @@ class ImuPoseWindowDataset(_WindowDataset):
             f = _norm(imu_stats, episode_imu_features(ep, **self.feature_kw))
             dims.add(f.shape[1])
             self._feat.append(f)
-            self._add(e, np.asarray(ep[K_HAND_VALID], dtype=bool))
+            ok = np.asarray(ep[K_HAND_VALID], dtype=bool)
+            if ep.has(K_IMU_VALID):
+                ok = ok & _window_all(np.asarray(ep[K_IMU_VALID], dtype=bool), self.window)
+            self._add(e, ok)
         name = type(self).__name__
         _same((tuple(ep.meta.imu_sites) for ep in self.episodes), "IMU sites", name)
         raw = [ep.meta.episode_id for ep in self.episodes

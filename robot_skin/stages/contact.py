@@ -27,7 +27,12 @@ modified; pseudo labels are a derived array (:data:`robot_skin.contact.D_CONTACT
    ``detector.enabled: false`` uses ``sigmoid(z − weak_z)`` as the probability instead;
    ``detector.bootstrap`` (``auto``: when the train split has no self-touch label, e.g. robot D1
    without geometric self-touch) adds positives where the calibrated level is STRONG inside
-   contact-allowed phases (pinch / grasp …) — self-training from the z rule;
+   contact-allowed phases (pinch / grasp …) — self-training from the z rule. The train split is the
+   baseline's own training data: its residuals must be the baseline stage's **out-of-fold** ones
+   (``baseline`` ``crossfit.folds`` ≥ 2, the default) — in-sample residuals are markedly tighter
+   than on unseen data, so the detector would learn a no-contact z it never meets at deployment.
+   ``metrics["no_contact_z_std"]`` (per split) shows that gap; a train split much tighter than the
+   calibration split is noted;
 4. metrics on the evaluation split (``val/`` or ``train_eval/``; plus ``test/``). ``val/`` is also the
    calibration split and the detector's early-stopping set, so its numbers are optimistic — pass a
    ``data.splits`` file with a test split for unbiased ``test/`` metrics. Reported: hallucination
@@ -51,9 +56,9 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from . import (finite_json, fit_and_restore, load_stage_yaml, parse_overrides, resolve_stage_config,
-               seed_model_init, split_stage_episodes, stage_episodes, warn_legacy_taxel_frame,
-               write_json_atomic)
+from . import (data_provenance, finite_json, fit_and_restore, load_stage_yaml, parse_overrides,
+               resolve_stage_config, seed_model_init, split_stage_episodes, stage_episodes,
+               warn_legacy_taxel_frame, write_json_atomic)
 
 log = logging.getLogger("robot_skin.stages.contact")
 
@@ -213,6 +218,7 @@ def run(cfg: Mapping[str, Any] | None = None) -> dict:
     cfg = resolve_config(cfg)
     out_dir = Path(cfg["out_dir"])
     d_cfg, c_cfg, det_cfg = cfg["data"], cfg["calibration"], dict(cfg["detector"])
+    provenance = data_provenance(d_cfg)            # the splits file / processed root this run trains on
     q_source = d_cfg["q_source"]
     if q_source not in Q_SOURCES:
         raise ValueError(f"data.q_source must be one of {Q_SOURCES}, got {q_source!r}")
@@ -300,7 +306,16 @@ def run(cfg: Mapping[str, Any] | None = None) -> dict:
     det_enabled = bool(det_cfg.pop("enabled"))
     metrics: dict[str, Any] = {"stage": STAGE, "out_dir": str(out_dir), "q_source": q_source,
                                "calibrator_path": str(out_dir / CALIBRATOR_NAME), "calibration_split": cal_split,
-                               "notes": notes}
+                               "data_provenance": provenance, "notes": notes}
+    # no-contact z spread per split: the detector trains on the train split, which must look like
+    # unseen data (baseline cross-fitting); in-sample baseline residuals show up as a tight train z
+    zstd = {name: _no_contact_z_std(split.get(name) or [], labels)
+            for name in ("train", "val", "test") if split.get(name)}
+    metrics["no_contact_z_std"] = zstd
+    ref_std = zstd.get(cal_split) if cal_split != "train" else None
+    if ref_std and zstd.get("train") and zstd["train"] < 0.8 * ref_std:
+        notes.append(f"train-split no-contact z is much tighter than on the {cal_split} split (std {zstd['train']:.2f} "
+                     f"vs {ref_std:.2f}): in-sample baseline residuals? run the baseline stage with crossfit.folds ≥ 2")
     if det_enabled:
         boot = det_cfg.pop("bootstrap")
         tr_v = [views[id(e)] for e in split["train"]]
@@ -349,6 +364,24 @@ def run(cfg: Mapping[str, Any] | None = None) -> dict:
                                          q_source)
     barrier(dist)
     return finite_json(metrics)
+
+
+def _no_contact_z_std(eps: Sequence, labels: Sequence[int]) -> float | None:
+    """std of ``residual_z`` over the labelled no-contact, unsaturated, finite samples of ``eps``."""
+    from ..datasets.episode import D_RESIDUAL_Z, K_CONTACT_LABEL, K_SATURATED
+
+    n = s1 = s2 = 0.0
+    for ep in eps:
+        if not ep.has_derived(D_RESIDUAL_Z):
+            continue
+        z = np.asarray(ep.derived(D_RESIDUAL_Z), dtype=np.float64)
+        m = np.isin(np.asarray(ep[K_CONTACT_LABEL]), list(labels)) & ~np.asarray(ep[K_SATURATED], dtype=bool)
+        m &= np.isfinite(z)
+        n, s1, s2 = n + m.sum(), s1 + z[m].sum(), s2 + (z[m] ** 2).sum()
+    if n < 2:
+        return None
+    mu = s1 / n
+    return float(np.sqrt(max(s2 / n - mu * mu, 0.0)))
 
 
 def _bootstrap_views(views: Sequence) -> tuple[list, int]:

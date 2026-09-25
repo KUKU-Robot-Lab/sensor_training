@@ -35,8 +35,10 @@ readout ─ 학습 토큰 ──────────────────
   함수를 쓴다. `obs_mode` 절제: `full`(6) / `ordinal`(4) / `binary`(1) / `none` (촉각 분기 자체를 만들지 않음, 토큰 0개).
 - **ContactGate**: `contact = level ≥ WEAK` (`data.contact_rule`) 가 하나도 없으면 촉각 토큰이 0 → 무접촉 드리프트가
   융합에 들어갈 수 없다 (상수 modality embedding 만 남는다). 주의: 기본 규칙(`level_ge_weak`)은 SATURATED 도 접촉으로
-  센다. 전처리가 모든 프레임에서 saturated 로 표시하는 **죽은 채널**이 있으면 게이트가 항상 열리므로, 그런 taxel 은
-  `taxel_pad` 로 가리거나 `weak_or_strong` 을 쓴다.
+  센다. 전처리가 모든 프레임에서 saturated 로 표시하는 **죽은 채널**(`meta.preprocessing.dead_taxels`)이 있으면
+  게이트가 항상 열리므로, `VTLADataset(mask_dead_taxels=True)` (stage `data.mask_dead_taxels`, 기본 켬)가 그런 taxel 을
+  `taxel_pad` 로 가린다(`make_observation(taxel_mask=...)`). 번들 `tactile.mask_dead_taxels` 가 켜져 있으면 제어도
+  세션의 죽은 채널을 같은 방식으로 가린다. 끄면 stage 가 경고한다; 다른 선택지는 `weak_or_strong`.
 - **Modality dropout** (학습 시 샘플별): `p_drop_tactile` / `p_drop_vision` / `p_drop_language` 가 해당 모달리티
   토큰 전체를 key-padding 으로 가린다. 가려진 토큰도 그래프에 남으므로(기울기 0) DDP 에
   `find_unused_parameters` 가 필요 없다.

@@ -56,6 +56,41 @@ def test_projection_matches_hand_derived_coordinates():
     np.testing.assert_allclose(pr.closest, [[0, 0, 0.25], [0, 0, 1.25], [1.5, 0, 0]])
 
 
+def test_palm_lateral_coordinate_interpolates_between_rays():
+    """``v`` of a palm taxel is continuous: linear between the nearest wrist → knuckle ray and its
+    neighbour on the taxel's side, from in-plane distances (the palmar offset of the skin is ignored),
+    clamped beyond the outermost rays. Three parallel rays (index 0, middle 1/3, ring 2/3) at y = 0, 1, 2."""
+    sk = CapsuleSkeleton(p0=[[0, 0, 0], [0, 1, 0], [0, 2, 0], [0, 0, 0]],
+                         p1=[[1, 0, 0], [1, 1, 0], [1, 2, 0], [0, 0, 1]],
+                         radius=0.1, names=["palm_index", "palm_middle", "palm_ring", "index1"])
+    pts = np.array([[0.5, 0.25, 0.3],      # 1/4 of the way index → middle, 0.3 palmar: 1/12
+                    [0.5, 1.5, -0.2],      # halfway middle → ring: 1/2
+                    [0.5, -0.5, 0.0],      # radial of the index ray: 0
+                    [0.5, 2.4, 0.1],       # ulnar of the ring ray: 2/3
+                    [0.0, 0.0, 0.9]])      # on the finger: NaN
+    groups = ["palm"] * 4 + ["index"]
+    pr = project_to_skeleton(pts, sk, taxel_groups=groups)
+    np.testing.assert_allclose(pr.v[:4], [1 / 12, 0.5, 0.0, 2 / 3], atol=1e-12)
+    assert np.isnan(pr.v[4])
+    pb = project_to_skeleton(np.stack([pts, pts[::-1]]), sk, taxel_groups=None)       # batched
+    np.testing.assert_allclose(pb.v[0, :4], pr.v[:4], atol=1e-12)
+    np.testing.assert_allclose(pb.v[1, 1:], pr.v[:4][::-1], atol=1e-12)
+
+
+def test_template_palm_pads_map_one_to_one_with_sides_kept(hands):
+    """glove ⇄ robot templates in skeleton space: each of the four palm pads maps to its counterpart
+    (radial/ulnar × proximal/distal) in both directions — none crosses the hand's midline."""
+    g, r = hands["glove"], hands["robot"]
+    g2r = align_layouts(g, r, src_pos=hands["gp"], dst_pos=hands["rp"], src_skeleton=hands["mano"],
+                        dst_skeleton=hands["rsk"])
+    r2g = align_layouts(r, g, src_pos=hands["rp"], dst_pos=hands["gp"], src_skeleton=hands["rsk"],
+                        dst_skeleton=hands["mano"])
+    assert [g.taxels[i].id for i in g2r.index[5:, 0]] == [t.id for t in r.taxels[5:]]
+    assert [r.taxels[i].id for i in r2g.index[5:, 0]] == [t.id for t in g.taxels[5:]]
+    # the ids name the same pads: radial side is glove palm-frame +x / robot palm-frame +y
+    assert all((g.taxels[i].position[0] > 0) == (r.taxels[i].position[1] > 0) for i in range(5, 9))
+
+
 def test_mano_skeleton_projection_of_glove_taxels(hands):
     sk = hands["mano"]
     assert sk.n == 19 and sk.names[0] == "index1" and np.allclose(np.linalg.norm(sk.palmar, axis=1), 1.0)
@@ -66,7 +101,8 @@ def test_mano_skeleton_projection_of_glove_taxels(hands):
     assert np.all((pr.t >= 0) & (pr.t <= 1)) and np.all(pr.u[:5] > 0.75)       # fingertip pads: distal
     assert np.all(pr.side > 0.9)                                                # every glove pad is palmar
     assert np.all(np.abs(pr.surface_distance) < 0.005)                          # on the skin surface
-    assert np.isnan(pr.v[:5]).all() and pr.v[5] == 1.0 and pr.v[6] == 0.0       # palm_00 ulnar, palm_01 radial
+    assert np.isnan(pr.v[:5]).all() and pr.v[6] == 0.0                         # palm_01 radial of the index ray
+    assert 2 / 3 < pr.v[5] < 1.0 and 1 / 3 < pr.v[7] < 2 / 3 and 0.0 < pr.v[8] < 1 / 3   # palm_00/10 ulnar, 11 radial
     np.testing.assert_allclose(pr.closest + pr.offset, hands["gp"], atol=1e-12)
     # batched input + unrestricted projection; alias with the default flat MANO hand
     T = np.stack([hands["gp"], hands["gp"] + [0.0, 0.0, 0.001]])
@@ -146,6 +182,42 @@ def test_map_taxel_values_reduce_modes_and_fill(tmp_path):
         map_taxel_values(v, al, reduce="median")
     al.save(tmp_path / "al.json")
     assert LayoutAlignment.load(tmp_path / "al.json").n_src == 3
+
+
+def test_k_beyond_group_size_and_max_dist_never_leak_across_matches(hands):
+    """Each fingertip group has one taxel per hand: with k = 2 the second column has no same-group
+    source. It must not carry another finger's flag / level (reduce max) or NaN (weighted), and
+    max_dist must drop every far match, not only the nearest."""
+    g, r = hands["glove"], hands["robot"]
+    al = align_layouts(g, r, src_pos=hands["gp"], dst_pos=hands["rp"], src_skeleton=hands["mano"],
+                       dst_skeleton=hands["rsk"], k=2)
+    tips = slice(0, 5)
+    assert np.all(al.index[tips, 1] == al.index[tips, 0]) and np.isinf(al.distance[tips, 1]).all()
+    for i in range(r.n):                                                     # no column names another group
+        assert all(al.src_groups[j] == al.dst_groups[i] for j in al.index[i])
+    flags = np.zeros(9, bool)
+    flags[0] = True                                                          # only the glove thumb tip touched
+    out = map_taxel_values(flags, al, reduce="max")
+    assert [t.id for t, f in zip(r.taxels, out) if f] == ["thumb_tip"]
+    lv = np.zeros(9, np.int64)
+    lv[0] = 3
+    np.testing.assert_array_equal(map_taxel_values(lv, al, reduce="max"), [3, 0, 0, 0, 0, 0, 0, 0, 0])
+    vals = np.arange(9, dtype=float)
+    vals[0] = np.nan                                                         # invalid thumb channel
+    w = map_taxel_values(vals, al)
+    assert np.isnan(w[0]) and np.isfinite(w[1:]).all()
+    np.testing.assert_allclose(w[1:5], [1.0, 2.0, 3.0, 4.0])
+    # an alignment saved before the padding (cross-group column, weight 0, distance inf) is masked too
+    old = LayoutAlignment(index=np.array([[0, 1], [1, 0]]), weight=np.array([[1.0, 0.0], [1.0, 0.0]]),
+                          distance=np.array([[0.1, np.inf], [0.1, np.inf]]), valid=np.array([True, True]), n_src=2)
+    assert list(map_taxel_values(np.array([True, False]), old, reduce="max")) == [True, False]
+    np.testing.assert_allclose(map_taxel_values(np.array([np.nan, 2.0]), old), [np.nan, 2.0])
+    # max_dist applies to every match: glove → glove, palm_00 ← palm_00 (0) but not palm_01 (24 mm away)
+    same = align_layouts(g, g, k=2, max_dist=1e-3)
+    assert same.valid.all() and np.all(same.index[:, 1] == np.arange(9)) and np.all(same.weight[:, 1] == 0.0)
+    f2 = np.zeros(9, bool)
+    f2[6] = True                                                             # palm_01 only
+    assert list(np.flatnonzero(map_taxel_values(f2, same, reduce="max"))) == [6]
 
 
 def test_robot_to_mano_estimator_inverts_the_retargeting(hands):

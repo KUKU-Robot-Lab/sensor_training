@@ -14,7 +14,7 @@ from torch.utils.data import TensorDataset
 from robot_skin.train import DistInfo, TrainConfig, Trainer
 from robot_skin.train.sweep import (expand_grid, flatten, get_by_path, load_results, main,
                                     run_optuna, run_sweep, sample_random, set_by_path, shard,
-                                    suggest_from_space, unflatten)
+                                    suggest_from_space, trial_config, unflatten)
 
 
 def toy_train(cfg: dict) -> dict:
@@ -28,6 +28,16 @@ def hw_train(cfg: dict) -> dict:
     """CLI objective that reports what the hardware profile put into the trial config."""
     return {"metric": cfg["train"]["lr"], "hardware": cfg.get("hardware"),
             "device": cfg["train"].get("device"), "batch_size": cfg["train"].get("batch_size")}
+
+
+def imu_pose_train_keys(cfg: dict) -> dict:
+    """CLI objective: the train keys the real imu_pose stage trains with — its ``resolve_config``
+    is the first thing ``stages.imu_pose.run`` does (and where a profile could be re-applied)."""
+    from robot_skin.stages import imu_pose
+
+    t = imu_pose.resolve_config(cfg)["train"]
+    return {"metric": float(t["batch_size"]),
+            **{k: t.get(k) for k in ("batch_size", "grad_accum", "precision", "compile", "device")}}
 
 
 # ───────────────────────────────────────────────────────────────────────────── paths
@@ -188,6 +198,53 @@ def test_cli_hardware_profile_applied_under_trial_overrides(tmp_path):
         assert r["result"]["batch_size"] == 8                                  # suggest.vtla
 
 
+@pytest.mark.parametrize("how", ["--hardware", "base-yaml"])
+def test_cli_swept_profile_keys_survive_the_stage_resolve(tmp_path, how):
+    """Regression: the profile used to be applied again inside the stage's run() (hardware set,
+    hardware_applied false), silently replacing every swept batch_size / precision / compile with
+    the profile's values — all trials trained identically."""
+    from robot_skin.stages import imu_pose
+
+    base = yaml.safe_load(imu_pose.CONFIG_PATH.read_text())
+    if how == "base-yaml":
+        base["hardware"] = "cpu"
+    (tmp_path / "base.yaml").write_text(yaml.safe_dump(base))
+    (tmp_path / "space.yaml").write_text(yaml.safe_dump({"space": {
+        "train.batch_size": [16, 32], "train.precision": ["bf16"], "train.compile": [True]}}))
+    argv = ["--fn", "robot_skin.tests.test_sweep:imu_pose_train_keys", "--space", str(tmp_path / "space.yaml"),
+            "--base", str(tmp_path / "base.yaml"), "--out", str(tmp_path / "o")]
+    res = main(argv + (["--hardware", "cpu"] if how == "--hardware" else []))
+    assert sorted(r["result"]["batch_size"] for r in res) == [16, 32]      # not cpu suggest (64)
+    for r in res:
+        assert r["status"] == "ok"
+        assert r["result"]["precision"] == "bf16" and r["result"]["compile"] is True   # not fp32/False
+        assert r["result"]["device"] == "cpu" and r["result"]["grad_accum"] == 1       # profile keys
+    # an axis the trial does not sweep keeps the profile's suggest.imu_pose value
+    (tmp_path / "space2.yaml").write_text(yaml.safe_dump({"space": {"train.lr": [1e-3]}}))
+    res = main(["--fn", "robot_skin.tests.test_sweep:imu_pose_train_keys", "--space", str(tmp_path / "space2.yaml"),
+                "--base", str(tmp_path / "base.yaml"), "--out", str(tmp_path / "o2"), "--hardware", "cpu"])
+    assert res[0]["result"]["batch_size"] == 64 and res[0]["result"]["precision"] == "fp32"
+
+
+def test_trial_config_applies_a_swept_profile_before_the_trial_overrides(tmp_path):
+    from robot_skin.stages import vtla
+
+    prof = tmp_path / "big.yaml"
+    prof.write_text(yaml.safe_dump({"name": "big", "train": {"device": "cpu", "precision": "bf16"},
+                                    "suggest": {"vtla": {"batch_size": 99, "grad_accum": 3}}, "env": {}}))
+    base = {"stage": "vtla", "hardware": "cpu", "train": {"lr": 1.0, "batch_size": 5}}
+    cfg = trial_config(base, {"train": {"batch_size": 7}})
+    assert cfg["hardware_applied"] is True and cfg["train"]["batch_size"] == 7   # trial beats profile
+    assert cfg["train"]["device"] == "cpu" and cfg["train"]["grad_accum"] == 1
+    assert vtla.resolve_config(cfg)["train"]["batch_size"] == 7                  # not re-applied
+    cfg = trial_config(base, {"hardware": str(prof), "train": {"lr": 0.1}})      # swept profile
+    assert cfg["hardware"] == "big" and cfg["train"]["batch_size"] == 99 and cfg["train"]["grad_accum"] == 3
+    assert cfg["train"]["precision"] == "bf16" and cfg["train"]["lr"] == 0.1
+    assert trial_config({"train": {"lr": 1.0}}, {"train": {"lr": 2.0}}) == {"train": {"lr": 2.0}}  # no profile
+    with pytest.warns(UserWarning, match="without a stage"):
+        trial_config({"hardware": "cpu", "train": {}}, {})
+
+
 # ───────────────────────────────────────────────────────────────────────────── optuna glue
 
 class FakeTrial:
@@ -216,6 +273,44 @@ def test_suggest_from_space_with_fake_trial():
                   "model": {"depth": 6, "betas": [0.9, 0.95]}}
     assert ("float", "train.lr", 1e-4, 1e-2, True) in t.calls
     assert ("cat", "model.betas", (0, 1)) in t.calls
+
+
+def test_trials_get_their_own_dir_even_when_the_base_sets_a_top_level_out_dir(tmp_path):
+    """Regression: trials wrote only ``train.out_dir`` while the stages prefer a top-level ``out_dir`` — with a
+    base that sets it (e.g. a pipeline's ``<runs>/<stage>/pipeline_config.yaml``) every trial trained into that
+    one directory, overwriting the pipeline's run and each other, and no trial_XXX dir was created."""
+    from robot_skin.stages import imu_pose
+
+    seen = []
+
+    def fn(cfg):
+        seen.append(imu_pose.resolve_config(cfg)["out_dir"])    # the directory the stage really writes to
+        return 0.0
+
+    base = yaml.safe_load(imu_pose.CONFIG_PATH.read_text())
+    base["out_dir"] = str(tmp_path / "pipeline_runs" / "imu_pose")
+    res = run_sweep(fn, base, [{"train": {"lr": 1e-3}}, {"train": {"lr": 2e-3}}], tmp_path / "sw")
+    assert sorted(seen) == [str(tmp_path / "sw" / "trial_000"), str(tmp_path / "sw" / "trial_001")]
+    assert sorted(r["trial_dir"] for r in res) == sorted(seen)
+    # a base without a top-level out_dir (the documented stage YAML) and a custom trial_dir_key are unchanged
+    seen.clear()
+    run_sweep(lambda c: (seen.append((c.get("out_dir"), c["train"]["out_dir"])), 0.0)[1],
+              {"train": {"lr": 1.0}}, [{}], tmp_path / "sw2")
+    assert seen == [(None, str(tmp_path / "sw2" / "trial_000"))]
+    seen.clear()
+    run_sweep(lambda c: (seen.append((c["out_dir"], c["log_dir"])), 0.0)[1], {"out_dir": "keep"}, [{}],
+              tmp_path / "sw3", trial_dir_key="log_dir")
+    assert seen == [("keep", str(tmp_path / "sw3" / "trial_000"))]
+
+
+def test_optuna_glue_is_exported_from_robot_skin_train():
+    """TRAINING.md names ``robot_skin.train.run_optuna``; it was only importable from ``.sweep``."""
+    import robot_skin.train as T
+
+    from robot_skin.train import run_optuna as ro, suggest_from_space as sfs, trial_config as tc  # noqa: F401
+
+    assert ro is run_optuna and sfs is suggest_from_space and tc is trial_config
+    assert {"run_optuna", "suggest_from_space", "trial_config"} <= set(T.__all__)
 
 
 @pytest.mark.skipif(importlib.util.find_spec("optuna") is not None, reason="optuna installed")

@@ -45,6 +45,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .heads import draw_on_generator
+
 __all__ = ["dpo_loss", "chunk_log_likelihood", "preference_loss", "make_reference_policy",
            "PreferencePair", "build_preference_pairs"]
 
@@ -127,7 +129,8 @@ def preference_loss(policy: nn.Module, reference: nn.Module, batch: Mapping[str,
     ``actions_chosen`` / ``actions_rejected [B,H,A]`` (normalized, relative like the training
     targets) and optional ``valid_chosen`` / ``valid_rejected [B,H]``. Each model encodes the
     observation once (shared by chosen / rejected and all draws). For the flow head the surrogate
-    is averaged over ``n_draws`` shared ``(ε, τ)`` draws (``generator`` for reproducibility). The
+    is averaged over ``n_draws`` shared ``(ε, τ)`` draws (``generator`` for reproducibility — drawn on
+    the generator's device, so a CUDA generator works for a CUDA policy). The
     reference runs without gradients. ``disable_dropout`` (default) evaluates the policy in eval
     mode — no dropout / modality dropout, gradients still flow — so that ``loss = log 2`` exactly
     when ``policy`` equals ``reference``; the policy's previous mode is restored afterwards.
@@ -150,7 +153,7 @@ def preference_loss(policy: nn.Module, reference: nn.Module, batch: Mapping[str,
         for _ in range(draws):
             kw: dict[str, Any] = {}
             if is_flow:
-                kw["noise"] = torch.randn(ac.shape, generator=generator).to(ac.device)
+                kw["noise"] = draw_on_generator(torch.randn, ac.shape, generator=generator, device=ac.device)
                 kw["tau"] = policy.head.sample_tau(ac.shape[0], generator=generator, device=ac.device)
             pc = chunk_log_likelihood(policy, batch, ac, vc, sigma=sigma, encoding=enc_p, **kw)
             pr = chunk_log_likelihood(policy, batch, ar, vr, sigma=sigma, encoding=enc_p, **kw)

@@ -67,14 +67,19 @@ python -m robot_skin deploy --set bundle=$R/runs/vtla --set duration_s=2 --set o
 ```bash
 python -m robot_skin record glove --protocol d1_motion --subject S01 --dry-run   # 계획·운영자 대본만 (장비 없이)
 python -m robot_skin record glove --protocol d1_motion --subject S01 --fake --time-scale 0.05   # 합성 소스로 end-to-end
+                                                         #   → robot_skin/data/synthetic (실제 raw 와 분리)
 python -m robot_skin preprocess                          # robot_skin/data/raw → robot_skin/data/processed
 python -m robot_skin env                                 # GPU/torch 점검, 추천 하드웨어 프로파일
 python -m robot_skin pipeline --hardware rtx5090         # → robot_skin/runs/<stage>/
 python -m robot_skin deploy --set bundle=robot_skin/runs/vtla
 ```
 
-`record` 는 `--out`/`--root` 를 생략하면 `robot_skin/data/raw/<dataset>/<subject>/…` 에 쓴다(`--dry-run` 도 계획을
-`…/dry_run/session.json` 으로 남긴다). 앞의 두 줄(`--dry-run`, `--fake`)과 `env` 는 이 VM 에서 실행해 확인했다.
+`record` 는 `--out`/`--root` 를 생략하면 `configs/default.yaml` `paths.raw_root`(`robot_skin/data/raw/<dataset>/<subject>/…`)
+에 쓴다. `--dry-run` 은 계획만 `…/dry_run/session.json` 으로 남기고, `preprocess` 는 이런 계획을 `plan` 으로 보고하고
+건너뛴다. `--fake` 세션은 전부 합성이라 `paths.synthetic_root`(`robot_skin/data/synthetic/…`)로 가서 실제 데이터와 섞이지
+않는다 — 경로 점검용으로 전처리하려면 `python -m robot_skin preprocess --raw robot_skin/data/synthetic --out /tmp/fake_proc`
+(episode 의 `meta.preprocessing.synthetic` 에 출처가 남고, 합성과 실제 세션을 함께 전처리하면 경고한다). 앞의 세 줄과
+`env` 는 이 VM 에서 실행해 확인했다.
 실제 장비 입력(IMU 허브, ROS joint state, 로봇 핸드 드라이버, mk555 `.bin` 로더)은 아직 인터페이스만 있다 —
 [`docs/DATA_ACQUISITION.md`](docs/DATA_ACQUISITION.md), [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) §7.
 

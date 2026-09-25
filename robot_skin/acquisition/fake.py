@@ -25,6 +25,13 @@ consistent raw streams, so the whole acquisition chain (recorder → sync → IM
 Each stream has its own nominal rate, host-clock latency, clock drift (ppm), jitter and drops, so
 ``sync.sync_session`` has something real to recover. Ground truth is in :attr:`FakeScene.truth`.
 Everything is seeded; no hidden global RNG.
+
+Limitation: the press is **scripted per contact site** (pinch → thumb + finger tip, fist, palm touch …)
+and is not derived from the MANO capsule geometry that ``datasets.build`` turns into ``self_touch`` /
+``contact_label`` — on a fake D1 session most pressed samples are labelled unknown (−1) and a few
+geometric contacts carry no press. A ``--fake`` session checks the software chain (record → sync →
+calibration → QC → preprocessing), not contact-label quality: train / evaluate the contact detector on
+``datasets.synthetic`` sessions, whose press comes from the same geometry as the labels.
 """
 from __future__ import annotations
 

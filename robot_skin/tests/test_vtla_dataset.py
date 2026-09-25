@@ -301,6 +301,61 @@ def test_obs_history_collate_and_model(data):
         collate_vtla([])
 
 
+def _with_dead_channel(ep, taxel=0):
+    """In-memory copy whose ``taxel`` is a dead channel exactly as ``datasets.build`` marks one
+    (baseline ≤ 0: ΔS 0, saturated in every frame, listed in ``meta.preprocessing.dead_taxels``)."""
+    import copy
+
+    from robot_skin.datasets.episode import K_DELTA, K_SATURATED
+
+    meta = copy.deepcopy(ep.meta)
+    meta.preprocessing = {**(meta.preprocessing or {}), "dead_taxels": [int(taxel)]}
+    arrays = {k: np.array(v) for k, v in ep.arrays.items()}
+    arrays[K_DELTA][:, taxel] = 0.0
+    arrays[K_SATURATED][:, taxel] = True
+    return Episode(meta, arrays, dict(ep.static))
+
+
+def test_dead_channel_is_masked_so_the_contact_gate_can_close(data):
+    """VTLA-2: a dead channel is SATURATED in every frame, i.e. contact under the default
+    ``level_ge_weak`` rule, so it held the hard ContactGate open on every sample and tactile drift of
+    the other taxels reached the fusion on real no-contact frames. ``mask_dead_taxels`` (default)
+    hides ``meta.preprocessing.dead_taxels`` via ``taxel_pad``: the gate closes again exactly where
+    the live taxels see no contact."""
+    kw = dict(cameras=(), tactile_source="bootstrap")
+    ref = _ds([_mem_copy(data["glove"][0])], **kw)
+    ep = _with_dead_channel(data["glove"][0], 0)
+    raw = _ds([ep], mask_dead_taxels=False, **kw)
+    masked = _ds([ep], **kw)
+    assert raw.dead_taxels == masked.dead_taxels == {ep.meta.episode_id: [0]} and ref.dead_taxels == {}
+    n = len(masked)
+    assert len(raw) == len(ref) == n > 0
+
+    def gate(ds, live=slice(None)):
+        return np.array([bool(ds[i]["contact"][live].any()) for i in range(n)])
+
+    assert gate(raw).all()                                             # the old behaviour: always open
+    assert all(bool(masked[i]["taxel_pad"][0]) and not masked[i]["taxel_pad"][1:].any()
+               and not masked[i]["contact"][0] for i in range(n))
+    np.testing.assert_array_equal(gate(masked), gate(ref, slice(1, None)))
+    assert not gate(masked).all()
+    # through the model: on a no-contact sample the tactile drift of the live taxels no longer matters
+    i = int(np.flatnonzero(~gate(masked))[0])
+    cfg = VTLAConfig(horizon=8, d_model=32, cameras=(), vision=None, text=None, fusion_depth=1, head_depth=1,
+                     tactile_encoder={"d_model": 16, "depth": 1, "heads": 2, "n_fourier": 2}, tactile_heads=2)
+    torch.manual_seed(0)
+    model = VTLAPolicy(cfg)
+    torch.nn.init.normal_(model.head.out.weight, std=0.5)
+
+    def drift_changes_output(ds):
+        batch = collate_vtla([ds[i]])
+        drifted = {**batch, "tactile_values": batch["tactile_values"].clone()}
+        drifted["tactile_values"][:, 1:] += 3.0
+        return not torch.allclose(model.predict(batch), model.predict(drifted))
+
+    assert drift_changes_output(raw) and not drift_changes_output(masked)
+
+
 def test_robot_joint_actions(data):
     ep = data["robot"][0]
     ds = _ds([ep], cameras=("ego",), action_spec="robot_joint", rel_mode="delta")
@@ -347,12 +402,34 @@ def test_stage_config_rejects_unknown_keys():
             stage.load_stage_config(None, bad)
         with pytest.raises(ValueError):
             stage.resolve_config(bad)
-    ok = stage.resolve_config({"image": None, "train": {"custom_key": 1},
+    ok = stage.resolve_config({"image": None, "train": {"max_steps": 1},
                                "vision": {"encoder": {"type": "tiny", "anything": 1}}})
     assert ok["image"] is None                       # open sections are validated downstream
+    for fn in (stage.resolve_config, lambda c: stage.load_stage_config(None, c)):
+        with pytest.raises(ValueError, match="custom_key"):     # train: TrainConfig fields only (CLI-5)
+            fn({"train": {"custom_key": 1}})
     lin = torch.nn.Linear(3, 2)
     h32 = stage._weights_hash(lin)
     assert h32 == stage._weights_hash(lin) and h32 != stage._weights_hash(lin.to(torch.bfloat16))
+
+
+def test_stage_mask_dead_taxels_is_configurable_and_warns_when_off(data):
+    """VTLA-2: ``data.mask_dead_taxels`` is a stage key (every key that could carry the documented
+    remedy was rejected as unknown); with it off under ``level_ge_weak`` the stage warns about the
+    episodes' dead channels instead of silently training with an always-open ContactGate."""
+    from robot_skin.stages import vtla as stage
+
+    assert stage.DEFAULTS["data"]["mask_dead_taxels"] is True
+    assert stage.resolve_config({"data": {"mask_dead_taxels": False}})["data"]["mask_dead_taxels"] is False
+    assert stage.load_stage_config(None, {"data": {"mask_dead_taxels": False}})["data"]["mask_dead_taxels"] is False
+    eps = [_with_dead_channel(data["glove"][0], 2), _mem_copy(data["glove"][1])]
+    with pytest.warns(UserWarning, match=r"1/2 episodes have dead tactile channels.*ContactGate never closes"):
+        stage._report_dead_taxels(eps, {"mask_dead_taxels": False, "contact_rule": "level_ge_weak"})
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        stage._report_dead_taxels(eps, {"mask_dead_taxels": True, "contact_rule": "level_ge_weak"})
+        stage._report_dead_taxels(eps, {"mask_dead_taxels": False, "contact_rule": "weak_or_strong"})
+        stage._report_dead_taxels(eps[1:], {"mask_dead_taxels": False, "contact_rule": "level_ge_weak"})
 
 
 def test_stage_splits_json_shared_with_other_stages(data, tmp_path, caplog):
@@ -460,6 +537,7 @@ def test_stage_run_writes_bundle_that_reproduces_policy(data, tmp_path, variant)
     assert comp["feature_spec"].obs_mode == ("full" if variant == "flow_full_aux" else "none")
     assert b["tactile"]["source"] == ("bootstrap" if variant == "flow_full_aux" else "none")
     assert b["vision"]["cameras"] == ["ego"] and b["vision"]["eval_transform"]["out_size"] == list(HW)
+    assert b["tactile"]["mask_dead_taxels"] is True                 # control masks dead channels likewise
     if variant == "flow_full_aux":
         assert b["tactile"]["calibrator_state"] == {"sigma_pct": [1.0], "weak_z": 3.0}
     if variant == "chunk_none_cached":
@@ -476,7 +554,7 @@ def test_stage_run_writes_bundle_that_reproduces_policy(data, tmp_path, variant)
                          use_cached_vision=b["vision"]["cached_features_key"],
                          action_normalizer=comp["action_normalizer"],
                          proprio_normalizer=comp["proprio_normalizer"], phases=b["meta"]["phases"],
-                         contact_rule=tac["contact_rule"],
+                         contact_rule=tac["contact_rule"], mask_dead_taxels=tac["mask_dead_taxels"],
                          tactile_source="bootstrap" if tac["source"] == "bootstrap" else "auto")
     res = stage.evaluate_policy(policy, val_ds, batch_size=16, seed=3, collate_fn=Collator(comp["tokenizer"]))
     assert res["l1"] == pytest.approx(metrics["val/l1"], rel=1e-5, abs=1e-6)

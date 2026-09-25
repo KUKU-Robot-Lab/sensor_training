@@ -21,7 +21,9 @@ Paper grounding
 Conventions
 - quaternions wxyz; gyro (rad/s) and acc (m/s², specific force incl. gravity) are in each IMU's
   **sensor frame** (what raw IMUs report). ``vec_frame="world"`` is available for devices that
-  output world-frame vectors.
+  output world-frame vectors: calibrate those with ``apply_imu_offsets_to_vectors(...,
+  vec_frame="world", world=G)`` (``G⁻¹ v``, preprocessing ``imu.vec_frame: world``) so they share
+  the calibrated quaternions' model world.
 - Calibration model: ``q_meas = G ⊗ q_segment ⊗ M`` (``G`` IMU-world ← model-world, ``M``
   sensor mounting). A static pose with known segment orientations ``q_ref`` gives the per-site
   offset ``q_off = M⁻¹ = q̄_meas⁻¹ ⊗ G ⊗ q_ref`` (``G = I`` → the spec's
@@ -190,13 +192,30 @@ def apply_imu_offsets(quat, offsets, *, world=None):
     return out.numpy() if is_np else out
 
 
-def apply_imu_offsets_to_vectors(vec, offsets):
-    """Sensor-frame vectors ``[...,S,3]`` (gyro/acc) → segment frame: ``R_offᵀ · v``."""
+def apply_imu_offsets_to_vectors(vec, offsets, *, vec_frame: str = "sensor", world=None):
+    """Calibrate gyro / acc ``[...,S,3]`` consistently with :func:`apply_imu_offsets` (the quaternions
+    become ``G⁻¹ ⊗ q_meas ⊗ q_off``):
+
+    - ``vec_frame="sensor"`` (what raw IMUs report): each sensor frame → its segment frame,
+      ``R_offᵀ · v`` (``world`` is irrelevant: ``G`` does not act on body-frame vectors);
+    - ``vec_frame="world"`` (devices that output world-frame vectors): IMU world → model world,
+      ``G⁻¹ · v`` — the per-site mounting offsets do not apply to them (``world=None`` → unchanged).
+      Rotating them by ``R_offᵀ`` instead would mix frames and make the
+      ``imu_features(vec_frame="world")`` depend on the session's IMU heading.
+    """
+    if vec_frame not in ("sensor", "world"):
+        raise ValueError("vec_frame must be 'sensor' or 'world'")
     is_np = not isinstance(vec, torch.Tensor)
     v = as_tensor(vec)
     v = v.to(torch.float64) if not v.is_floating_point() else v
-    R = quat_to_matrix(as_tensor(offsets).to(dtype=v.dtype, device=v.device))  # [S,3,3]
-    out = torch.matmul(R.transpose(-1, -2), v[..., None])[..., 0]
+    if vec_frame == "sensor":
+        R = quat_to_matrix(as_tensor(offsets).to(dtype=v.dtype, device=v.device))  # [S,3,3]
+        out = torch.matmul(R.transpose(-1, -2), v[..., None])[..., 0]
+    elif world is None:
+        out = v.clone()
+    else:
+        G = quat_to_matrix(as_tensor(world).to(dtype=v.dtype, device=v.device).reshape(4))
+        out = torch.matmul(G.transpose(-1, -2), v[..., None])[..., 0]
     return out.numpy() if is_np else out
 
 

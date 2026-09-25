@@ -29,7 +29,17 @@ to :data:`DEFAULTS`, unknown keys raise):
    subtraction (``eval.motion_contact_separability``: positives = self-touch labels, negatives =
    no-contact while the joints move), and — synthetic data (``gt_artefact_pct``) — the error to
    the true artefact on no-contact / contact frames;
-5. writes the derived arrays, ``<out_dir>/baseline_model.pt`` (:func:`load_baseline_model`, meta:
+5. **cross-fitting** (``crossfit.folds`` ≥ 2, default 3): the train episodes are split into folds
+   (whole subjects / episodes, ``crossfit.by``) and one extra model per fold is trained without it
+   (checkpoints under ``<out_dir>/crossfit/fold<k>``); the derived arrays of a *train* episode come
+   from the model that did not see it (out-of-fold). The ``contact`` stage fits its detector — and
+   ``pretrain`` learns — on the train split's residuals: in-sample residuals of the shipped model
+   are 20–50 % tighter than on unseen data (and at deployment), which would teach the detector a
+   no-contact z far narrower than it will meet (stacking leakage). Val / test / D2 episodes keep the
+   shipped model's predictions; ``metrics["crossfit"]`` reports the in-sample vs out-of-fold gap.
+   Fewer than two train groups, or ``predict.write_derived: false`` (e.g. sweep trials) → skipped
+   (noted in ``metrics["crossfit"]``);
+6. writes the derived arrays, ``<out_dir>/baseline_model.pt`` (:func:`load_baseline_model`, meta:
    ``q_source``, ``window``, ``qd`` — the ``joint_velocity`` kwargs the online processor must reuse,
    ``joint_velocity(q_buffer, hz, **meta["qd"])`` — and ``qd_source`` (``derivative`` | ``file``),
    joint names, layout), ``joint_stats.json`` and ``metrics.json``.
@@ -51,9 +61,9 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from . import (finite_json, fit_and_restore, load_stage_yaml, parse_overrides, resolve_stage_config,
-               seed_model_init, split_stage_episodes, stage_episodes, warn_legacy_taxel_frame,
-               write_json_atomic)
+from . import (data_provenance, finite_json, fit_and_restore, load_stage_yaml, parse_overrides,
+               resolve_stage_config, seed_model_init, split_stage_episodes, stage_episodes,
+               warn_legacy_taxel_frame, write_json_atomic)
 
 log = logging.getLogger("robot_skin.stages.baseline")
 
@@ -88,6 +98,7 @@ DEFAULTS: dict[str, Any] = {
     },
     "stats": {"method": "std"},
     "target_scale": {"enabled": True, "floor_pct": 0.05},
+    "crossfit": {"folds": 3, "by": "auto"},
     "model": {"window": 32, "hidden": 64, "taxel_emb_dim": 8, "kernel": 3, "n_layers": 4, "arch": "tcn",
               "head_hidden": 64, "dropout": 0.0, "pos_scale": 10.0, "use_pose": True, "sigma0": 1.0,
               "logvar_min": -12.0, "logvar_max": 8.0, "var_detach": True},
@@ -254,6 +265,64 @@ def evaluate_baseline(model, episodes: Sequence, *, q_source: str = "q", only_la
     return out
 
 
+def crossfit_folds(train_eps: Sequence, cfg: Mapping[str, Any]) -> tuple[list[list], str]:
+    """Folds of the train episodes for cross-fitting: whole groups (``crossfit.by``: ``subject`` |
+    ``episode``; ``auto`` = the ``splits.json`` grouping when it names ``subject``, else
+    ``data.split_by``), assigned round-robin after a ``data.split_seed`` shuffle. Returns
+    ``(folds, by)``; no folds when ``crossfit.folds`` < 2 or fewer than two groups exist."""
+    cf, d = cfg["crossfit"], cfg["data"]
+    by = str(cf.get("by") or "auto")
+    if by == "auto":
+        by = str(d.get("split_by") or "episode")
+        if d.get("splits"):
+            try:
+                meta_by = (json.loads(Path(d["splits"]).read_text()).get("meta") or {}).get("by")
+            except (OSError, ValueError):
+                meta_by = None
+            if meta_by is not None:
+                by = "subject" if "subject" in ([meta_by] if isinstance(meta_by, str) else list(meta_by)) \
+                    else "episode"
+    if by not in ("episode", "subject"):
+        raise ValueError(f"crossfit.by must be auto | episode | subject, got {by!r}")
+    key = (lambda e: e.meta.subject or "") if by == "subject" else (lambda e: e.meta.episode_id)
+    groups = sorted({key(e) for e in train_eps})
+    k = min(int(cf.get("folds") or 0), len(groups))
+    if k < 2:
+        return [], by
+    rng = np.random.default_rng(int(d.get("split_seed", 0)))
+    fold_of = {groups[j]: i % k for i, j in enumerate(rng.permutation(len(groups)))}
+    return [[e for e in train_eps if fold_of[key(e)] == f] for f in range(k)], by
+
+
+def _fit_crossfit(cfg, folds, views, ds_kw, val_ds, only, N, D, m_cfg) -> list[tuple[Any, list]]:
+    """One model per fold, trained like the main one on the other folds' train episodes (own joint
+    stats / target scale; the main validation set early-stops it — none of it is in the fold).
+    Returns ``[(model, held-out episodes)]``."""
+    from ..baseline.temporal import TemporalBaselinePredictor
+    from ..datasets.episode import K_Q, K_QD
+    from ..datasets.motion import BaselineWindowDataset
+    from ..datasets.stats import compute_stats
+
+    out = []
+    for f, held in enumerate(folds):
+        held_ids = {id(e) for e in held}
+        tr = [views[id(e)] for part in folds for e in part if id(e) not in held_ids]
+        st = compute_stats(tr, keys=(K_Q, K_QD), method=cfg["stats"]["method"])
+        seed_model_init(cfg["train"])
+        m = TemporalBaselinePredictor(N, D, **m_cfg)
+        m.set_joint_stats(st[K_Q], st[K_QD])
+        if cfg["target_scale"]["enabled"]:
+            m.set_target_scale(target_scale(tr, only, float(cfg["target_scale"]["floor_pct"])))
+        # own run dir; resume only its own checkpoints (an explicit resume path is the main model's)
+        t_cfg = {**cfg["train"], "out_dir": str(Path(cfg["train"]["out_dir"]) / "crossfit" / f"fold{f}"),
+                 "resume": "auto" if cfg["train"].get("resume") else None}
+        fit_and_restore(m, functools.partial(_loss, loss_cfg=dict(cfg["loss"])), t_cfg,
+                        BaselineWindowDataset(tr, **ds_kw), val_ds,
+                        extra_state={"stage": STAGE, "model_config": m.config, "crossfit_fold": f})
+        out.append((m, list(held)))
+    return out
+
+
 # ─────────────────────────────────────────────────────────────── run
 
 def run(cfg: Mapping[str, Any] | None = None) -> dict:
@@ -267,6 +336,7 @@ def run(cfg: Mapping[str, Any] | None = None) -> dict:
     cfg = resolve_config(cfg)
     out_dir = Path(cfg["out_dir"])
     d_cfg, m_cfg = cfg["data"], dict(cfg["model"])
+    provenance = data_provenance(d_cfg)            # the splits file / processed root this run trains on
     q_source = d_cfg["q_source"]
     if q_source not in Q_SOURCES:
         raise ValueError(f"data.q_source must be one of {Q_SOURCES}, got {q_source!r}")
@@ -344,9 +414,32 @@ def run(cfg: Mapping[str, Any] | None = None) -> dict:
     trainer = fit_and_restore(model, functools.partial(_loss, loss_cfg=dict(cfg["loss"])), cfg["train"],
                               train_ds, val_ds, extra_state={"stage": STAGE, "model_config": model.config,
                                                              "bundle_meta": bundle_meta})
+    # ── cross-fitting: out-of-fold predictions for the train episodes (stage docstring, step 5) ──
+    folds, cf_by = crossfit_folds(split["train"], cfg)
+    want = int(cfg["crossfit"]["folds"] or 0) >= 2
+    if folds and not cfg["predict"]["write_derived"]:       # no derived arrays to protect (e.g. a sweep trial)
+        folds = []
+    cf_info: dict[str, Any] = {"folds": len(folds), "by": cf_by,
+                               "episodes": [[str(e.root) for e in part] for part in folds]}
+    fold_models: list = []
+    if want and not cfg["predict"]["write_derived"]:
+        cf_info["note"] = "cross-fitting skipped: predict.write_derived is false (no derived arrays written)"
+    elif folds:
+        try:
+            fold_models = _fit_crossfit(cfg, folds, views, ds_kw, val_ds, only, N, D, m_cfg)
+        except ValueError as e:                  # e.g. a fold whose complement has no eligible window
+            cf_info.update(folds=0, note=f"cross-fitting failed ({e}): train residuals are in-sample")
+            fold_models = []
+    elif want:
+        n_grp = len({e.meta.subject if cf_by == "subject" else e.meta.episode_id for e in split["train"]})
+        cf_info["note"] = (f"cross-fitting skipped: {n_grp} train {cf_by} group(s) (< 2); the train episodes' "
+                           "residuals are in-sample for the baseline (tighter than on unseen data)")
+    if cf_info.get("note") and cfg["predict"]["write_derived"]:
+        log.warning("baseline: %s", cf_info["note"])
     metrics: dict[str, Any] = {
         "stage": STAGE, "out_dir": str(out_dir), "model_path": str(out_dir / BASELINE_MODEL_NAME),
         "q_source": q_source, "window": model.window, "receptive_field": int(model.receptive_field),
+        "data_provenance": provenance,
         "n_episodes": {"loaded": len(eps), "train": len(split["train"]), "val": len(split["val"]),
                        "test": len(split["test"]), "skipped": len(skipped)},
         "n_samples": {"train": len(train_ds), "val": len(val_ds) if val_ds is not None else 0},
@@ -356,7 +449,8 @@ def run(cfg: Mapping[str, Any] | None = None) -> dict:
     }
     if trainer.dist.is_main:
         metrics = _predict_evaluate_save(cfg, model, trainer, metrics, usable, views, split, skipped, stats,
-                                         bundle_meta, q_source, only, train_sets, pred_sets, N, D, joint_names)
+                                         bundle_meta, q_source, only, train_sets, pred_sets, N, D, joint_names,
+                                         fold_models, cf_info)
     from ..train import barrier
 
     barrier(trainer.dist)
@@ -364,8 +458,10 @@ def run(cfg: Mapping[str, Any] | None = None) -> dict:
 
 
 def _predict_evaluate_save(cfg, model, trainer, metrics, usable, views, split, skipped, stats, bundle_meta,
-                           q_source, only, train_sets, pred_sets, N, D, joint_names) -> dict:
-    """Rank-0 part of :func:`run`: derived arrays for every episode, evaluation, bundle + metrics."""
+                           q_source, only, train_sets, pred_sets, N, D, joint_names, fold_models=(),
+                           cf_info=None) -> dict:
+    """Rank-0 part of :func:`run`: derived arrays for every episode (train episodes: out-of-fold
+    when cross-fitted), evaluation, bundle + metrics."""
     import torch
 
     from ..baseline.temporal import BASELINE_MODEL_NAME, episode_joint_view, predict_episode, save_baseline_model
@@ -377,6 +473,8 @@ def _predict_evaluate_save(cfg, model, trainer, metrics, usable, views, split, s
     # ── predict every episode (derived arrays) ─────────────────────────────
     p_cfg, e_cfg = cfg["predict"], cfg["eval"]
     preds: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    oof: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    fold_of = {id(e): fm for fm, held in fold_models for e in held}
     predicted = []
     for ep in usable:
         if ep.meta.dataset not in pred_sets and ep.meta.dataset not in train_sets:
@@ -390,10 +488,13 @@ def _predict_evaluate_save(cfg, model, trainer, metrics, usable, views, split, s
             continue
         mean, lv = predict_episode(model, view, batch_size=int(p_cfg["batch_size"]))
         preds[id(ep)] = (mean, lv)
+        if id(ep) in fold_of:                              # a train episode: the model that did not see it
+            oof[id(ep)] = predict_episode(fold_of[id(ep)], view, batch_size=int(p_cfg["batch_size"]))
+        w_mean, w_lv = oof.get(id(ep), (mean, lv))
         if ep.meta.dataset in pred_sets and p_cfg["write_derived"]:
-            ep.set_derived(D_BASELINE_PRED, mean)
-            ep.set_derived(D_BASELINE_LOGVAR, lv)
-            ep.set_derived(D_RESIDUAL, (np.asarray(ep[K_DELTA], dtype=np.float32) - mean).astype(np.float32))
+            ep.set_derived(D_BASELINE_PRED, w_mean)
+            ep.set_derived(D_BASELINE_LOGVAR, w_lv)
+            ep.set_derived(D_RESIDUAL, (np.asarray(ep[K_DELTA], dtype=np.float32) - w_mean).astype(np.float32))
             predicted.append(str(ep.root))
     metrics["n_episodes"]["predicted"] = len(predicted)
     metrics["n_episodes"]["skipped"] = len(skipped)
@@ -417,6 +518,18 @@ def _predict_evaluate_save(cfg, model, trainer, metrics, usable, views, split, s
         with torch.no_grad():
             res = evaluate_baseline(model, [e for e in g if id(e) in preds], **ev_kw)
         metrics.update({f"{name}/{k}": v for k, v in res.items()})
+    # in-sample (shipped model) vs out-of-fold residuals of the train episodes: the gap the
+    # cross-fitting removes from the contact / pretrain stages' training data
+    cf = dict(cf_info or {"folds": 0})
+    tr_oof = [e for e in split["train"] if id(e) in oof]
+    if tr_oof:
+        keep = ("mae_resid", "rmse_resid", "z_std", "coverage_2sigma", "n_no_contact")
+        for tag, pr in (("in_sample", preds), ("out_of_fold", oof)):
+            with torch.no_grad():
+                r = evaluate_baseline(model, tr_oof, **{**ev_kw, "predictions": pr})
+            cf[tag] = {k: r[k] for k in keep if k in r}
+    metrics["crossfit"] = cf
+    bundle_meta["crossfit"] = {k: v for k, v in cf.items() if k != "episodes"}
 
     bundle_meta["metrics"] = {k: v for k, v in metrics.items() if "/" in k}
     bundle_meta["episodes"] = {k: [str(e.root) for e in v] for k, v in split.items()}

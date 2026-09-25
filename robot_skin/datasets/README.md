@@ -49,19 +49,26 @@ imu = ImuPoseWindowDataset(splits["train"], window=32, imu_stats=stats)
 ## 전처리 단계 (`build.py`)
 
 1. manifest + layout 해석 (`resolve_layout`: 설정 override → 세션 디렉터리 기준 상대 경로 → 세션 안 사본 →
-   절대 경로 → 내장 이름; 세션을 옮겨도 동작). events/segments 로드.
+   절대 경로 → 내장 이름; 세션을 옮겨도 동작). events 로드; segments 는 `events.jsonl` 기준
+   (`acquisition.recorder.session_segments`: 레코더 세션은 이벤트에서 다시 만들어 손으로 고친 경계가 라벨에
+   반영되고, 합성·수작업 manifest 는 쓰인 그대로).
 2. pressure 로드 (기본 npz, `pressure.loader` 로 mk555 `.bin` 로더 주입 — `bin_merge.py` 복사 금지) →
    `layout.by_channel` (채널 순서 → layout 순서) → (선택) 저역통과.
-3. 마스터 시계: `clock.reference` 스트림의 공통 구간, `1/hz` 격자 (세션 시계 그대로).
+3. 마스터 시계: `clock.reference` 스트림의 공통 구간, `1/hz` 격자 (세션 시계 그대로). native 샘플 갭
+   (`> max(clock.max_gap_s, 4 × 중앙 간격)`)과 자기 구간 밖(끝값 유지)은 측정이 아니다 → pressure 는 `saturated`,
+   IMU / joint_state 는 `imu_valid` / `joint_state_valid` = False (`q_valid_mask`·IMU 데이터셋·통계가 따른다).
 4. baseline = 첫 `no_contact` segment 의 처음 `duration_s` 중앙값 → ΔS (press → 음수) → `saturated`
    (레일 근처 raw 샘플이 보간에 섞인 프레임 포함, `|ΔS| ≥ 90 %`).
 5. IMU: `manifest.calibration` 의 `imu_offsets`/`imu_world` 적용 (쿼터니언 `G⁻¹ ⊗ q ⊗ q_off`, gyro/acc
-   `R_offᵀ v`) → 연속성 보정 → 보간 → 재정규화. 보정이 없으면 raw 로 두고 경고
+   `R_offᵀ v`; 장치가 월드 프레임 벡터를 내면 `imu.vec_frame: world` → `G⁻¹ v`, `preprocessing.imu.vec_frame` 에 기록)
+   → 연속성 보정 → 보간 → 재정규화. 보정이 없으면 raw 로 두고 경고
    (`imu.calibrate_if_missing: true` 면 `imu_calibration` 단계에서 계산; raw 세션은 수정하지 않음).
 6. hand_pose: `pose.vision_hand.smooth_hand_labels` (신뢰도 게이트, ≤ 0.25 s 결손 SLERP, 6 Hz 저역통과) →
-   쿼터니언 보간 → `hand_pose_valid`.
+   쿼터니언 보간 → `hand_pose_valid`. 기록 뒤 오프라인으로 만든 `hand_pose.npz` / `object_pose.npz` 는
+   `session.json` 에 등록되지 않았어도 세션 디렉터리에서 읽는다(`OFFLINE_STREAMS`, notes 에 기록).
 7. `q`/`qd`: robot = `joint_state` 를 `URDFModel.reorder_q` 로 URDF 순서 (URDF = `robot.urdf` 설정 또는
-   `manifest.meta.urdf`, 세션 디렉터리 기준); glove = `hand_finger_pose` 45-D. `qd` = `joint_velocity`
+   `manifest.meta.urdf`, 세션 디렉터리 기준; 빠진 관절은 0 + `zero_filled_joints`, 이름이 하나도 안 맞으면 에러);
+   glove = `hand_finger_pose` 45-D. `qd` = `joint_velocity`
    (Savitzky–Golay, 기본 `savgol_causal`: 최근 50 ms 다항식 적합을 가장 새 샘플에서 평가 — 과거 샘플만 쓰므로
    온라인 제어기가 q 링버퍼로 **똑같이** 재현한다. `savgol` 은 더 매끈한 중앙 추정이지만 오프라인 전용).
 8. taxel 자세 (**손 / 로봇 base 프레임**, `episode.py` 계약): glove `pose.mano.taxel_poses_from_hand` 를
@@ -72,8 +79,12 @@ imu = ImuPoseWindowDataset(splits["train"], window=32, imu_stats=stats)
    충돌은 −1), `cam_<name>_idx` (zoh, 첫 프레임 전 −1), 카메라 디렉터리 symlink/복사, `meta.task`.
 10. `gt_synthetic.npz` 가 있으면 ΔS 를 정답과 대조 (`meta.preprocessing.synthetic_gt`) 하고 `gt_*` 배열 저장.
 11. 임시 디렉터리에 저장 후 rename (중단돼도 반쯤 쓴 episode 가 남지 않음). `--force` 는 `derived/` 까지 지운다.
-    이미 있는 episode 는 건너뛰고, 설정·버전·raw 파일 구성(나중에 추가한 `hand_pose.npz` 등)이 바뀌었으면
-    `stale` 로 보고한다.
+    이미 있는 episode 는 건너뛰고, 설정·버전·raw 파일 구성(나중에 추가한 `hand_pose.npz`, 고친 `events.jsonl`,
+    다시 적용한 싱크 등 — 시간 벡터 내용까지 해시)이 바뀌었으면 `stale` 로 보고한다. `qc.json` 이 `passed: false`
+    인 세션은 기본으로 건너뛴다(`qc_failed`; `--set qc.skip_failed=false` 로 끔). `record --dry-run` 계획
+    (`meta.dry_run`, 기록된 스트림 없음)은 `plan` 으로 보고하고 건너뛴다(실패가 아니다). 합성 세션(`record --fake`,
+    `datasets.synthetic`)은 `meta.preprocessing.synthetic`(`fake_recorder` | `generator`)에 출처가 남고, 한 번의
+    실행에서 기록된 세션과 섞이면 경고한다.
 
 설정 키 전체와 기본값: `robot_skin/configs/stages/preprocess.yaml` (= `build.DEFAULTS`, 모르는 키는 에러).
 
@@ -84,9 +95,9 @@ imu = ImuPoseWindowDataset(splits["train"], window=32, imu_stats=stats)
 
 | 데이터셋 | 샘플 | 사용 프레임 |
 |---|---|---|
-| `BaselineWindowDataset` | `q_hist[W,D]`, `qd_hist[W,D]`, `pos[N,3]`, `nrm[N,3]`, `y[N]` (t 의 ΔS), `valid[N]` | `contact_label ∈ only_labels` (기본 0) 이고 포화 아닌 taxel ≥ `min_valid` 개, 창 전체의 `q`·`qd` 가 측정값 (glove: `stats.qd_valid_mask` = `hand_pose_valid` 를 미분 필터 폭만큼 침식) |
+| `BaselineWindowDataset` | `q_hist[W,D]`, `qd_hist[W,D]`, `pos[N,3]`, `nrm[N,3]`, `y[N]` (t 의 ΔS), `valid[N]` | `contact_label ∈ only_labels` (기본 0) 이고 포화 아닌 taxel ≥ `min_valid` 개, 창 전체의 `q`·`qd` 가 측정값 (`stats.qd_valid_mask` = glove `hand_pose_valid` / robot `joint_state_valid` 를 미분 필터 폭만큼 침식) |
 | `ContactWindowDataset` | `z_hist[W,N]` (derived `residual_z`, 누름 양수), `sat_hist[W,N]`, `q[D]`, `qd[D]`, `q_valid` (t 의 q/qd 가 측정값인지), `label[N]`, `label_mask[N]` | `contact_label ≥ 0` (포화 제외) 인 taxel ≥ `min_labelled` 개; derived `residual_z` `[T,N]` 필요 |
-| `ImuPoseWindowDataset` | `feat[W,F]` (`pose.imu_model.imu_features`, 손목 IMU 기준), `finger_pose[15,3]`, `global_orient[3]` | `hand_pose_valid` |
+| `ImuPoseWindowDataset` | `feat[W,F]` (`pose.imu_model.imu_features`, 손목 IMU 기준), `finger_pose[15,3]`, `global_orient[3]` | `hand_pose_valid`, 창 전체 `imu_valid` |
 
 `label_key` (기본 `contact_label`) 는 episode 배열을 먼저 찾고, 없으면 같은 이름의 **derived** 배열을 쓴다 —
 `label_key="contact_label_pseudo"` 로 contact stage 의 D2 pseudo 라벨을 그대로 학습에 쓸 수 있다.
@@ -102,4 +113,5 @@ imu = ImuPoseWindowDataset(splits["train"], window=32, imu_stats=stats)
   D2 일반화, 튜플은 복합 키. 키가 없는 episode (예: `by="object"` 의 D1) 는 episode 하나가 한 그룹.
   `holdout={"subject": ["S07"]}` → test, `{"val": {…}, "test": {…}}` 형태도 가능 (holdout 은 그룹 규칙보다 우선).
 - `compute_stats(..., masks="auto")`: `delta_pct`/`pressure_raw`/residual 류는 포화 제외, 손 자세와 glove
-  `q` 는 `hand_pose_valid` 만, glove `qd` 는 `qd_valid_mask` 만 (라벨 결손 뒤 점프의 속도 스파이크 제외). `method="std"` 는 episode 별 누적(Chan)이라 메모리에 전부 올리지 않는다.
+  `q` 는 `hand_pose_valid` 만, glove `qd` 는 `qd_valid_mask` 만 (라벨 결손 뒤 점프의 속도 스파이크 제외), robot `q`/`qd` 는
+  `joint_state_valid` (구간 밖·샘플 갭 제외), `imu_features` 는 `imu_valid` 만. `method="std"` 는 episode 별 누적(Chan)이라 메모리에 전부 올리지 않는다.

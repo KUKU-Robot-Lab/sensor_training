@@ -11,7 +11,10 @@ Modes
 
 Output location: ``--out`` is the session directory for single-session protocols (D1,
 ``robot_sweep``, protocol-free ``--duration``) and the parent directory for D2 (one directory per
-episode). Without ``--out``: ``<--root>/<dataset>/<subject>/<session_id>``.
+episode). Without ``--out``: ``<--root>/<dataset>/<subject>/<session_id>``. ``--root`` defaults to
+``configs/default.yaml`` ``paths.raw_root`` — and for ``--fake`` to ``paths.synthetic_root``: synthetic
+sessions never land in the real raw root (where ``preprocess`` would build them next to real data).
+A ``--dry-run`` plan goes to ``<root>/<dataset>/<subject>/dry_run``; ``datasets.build`` skips such plans.
 """
 from __future__ import annotations
 
@@ -34,6 +37,32 @@ log = logging.getLogger(__name__)
 FAKE_DEFAULT_EPISODES = 3
 
 
+def default_root(fake: bool = False) -> Path:
+    """The raw root without ``--root``: ``configs/default.yaml`` ``paths.raw_root``, or for ``--fake``
+    ``paths.synthetic_root`` (synthetic data is kept apart from real data, like ``python -m robot_skin synth``)."""
+    from ..config import load_config
+
+    paths = load_config().get("paths") or {}
+    if fake:
+        return Path(paths.get("synthetic_root") or "robot_skin/data/synthetic")
+    return Path(paths.get("raw_root") or "robot_skin/data/raw")
+
+
+class _RootArg(argparse.Action):
+    """``--root``: remembers that it was given (``root_given``), so ``--fake`` keeps an explicit root."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, Path(values))
+        namespace.root_given = True
+
+
+def resolve_root(args) -> Path:
+    """``--root`` as given, else :func:`default_root` (``paths.synthetic_root`` for ``--fake``)."""
+    if getattr(args, "root_given", True) or not getattr(args, "fake", False):
+        return Path(args.root)
+    return default_root(fake=True)
+
+
 def _csv_list(s: str | None) -> list[str] | None:
     if s is None:
         return None
@@ -46,8 +75,11 @@ def base_parser(prog: str, description: str) -> argparse.ArgumentParser:
     g = p.add_argument_group("session")
     g.add_argument("--out", type=Path, default=None,
                    help="session dir (single-session protocols) or parent dir (D2: one dir per episode)")
-    g.add_argument("--root", type=Path, default=Path("robot_skin/data/raw"),
-                   help="raw data root when --out is not given: <root>/<dataset>/<subject>/<session_id>")
+    g.add_argument("--root", type=Path, default=default_root(), action=_RootArg,
+                   help="raw data root when --out is not given: <root>/<dataset>/<subject>/<session_id> "
+                        "(default: configs/default.yaml paths.raw_root; with --fake paths.synthetic_root, "
+                        "so synthetic sessions stay apart from real data)")
+    p.set_defaults(root_given=False)
     g.add_argument("--protocol", default=None, help="protocol name (d1_motion | d2_task | robot_sweep) or YAML path")
     g.add_argument("--subject", default="S00", help="pseudonymous subject id, e.g. S01 (never a real name)")
     g.add_argument("--layout", default=None, help="layout name or YAML path")
@@ -117,6 +149,7 @@ def run_logger(args, *, kind: str, default_layout: str, default_protocol: str | 
     ``streams_fn(args, plan, cameras) -> {name: StreamInfo}`` for dry-run manifests."""
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING, format="%(levelname)s %(message)s")
     args.layout = args.layout or default_layout
+    args.root = resolve_root(args)
     plan, cams = build_plan(args, kind=kind, default_protocol=default_protocol, default_cameras=default_cameras)
     script = format_script(plan, lang=args.lang, max_episodes=5)
     if args.dry_run:
@@ -138,6 +171,10 @@ def run_logger(args, *, kind: str, default_layout: str, default_protocol: str | 
         printed.append(res)
 
     if args.fake:
+        if args.out is None and not getattr(args, "root_given", True):
+            print(f"[fake] synthetic sessions go to {args.root} (configs/default.yaml paths.synthetic_root), apart "
+                  f"from real data — preprocess them with "
+                  f"`python -m robot_skin preprocess --raw {args.root} --out <dir>`")
         factory = fake_source_factory(plan, kind=kind, layout=args.layout, cameras=cams, seed=args.seed,
                                       imu=not getattr(args, "no_imu", False))
         results = run_plan(plan, source_factory=factory, clock_factory=SimClock, operator=AutoOperator(),

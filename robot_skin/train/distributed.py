@@ -17,7 +17,7 @@ import os
 import warnings
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Iterator, Mapping
+from typing import Iterator, Mapping, Sequence
 
 import torch
 import torch.distributed as dist
@@ -26,7 +26,7 @@ from torch.utils.data import Dataset, DistributedSampler, IterableDataset, Sampl
 
 __all__ = ["DistInfo", "init_distributed", "is_dist_initialized", "wrap_ddp", "unwrap_model",
            "make_sampler", "make_eval_sampler", "ShardSampler", "barrier", "cleanup",
-           "all_reduce_sum", "all_reduce_mean"]
+           "all_reduce_sum", "all_reduce_mean", "all_ranks_equal"]
 
 
 @dataclass(frozen=True)
@@ -217,6 +217,19 @@ def all_reduce_sum(values: Mapping[str, float]) -> dict[str, float]:
     t = torch.tensor([out[k] for k in keys], dtype=torch.float64, device=_reduce_device())
     dist.all_reduce(t, op=dist.ReduceOp.SUM)
     return {k: float(x) for k, x in zip(keys, t.tolist())}
+
+
+def all_ranks_equal(values: Sequence[float]) -> bool:
+    """Collective: ``True`` iff every rank passed the same numbers (MIN == MAX all-reduce).
+    ``True`` without a process group. Every rank must call it with the same length."""
+    vals = [float(v) for v in values]
+    if not is_dist_initialized() or dist.get_world_size() == 1 or not vals:
+        return True
+    t = torch.tensor(vals, dtype=torch.float64, device=_reduce_device())
+    lo, hi = t.clone(), t.clone()
+    dist.all_reduce(lo, op=dist.ReduceOp.MIN)
+    dist.all_reduce(hi, op=dist.ReduceOp.MAX)
+    return bool(torch.equal(lo, hi))
 
 
 def all_reduce_mean(values: Mapping[str, float]) -> dict[str, float]:

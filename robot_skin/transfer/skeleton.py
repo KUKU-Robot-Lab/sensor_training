@@ -12,8 +12,13 @@ URDFs). :func:`project_to_skeleton` maps each taxel to its nearest capsule and r
   2-link robot finger both have ``u ≈ 1``;
 - ``side = cos∠(offset, palmar direction)`` — +1 on the palmar (pad) side, −1 dorsal (NaN if the
   skeleton has no palmar directions);
-- ``v`` — for palm taxels, the lateral position of their palm capsule (the wrist → knuckle ray it
-  lies on: thumb −1/3, index 0, middle 1/3, ring 2/3, pinky 1; NaN on fingers).
+- ``v`` — for palm taxels, the lateral position across the palm (radial → ulnar), continuous: the
+  palm capsules are wrist → knuckle rays with :data:`PALM_LATERAL` values (thumb −1/3, index 0,
+  middle 1/3, ring 2/3, pinky 1) and ``v`` interpolates linearly between the nearest ray and its
+  neighbour on the taxel's side, by perpendicular distance in the palm plane (beyond the outermost
+  ray: that ray's value); NaN on fingers. A per-capsule (quantised) value would send a pad lying
+  between two rays to whichever ray is marginally closer — across the hand's midline for two
+  palms whose rays sit at different spacings.
 
 ``(finger, u, side, v)`` are the canonical coordinates used by :func:`robot_skin.transfer.align_layouts`
 to put glove and robot taxels on one hand (MANO: Romero et al., SIGGRAPH Asia 2017; cross-embodiment
@@ -89,7 +94,8 @@ class CapsuleSkeleton:
     @property
     def lateral(self) -> np.ndarray:
         """``[S]`` palm-capsule lateral coordinate (:data:`PALM_LATERAL` of the finger named after
-        ``palm_`` / ``>``); NaN for finger capsules."""
+        ``palm_`` / ``>``); NaN for finger capsules. A taxel's ``v`` interpolates between these
+        (:func:`project_to_skeleton`)."""
         out = np.full(self.n, np.nan)
         for i, (n, g) in enumerate(zip(self.names, self.groups)):
             if g != "palm":
@@ -231,6 +237,51 @@ def _as_skeleton(sk: Any) -> CapsuleSkeleton:
     raise TypeError("skeleton must be a CapsuleSkeleton or a (p0, p1, radius[, names]) tuple")
 
 
+def _palm_lateral(p: np.ndarray, sk: CapsuleSkeleton, seg: np.ndarray) -> np.ndarray:
+    """Continuous palm lateral coordinate ``v`` (module docstring) of points ``p[..., N, 3]`` whose
+    capsule ``seg[..., N]`` is a palm ray (finite :attr:`CapsuleSkeleton.lateral`); NaN elsewhere.
+
+    Rays sorted radial → ulnar; ``dᵣ`` = distance to ray ``r`` (half-line from ``p0``) after removing
+    the component along the palm-plane normal (best-fit plane through the rays: the skin sits a few mm
+    palmar of the bone axes, which would otherwise dominate). With ``r₁`` the nearest ray and ``r₂``
+    a neighbour on the other side of the point (the two in-plane offsets point in opposite
+    directions): ``v = v₁ + (v₂ − v₁)·d₁ / (d₁ + d₂)``; no such neighbour → ``v₁``. Fewer than two
+    rays → the capsule's value."""
+    lat = sk.lateral
+    v = lat[seg]
+    on_palm = np.isfinite(v)
+    rays = np.asarray([s for s in np.argsort(lat, kind="stable") if np.isfinite(lat[s])], dtype=np.int64)
+    if rays.size < 2 or not on_palm.any():
+        return v
+    a, ab = sk.p0[rays], sk.p1[rays] - sk.p0[rays]                                    # [R,3]
+    pts = np.concatenate([sk.p0[rays], sk.p1[rays]])
+    _, sv, vt = np.linalg.svd(pts - pts.mean(0))
+    normal = vt[-1] if sv[1] > 1e-9 * max(float(sv[0]), 1e-12) else None             # collinear rays: 3D
+    rel = p[..., :, None, :] - a                                                       # [...,N,R,3]
+    tr = np.maximum(np.einsum("...nrk,rk->...nr", rel, ab) / np.maximum(np.sum(ab * ab, -1), 1e-18), 0.0)
+    off = rel - tr[..., None] * ab
+    if normal is not None:
+        off = off - np.einsum("...k,k->...", off, normal)[..., None] * normal
+    d = np.linalg.norm(off, axis=-1)                                                   # [...,N,R]
+    R = rays.size
+    i = np.argmin(d, axis=-1)                                                          # [...,N]
+    pick = lambda x, j: np.take_along_axis(x, j[..., None], axis=-1)[..., 0]          # noqa: E731
+    pick3 = lambda j: np.take_along_axis(off, j[..., None, None].repeat(3, -1), axis=-2)[..., 0, :]  # noqa: E731
+    lo, hi = np.clip(i - 1, 0, R - 1), np.clip(i + 1, 0, R - 1)
+    o_i = pick3(i)
+    br_lo = (i > 0) & (np.sum(o_i * pick3(lo), -1) < 0)                               # point between lo and i
+    br_hi = (i < R - 1) & (np.sum(o_i * pick3(hi), -1) < 0)
+    d_i, d_lo, d_hi = pick(d, i), pick(d, lo), pick(d, hi)
+    use_lo = br_lo & (~br_hi | (d_lo <= d_hi))
+    use_hi = br_hi & ~use_lo
+    L = lat[rays]
+    v1 = L[i]
+    v2 = np.where(use_lo, L[lo], np.where(use_hi, L[hi], v1))
+    d2 = np.where(use_lo, d_lo, np.where(use_hi, d_hi, 0.0))
+    frac = np.where(use_lo | use_hi, d_i / np.maximum(d_i + d2, 1e-12), 0.0)
+    return np.where(on_palm, v1 + (v2 - v1) * frac, v)
+
+
 def project_to_skeleton(taxel_pos: np.ndarray, skeleton: Any, *, taxel_groups: Sequence[str] | None = None,
                         allowed: np.ndarray | None = None) -> SkeletonProjection:
     """Project taxel positions ``[..., N, 3]`` onto the nearest capsule axis of ``skeleton``
@@ -283,7 +334,7 @@ def project_to_skeleton(taxel_pos: np.ndarray, skeleton: Any, *, taxel_groups: S
         side = np.full(t.shape, np.nan)
     finger = np.asarray(sk.groups, dtype=object)[seg]
     return SkeletonProjection(segment=seg, names=list(sk.names), finger=finger, t=t, u=u, side=side,
-                              v=sk.lateral[seg],
+                              v=_palm_lateral(p, sk, seg),
                               closest=closest, offset=offset, distance=dist, surface_distance=dist - sk.radius[seg])
 
 

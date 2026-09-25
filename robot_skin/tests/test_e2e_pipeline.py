@@ -218,6 +218,25 @@ def test_one_splits_file_shared_by_every_stage(e2e):
         cli(["splits", "--processed", str(proc), "--out", str(again)])
 
 
+def test_every_stage_records_the_data_it_trained_on(e2e):
+    """metrics.json ``data_provenance`` (the pipeline's check against results another run wrote into its
+    directories) names the pipeline's splits.json (sha256) and processed root for every stage; the pipeline
+    record fingerprints every consumed stage and each stage's record the upstream runs it consumed."""
+    from robot_skin.__main__ import UPSTREAM_STAGES, stage_fingerprint
+
+    proc, runs = e2e["proc"], e2e["runs"]
+    sp = runs / "splits.json"
+    sha = hashlib.sha256(sp.read_bytes()).hexdigest()
+    rec = _record(runs)["stages"]
+    for s in STAGES:
+        prov = _strict_json(runs / s / "metrics.json")["data_provenance"]
+        assert prov == {"splits": str(sp.resolve()), "splits_sha256": sha, "processed_root": str(proc.resolve())}, s
+        if s in UPSTREAM_STAGES:
+            assert rec[s]["fingerprint"] == stage_fingerprint(s, runs / s), s
+    assert rec["vtla"]["inputs"] == {u: rec[u]["fingerprint"] for u in ("baseline", "contact", "pretrain")}
+    assert rec["baseline"]["inputs"] == {"imu_pose": rec["imu_pose"]["fingerprint"]}
+
+
 def test_shared_splits_file_warns_only_about_real_problems(e2e, caplog):
     """The pipeline's splits.json lists D1 and D2 episodes; a stage that uses one dataset sees the
     other's entries as existing episodes outside its pool — logged, not warned. Unresolvable entries
@@ -264,6 +283,7 @@ def test_vtla_bundle_is_wired_to_the_earlier_stages(e2e):
     assert tac["calibrator_state"] == json.loads((runs / "contact" / "calibrator.json").read_text())
     assert tac["baseline_model"] == str(runs / "baseline" / "baseline_model.pt")
     assert b["action"]["spec"]["kind"] == "hand_mano"
+    assert tac["taxel_frames"] == ["mano_wrist"]                  # glove D2: the encoder saw MANO-frame poses
     # the policy's tactile branch is the pretrained encoder (architecture + feature spec)
     enc = read_encoder_state(runs / "pretrain")
     pol = _quiet(build_policy_from_bundle, b)
@@ -286,6 +306,8 @@ def test_deploy_on_the_fake_robot_hand_reports_latency_and_safety(e2e):
     assert m["estop"] is False and m["startup"]["calibrator"] == "startup"
     assert any("retarget scale" in n for n in m["notes"])
     assert any("stage-1 references" in n for n in m["notes"])   # glove stage-1 models not used on the robot
+    # the glove-trained tactile encoder gets the robot skin's poses in its MANO wrist frame
+    assert any("URDF root → MANO wrist frame" in n for n in m["notes"])
     assert Path(m["session_dir"]).is_dir()
 
 
@@ -380,3 +402,293 @@ def test_pipeline_resumes_and_reruns_everything_downstream(e2e):
         assert _derived_intact("baseline", runs / "baseline", proc)
     finally:
         f.with_suffix(".moved").rename(f)
+
+
+# ───────────────────────────────────────────────────────────── orchestration only (stub stage runs, no data)
+
+_ENV_KEYS = ("PYTORCH_CUDA_ALLOC_CONF", "NCCL_P2P_DISABLE")
+
+
+def _stub_stage_runs(monkeypatch, stages, seen: list) -> None:
+    """Replace ``stages.<s>.run`` (the real ``load_stage_config`` still resolves the config) by a stub
+    that records ``(stage, train.resume, hardware, env)`` and writes the files of a finished stage."""
+    import importlib
+
+    for s in stages:
+        def run(cfg, s=s):
+            seen.append((s, (cfg.get("train") or {}).get("resume"), cfg.get("hardware"),
+                         {k: os.environ.get(k) for k in _ENV_KEYS}))
+            out = Path(cfg["out_dir"])
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "metrics.json").write_text("{}")
+            (out / STAGE_ARTEFACTS[s]).write_text("x")
+            return {"best": None, "steps": 0}
+
+        monkeypatch.setattr(importlib.import_module(f"robot_skin.stages.{s}"), "run", run)
+
+
+def _stub_roots(tmp_path) -> tuple[Path, Path, Path]:
+    proc, runs, sp = tmp_path / "proc", tmp_path / "runs", tmp_path / "splits.json"
+    proc.mkdir()
+    sp.write_text('{"train": [], "val": [], "test": []}')
+    return proc, runs, sp
+
+
+def test_pipeline_resumes_only_an_interrupted_attempt_on_the_same_data(tmp_path, monkeypatch):
+    """Regression: with ``--set train.resume=auto`` a stage the pipeline decided to *retrain* (--force,
+    another splits file, an upstream re-run) resumed its old finished ckpt_last.pt — no step was taken
+    and the old model (trained on the old split) was exported and evaluated as the new one."""
+    from robot_skin.__main__ import run_pipeline
+
+    seen: list = []
+    _stub_stage_runs(monkeypatch, ("imu_pose", "baseline"), seen)
+    proc, runs, sp = _stub_roots(tmp_path)
+
+    def go(**kw) -> dict:
+        seen.clear()
+        _quiet(run_pipeline, proc, runs, stages=["imu_pose", "baseline"], hardware="cpu",
+               overrides=["train.resume=auto"], splits=sp, **kw)
+        return {s: r for s, r, *_ in seen}
+
+    assert go() == {"imu_pose": "auto", "baseline": None}        # first attempt; baseline: imu_pose just ran
+    assert go() == {}                                              # finished → skipped
+    assert go(force=True) == {"imu_pose": None, "baseline": None}  # retraining a finished stage
+    assert yaml.safe_load((runs / "imu_pose" / "pipeline_config.yaml").read_text())["train"]["resume"] is None
+    sp.write_text('{"train": [], "val": [], "test": ["x"]}')      # other splits → stale → retrained
+    assert go() == {"imu_pose": None, "baseline": None}
+    (runs / "baseline" / "metrics.json").unlink()                  # interrupted attempt, same data
+    assert go() == {"baseline": "auto"}
+    (runs / "imu_pose" / "metrics.json").unlink()
+    (runs / "baseline" / "metrics.json").unlink()
+    assert go() == {"imu_pose": "auto", "baseline": None}          # upstream re-ran: inputs changed
+    (runs / "imu_pose" / "metrics.json").unlink()                  # interrupted, then the splits changed
+    sp.write_text('{"train": ["y"], "val": [], "test": []}')
+    assert go() == {"imu_pose": None, "baseline": None}
+
+
+def test_pipeline_exports_every_stage_profile_env_before_the_first_stage(tmp_path, monkeypatch):
+    """Regression: only the global --hardware env was exported up front; a per-stage profile's env
+    (``--set vtla.hardware=…``) was exported (setdefault) only when that stage's config was loaded —
+    ignored when an earlier profile had set the variable, and too late (after init_distributed and
+    earlier stages' CUDA use) otherwise."""
+    from robot_skin.__main__ import run_pipeline
+
+    for k in _ENV_KEYS:                    # absent now, and restored to absent afterwards
+        monkeypatch.setenv(k, "x")
+        monkeypatch.delenv(k)
+
+    def prof(name: str, env: dict) -> str:
+        p = tmp_path / f"{name}.yaml"
+        p.write_text(yaml.safe_dump({"name": name, "train": {"device": "cpu", "precision": "fp32"}, "env": env}))
+        return str(p)
+
+    a = prof("profA", {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
+    b = prof("profB", {"NCCL_P2P_DISABLE": "1"})
+    c = prof("profC", {"NCCL_P2P_DISABLE": "0"})
+    seen: list = []
+    _stub_stage_runs(monkeypatch, ("imu_pose", "vtla"), seen)
+    proc, runs, sp = _stub_roots(tmp_path)
+    kw = dict(stages=["imu_pose", "vtla"], splits=sp)
+    rec = _quiet(run_pipeline, proc, runs, hardware=a, overrides=[f"vtla.hardware={b}"], **kw)
+    both = {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "NCCL_P2P_DISABLE": "1"}
+    assert {s: (hw, env) for s, _, hw, env in seen} == {"imu_pose": ("profA", both), "vtla": ("profB", both)}
+    assert rec["stages"]["imu_pose"]["env"] == {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+    assert rec["stages"]["vtla"]["env"] == {"NCCL_P2P_DISABLE": "1"}
+    # one variable, two values in one process: an error — unless the user's shell sets it (it wins)
+    for k in _ENV_KEYS:
+        monkeypatch.delenv(k)
+    with pytest.raises(SystemExit, match="NCCL_P2P_DISABLE"):
+        _quiet(run_pipeline, proc, runs, hardware=b, overrides=[f"vtla.hardware={c}"], force=True, **kw)
+    monkeypatch.setenv("NCCL_P2P_DISABLE", "7")
+    seen.clear()
+    rec = _quiet(run_pipeline, proc, runs, hardware=b, overrides=[f"vtla.hardware={c}"], force=True, **kw)
+    assert {s: env["NCCL_P2P_DISABLE"] for s, _, _, env in seen} == {"imu_pose": "7", "vtla": "7"}
+    assert rec["stages"]["vtla"]["env"] == {"NCCL_P2P_DISABLE": "7"}
+
+
+def _stub_retrainable_runs(monkeypatch, stages, seen: list) -> None:
+    """Like :func:`_stub_stage_runs`, but every run writes *different* files (a run counter), as a real
+    retraining does — the pipeline fingerprints finished runs by their metrics.json + main artefact."""
+    import importlib
+    import itertools
+
+    counter = itertools.count()
+    for s in stages:
+        def run(cfg, s=s):
+            n = next(counter)
+            seen.append(s)
+            out = Path(cfg["out_dir"])
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "metrics.json").write_text(json.dumps({"run": n}))
+            (out / STAGE_ARTEFACTS[s]).write_text(f"model {n}")
+            return {"best": None, "steps": 0}
+
+        monkeypatch.setattr(importlib.import_module(f"robot_skin.stages.{s}"), "run", run)
+
+
+def test_pipeline_rerun_rule_holds_across_invocations(tmp_path, monkeypatch):
+    """Regression: only an in-process flag made later stages rerun after an upstream stage ran. After
+    ``pipeline --stages baseline --force`` (new baseline, new derived residuals) the next full ``pipeline``
+    skipped contact / pretrain / vtla — their z / levels, calibrator.json and the bundle's embedded calibrator
+    stayed fitted to the old baseline while the bundle's baseline_model path pointed at the new one. The
+    baseline-only run's summary also printed the unselected stages with their old 'ran' status."""
+    from robot_skin.__main__ import format_summary, run_pipeline
+
+    seen: list = []
+    _stub_retrainable_runs(monkeypatch, STAGES, seen)
+    proc, runs, sp = _stub_roots(tmp_path)
+
+    def go(stages=STAGES, **kw) -> list:
+        seen.clear()
+        return _quiet(run_pipeline, proc, runs, stages=list(stages), hardware="cpu", splits=sp, **kw), list(seen)
+
+    rec, ran = go()
+    assert ran == list(STAGES)
+    rec, ran = go()
+    assert ran == []                                                        # nothing changed: all skipped
+    rec, ran = go(["baseline"], force=True)                                  # one stage retrained on its own
+    assert ran == ["baseline"]
+    assert rec["last_invocation"]["out_of_date"] == {"contact": ["baseline"], "pretrain": ["contact"],
+                                                     "vtla": ["baseline", "contact", "pretrain"]}
+    summary = format_summary(rec)
+    assert "baseline  ran" in summary and "imu_pose  not selected\n" in summary
+    assert "contact   not selected — OUT OF DATE" in summary and "contact   ran" not in summary
+    rec, ran = go()                                                          # the next full run catches up
+    assert ran == ["contact", "pretrain", "vtla"]
+    assert all(rec["stages"][s]["status"] == ("skipped" if s in ("imu_pose", "baseline") else "ran") for s in STAGES)
+    assert rec["stages"]["vtla"]["inputs"]["baseline"] == rec["stages"]["baseline"]["fingerprint"]
+    assert go()[1] == []
+    # a standalone run (same data) that rewrote an upstream stage's files: kept, but everything after it reruns
+    (runs / "contact" / "metrics.json").write_text(json.dumps({"run": "standalone"}))
+    assert go()[1] == ["pretrain", "vtla"]
+    # selecting only a downstream stage warns that a consumed, unselected stage is out of date
+    _quiet(run_pipeline, proc, runs, stages=["contact"], hardware="cpu", splits=sp, force=True)
+    import logging as lg
+
+    records: list = []
+    h = lg.Handler()
+    h.emit = records.append
+    lg.getLogger("robot_skin.cli").addHandler(h)
+    try:
+        rec, ran = go(["vtla"])
+    finally:
+        lg.getLogger("robot_skin.cli").removeHandler(h)
+    assert ran == ["vtla"]                                                   # its input contact changed
+    assert any("consumes pretrain, whose results are out of date" in r.getMessage() for r in records)
+
+
+def test_pipeline_resume_is_blocked_when_an_upstream_stage_changed_since_the_attempt(tmp_path, monkeypatch):
+    """An interrupted attempt must not be resumed after its upstream stage was retrained in another invocation
+    (``<out>/<stage>/pipeline_attempt.json`` records the upstream runs the attempt started from)."""
+    from robot_skin.__main__ import run_pipeline
+
+    seen: list = []
+    _stub_retrainable_runs(monkeypatch, ("imu_pose", "baseline"), seen)
+    proc, runs, sp = _stub_roots(tmp_path)
+    resumes: list = []
+    import robot_skin.stages.baseline as st_b
+
+    stub = st_b.run
+    monkeypatch.setattr(st_b, "run", lambda cfg: (resumes.append(cfg["train"]["resume"]), stub(cfg))[1])
+    kw = dict(hardware="cpu", splits=sp, overrides=["train.resume=auto"])
+    _quiet(run_pipeline, proc, runs, stages=["imu_pose", "baseline"], **kw)
+    (runs / "baseline" / "metrics.json").unlink()                           # baseline interrupted
+    _quiet(run_pipeline, proc, runs, stages=["imu_pose"], force=True, **kw)  # imu_pose retrained meanwhile
+    resumes.clear()
+    _quiet(run_pipeline, proc, runs, stages=["baseline"], **kw)
+    assert resumes == [None]                                                # not resumed: its inputs changed
+    (runs / "baseline" / "metrics.json").unlink()                           # interrupted again, same inputs
+    resumes.clear()
+    _quiet(run_pipeline, proc, runs, stages=["baseline"], **kw)
+    assert resumes == ["auto"]
+
+
+def test_pipeline_retrains_results_another_run_wrote_on_other_splits(tmp_path, monkeypatch):
+    """Regression (TRAINING §10 resume command without data.splits): a standalone ``train baseline`` wrote into
+    the pipeline's ``<runs>/baseline`` after splitting its own pool — trained on the pipeline's val/test
+    episodes — and the next ``pipeline`` skipped it and everything after it. Stages now record
+    ``data_provenance`` in metrics.json, and the pipeline retrains results that were not trained on its data."""
+    from robot_skin.__main__ import run_pipeline
+    from robot_skin.stages import data_provenance
+
+    seen: list = []
+    _stub_retrainable_runs(monkeypatch, STAGES, seen)
+    proc, runs, sp = _stub_roots(tmp_path)
+    go = lambda: (seen.clear(), _quiet(run_pipeline, proc, runs, stages=list(STAGES), hardware="cpu", splits=sp),
+                  list(seen))[2]
+    assert go() == list(STAGES)
+    ok = data_provenance({"splits": str(sp), "processed_root": str(proc)})
+    assert ok["splits_sha256"] == hashlib.sha256(sp.read_bytes()).hexdigest() and ok["processed_root"] == str(proc)
+    m = runs / "baseline" / "metrics.json"
+    m.write_text(json.dumps({"run": "same data", "data_provenance": ok}))  # a standalone run on the same data
+    assert go() == ["contact", "pretrain", "vtla"]
+    m.write_text(json.dumps({"run": "own split", "data_provenance": data_provenance({"processed_root": str(proc)})}))
+    assert go() == ["baseline", "contact", "pretrain", "vtla"]              # no splits file: retrained
+    other = tmp_path / "other"
+    other.mkdir()
+    m.write_text(json.dumps({"data_provenance": {**ok, "processed_root": str(other)}}))
+    assert go() == ["baseline", "contact", "pretrain", "vtla"]              # another processed root
+    assert go() == []
+
+
+def test_pipeline_refuses_split_flags_an_existing_splits_file_would_ignore(tmp_path, monkeypatch):
+    """Regression: ``pipeline --split-by task --val-frac 0.4`` on a runs dir that already has splits.json kept
+    the old subject split without a word."""
+    from robot_skin.__main__ import run_pipeline
+
+    seen: list = []
+    _stub_stage_runs(monkeypatch, ("imu_pose",), seen)
+    proc, runs, _ = _stub_roots(tmp_path)
+    runs.mkdir()
+    (runs / "splits.json").write_text(json.dumps({"train": [], "val": [], "test": [], "meta": {
+        "by": "subject", "val_frac": 0.15, "test_frac": 0.15, "seed": 0}}))
+    kw = dict(stages=["imu_pose"], hardware="cpu")
+    with pytest.raises(SystemExit, match="by='subject'.*only apply when the file is created"):
+        _quiet(run_pipeline, proc, runs, split_cfg={"by": "task", "val_frac": 0.4}, **kw)
+    with pytest.raises(SystemExit, match="seed=0"):
+        cli(["pipeline", "--processed", str(proc), "--out", str(runs), "--stages", "imu_pose", "--hardware", "cpu",
+             "-q", "--split-seed", "7"])
+    assert seen == []
+    # the same settings (any spelling) are fine; an explicit --splits file is checked the same way
+    _quiet(run_pipeline, proc, runs, split_cfg={"by": ["subject"], "val_frac": 0.15, "seed": 0}, **kw)
+    assert [s for s, *_ in seen] == ["imu_pose"]
+    with pytest.raises(SystemExit, match="test_frac"):
+        _quiet(run_pipeline, proc, tmp_path / "runs2", splits=runs / "splits.json", split_cfg={"test_frac": 0.3},
+               **kw)
+
+
+def test_default_pipeline_skips_imu_pose_on_data_without_imus(tmp_path, monkeypatch):
+    """Regression: the default stage list aborted at imu_pose ('no training episodes with IMUs and hand
+    labels') on robot sessions / --no-imu glove data, although imu_pose is optional downstream."""
+    from robot_skin.__main__ import format_summary, run_pipeline
+
+    seen: list = []
+    _stub_stage_runs(monkeypatch, STAGES, seen)
+    proc, runs, sp = _stub_roots(tmp_path)                                  # no episodes with IMUs
+    rec = _quiet(run_pipeline, proc, runs, hardware="cpu", splits=sp)       # default stages (configs/default.yaml)
+    assert [s for s, *_ in seen] == list(STAGES[1:])
+    assert rec["stages"]["imu_pose"]["status"] == "no_data" and "imu_pose  no_data" in format_summary(rec)
+    seen.clear()
+    _quiet(run_pipeline, proc, runs, hardware="cpu", splits=sp)
+    assert seen == []                                                       # resumes: nothing to redo
+    # asked for explicitly, or needed (q_source: hand_pose_imu): it runs (and a real stage fails loudly)
+    _quiet(run_pipeline, tmp_path / "proc", tmp_path / "r2", stages=["imu_pose"], hardware="cpu", splits=sp)
+    assert [s for s, *_ in seen] == ["imu_pose"]
+    seen.clear()
+    _quiet(run_pipeline, proc, tmp_path / "r3", hardware="cpu", splits=sp,
+           overrides=["baseline.data.q_source=hand_pose_imu"])
+    assert [s for s, *_ in seen] == list(STAGES)
+
+
+def test_pipeline_stage_config_records_the_out_dir_it_used(tmp_path, monkeypatch):
+    """``<runs>/<stage>/pipeline_config.yaml`` ('the full config actually used') showed ``train.out_dir:
+    robot_skin/runs/<stage>`` although the stage wrote to ``<runs>/<stage>``; used as a sweep base, every trial
+    then overwrote the pipeline's run."""
+    from robot_skin.__main__ import run_pipeline
+
+    seen: list = []
+    _stub_stage_runs(monkeypatch, ("imu_pose",), seen)
+    proc, runs, sp = _stub_roots(tmp_path)
+    _quiet(run_pipeline, proc, runs, stages=["imu_pose"], hardware="cpu", splits=sp)
+    cfg = yaml.safe_load((runs / "imu_pose" / "pipeline_config.yaml").read_text())
+    assert cfg["out_dir"] == cfg["train"]["out_dir"] == str(runs / "imu_pose")

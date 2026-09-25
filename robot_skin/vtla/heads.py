@@ -41,8 +41,8 @@ import torch.nn as nn
 
 from .losses import masked_l1, masked_mse
 
-__all__ = ["HEAD_TYPES", "TAU_DISTS", "sinusoidal_embedding", "ChunkRegressionHead",
-           "FlowMatchingHead", "build_head"]
+__all__ = ["HEAD_TYPES", "TAU_DISTS", "sinusoidal_embedding", "draw_on_generator",
+           "ChunkRegressionHead", "FlowMatchingHead", "build_head"]
 
 HEAD_TYPES = ("chunk", "flow")
 TAU_DISTS = ("uniform", "beta")
@@ -84,6 +84,19 @@ class _CrossDecoder(nn.Module):
                 memory_mask: torch.Tensor | None) -> torch.Tensor:
         kpm = None if memory_mask is None else memory_mask.bool()
         return self.decoder(tgt, memory, memory_key_padding_mask=kpm)
+
+
+def draw_on_generator(fn, shape: int | tuple[int, ...] | torch.Size, *,
+                      generator: torch.Generator | None = None,
+                      device: torch.device | str | None = None) -> torch.Tensor:
+    """float32 ``fn(shape)`` (``torch.rand`` / ``torch.randn``) drawn **on the generator's device**,
+    then moved to ``device`` (None: left where drawn). A ``torch.Generator`` only fills tensors of
+    its own device type (a CUDA generator raises for a CPU tensor and vice versa), so control's
+    ``torch.Generator(device=policy_device)`` works for a policy on any device. Without a generator
+    the global **CPU** RNG is used (as before), so seeded CPU/GPU runs draw the same values."""
+    gdev = generator.device if generator is not None else torch.device("cpu")
+    x = fn(shape, generator=generator, device=gdev, dtype=torch.float32)
+    return x if device is None else x.to(device)
 
 
 def _check_memory(memory: torch.Tensor, d_model: int) -> None:
@@ -212,8 +225,9 @@ class FlowMatchingHead(nn.Module):
     # ── training ──────────────────────────────────────────────────────────────────────
     def sample_tau(self, n: int, *, generator: torch.Generator | None = None,
                    device: torch.device | str | None = None) -> torch.Tensor:
-        """``n`` training times τ from :attr:`tau_dist` (drawn on the CPU generator, then moved)."""
-        u = torch.rand(n, generator=generator, dtype=torch.float32)
+        """``n`` training times τ from :attr:`tau_dist` (drawn on ``generator``'s device — the
+        global CPU RNG without one — then moved to ``device``)."""
+        u = draw_on_generator(torch.rand, (int(n),), generator=generator)
         if self.tau_dist == "beta":
             u = 1.0 - (1.0 - u).pow(1.0 / self.tau_beta_b)      # Beta(1, b) inverse CDF
         return u.to(device) if device is not None else u
@@ -222,7 +236,7 @@ class FlowMatchingHead(nn.Module):
               generator: torch.Generator | None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         a = actions.float()
         if noise is None:
-            noise = torch.randn(a.shape, generator=generator, dtype=torch.float32).to(a.device)
+            noise = draw_on_generator(torch.randn, a.shape, generator=generator, device=a.device)
         if tau is None:
             tau = self.sample_tau(a.shape[0], generator=generator, device=a.device)
         tau = torch.as_tensor(tau, dtype=torch.float32, device=a.device).reshape(-1)
@@ -262,14 +276,16 @@ class FlowMatchingHead(nn.Module):
     def sample(self, memory: torch.Tensor, memory_mask: torch.Tensor | None = None, *,
                n_steps: int | None = None, noise: torch.Tensor | None = None,
                generator: torch.Generator | None = None, **_: object) -> torch.Tensor:
-        """Euler-integrate from ``x_0 = noise`` (τ = 0) to τ = 1 in ``n_steps`` → ``[B,H,A]``."""
+        """Euler-integrate from ``x_0 = noise`` (τ = 0) to τ = 1 in ``n_steps`` → ``[B,H,A]``.
+        Without ``noise`` it is drawn with ``generator`` on the generator's own device (a CUDA
+        generator for a CUDA policy works — control passes ``torch.Generator(device=...)``)."""
         K = self.n_steps if n_steps is None else int(n_steps)
         if K < 1:
             raise ValueError("n_steps must be >= 1")
         B = memory.shape[0]
         shape = (B, self.horizon, self.action_dim)
         if noise is None:
-            noise = torch.randn(shape, generator=generator, dtype=torch.float32)
+            noise = draw_on_generator(torch.randn, shape, generator=generator)
         if tuple(noise.shape) != shape:
             raise ValueError(f"noise must be {shape}, got {tuple(noise.shape)}")
         x = noise.to(device=memory.device, dtype=torch.float32)

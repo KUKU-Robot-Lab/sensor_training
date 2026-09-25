@@ -48,7 +48,9 @@
   윈도: `imu_windows(feat[T,F], W)` (인과적, 앞쪽 edge-padding).
 - 보정 모델 `q_meas = G ⊗ q_segment ⊗ M`. 정적 자세(평평한 손 등, 세그먼트 자세 `ref_rot` 기지)에서
   `calibrate_imu_offsets(quat_calib, ref_rot, world=G)` → `q_off = mean(q_meas)⁻¹ ⊗ G ⊗ q_ref`,
-  적용 `apply_imu_offsets(q, q_off, world=G)` = `G⁻¹ ⊗ q ⊗ q_off`, 벡터는 `apply_imu_offsets_to_vectors`.
+  적용 `apply_imu_offsets(q, q_off, world=G)` = `G⁻¹ ⊗ q ⊗ q_off`, 벡터는 `apply_imu_offsets_to_vectors`
+  (센서 프레임 `R_offᵀ v`; 월드 프레임 벡터를 내는 장치는 `vec_frame="world", world=G` → `G⁻¹ v` — 그 뒤
+  `imu_features(vec_frame="world")`. 월드 벡터에 장착 오프셋을 적용하면 프레임이 섞여 특징이 IMU 방위에 따라 변한다).
   `G` 는 `estimate_world_alignment` (손목 IMU 장착 오프셋 = I 가정). 손목 기준 상대 특징에서는 `G` 가 상쇄된다.
   평평한 손 보정의 `ref_rot` 은 `imu_reference_rotations(layout, skeleton)` (스켈레톤 세그먼트 자세 → 보정 후 센서 프레임 =
   세그먼트 프레임, `synthesize_imu` 와 같은 규약):
@@ -66,7 +68,8 @@
 
 **비전 라벨 (vision_hand.py)** — HaMeR (Pavlakos et al., CVPR 2024) / WiLoR (Potamias et al., CVPR 2025, arXiv:2409.12259) 를 **오프라인**으로 돌려
 `hand_pose.npz` (`t, global_orient[T,3], finger_pose[T,15,3], wrist_pos[T,3], confidence[T]`) 를 만든다
-(`HaMeREstimator` docstring 에 절차). `smooth_hand_labels`: 신뢰도 게이트 → 짧은 공백(≤ `max_gap_s`) 쿼터니언
+(`HaMeREstimator` docstring 에 절차; `save_hand_labels(<session_dir>, …)` 가 `session.json` 에 `hand_pose` 스트림을
+등록한다 — `register_hand_labels`). `smooth_hand_labels`: 신뢰도 게이트 → 짧은 공백(≤ `max_gap_s`) 쿼터니언
 SLERP / 위치 선형 보간 → 유효 구간별 영위상 저역통과(scipy Butterworth, 없으면 중심 이동평균). 긴 공백은 `valid=False`.
 
 ## 데이터 흐름

@@ -9,12 +9,12 @@
 | `protocol.py` + `protocols/*.yaml` | 프로토콜 스키마/검증, `plan_session` (seed 고정 무작위화), `format_script` (운영자 대본), `make_session_id` |
 | `instructions.py` | 지시문 템플릿 슬롯 `{object}` `{target}` … 렌더링 (`red_cup` → "red cup") |
 | `sources.py` | `StreamSource` 프로토콜, `SimClock`/`MonotonicClock`, `PlaybackSource`, `Fake*Source`, `SerialPressureSource`(pyserial, 파서 주입), `CameraSource`(cv2), `ImuSource`·`RosJointStateSource` 스텁 |
-| `fake.py` | `FakeScene`: 프로토콜 타임라인 → 물리적으로 일관된 합성 스트림 (압력·IMU·카메라·손 라벨·물체·관절) |
+| `fake.py` | `FakeScene`: 프로토콜 타임라인 → 물리적으로 일관된 합성 스트림 (압력·IMU·카메라·손 라벨·물체·관절). 누름은 접촉 부위별 대본이라 전처리의 기하 self-touch 라벨과 맞지 않는다 — `--fake` 는 소프트웨어 경로 확인용이고, 접촉 검출 학습·평가는 `datasets.synthetic` 으로 |
 | `recorder.py` | `Recorder`: 호스트 단조 시계, 소스별 폴링 스레드(또는 `SimClock` 동기 모드), `events.jsonl` 실시간 기록, 종료 시 raw 파일 + `session.json` |
 | `sync.py` | 3-탭 싱크: 이벤트 envelope 상호상관 → 스트림별 offset (+ 시작/끝 → drift), 타임스탬프 제자리 보정 |
 | `calibration.py` | 평손 보정 블록 → `calibrate_imu_offsets` → `manifest.calibration` (`imu_offsets`/`imu_world`/`imu_sites`) |
 | `qc.py` | `session_qc` + CLI: 레이트·지터·갭·드롭, 포화, baseline 드리프트, IMU, 카메라, 라벨, 싱크 게이트 |
-| `session.py` | `run_plan`/`record_episode`: 에피소드마다 디렉터리, 운영자(`ConsoleOperator`/`AutoOperator`; D2 수동 phase 는 Enter 마다 *시작* 경계, 마지막 Enter 가 체인의 끝), 후처리(싱크→보정→QC) |
+| `session.py` | `run_plan`/`record_episode`: 에피소드마다 디렉터리, 운영자(`ConsoleOperator`/`AutoOperator`; D2 수동 phase 는 Enter 마다 *시작* 경계, 마지막 Enter 가 체인의 끝), 후처리(싱크→보정→segments 재생성(`refresh_segments`)→QC) |
 | `glove_logger.py`, `robot_logger.py`, `_cli.py` | CLI (`--dry-run`, `--fake`, 실장비) |
 
 ## 빠른 시작
@@ -24,7 +24,7 @@ PY=python   # repo 루트에서
 # 계획만: session.json(단일 세션) / plan.json(D2) + 한국어 운영자 대본 출력
 $PY -m robot_skin.acquisition.glove_logger --protocol d1_motion --subject S01 --dry-run
 # 합성 end-to-end (하드웨어 없이 수 초): 기록 → 3-탭 싱크 → IMU 보정 → QC
-$PY -m robot_skin.acquisition.glove_logger --protocol d1_motion --subject S01 --fake --time-scale 0.05
+$PY -m robot_skin.acquisition.glove_logger --protocol d1_motion --subject S01 --fake --time-scale 0.05   # → robot_skin/data/synthetic
 $PY -m robot_skin.acquisition.glove_logger --protocol d2_task --task pour --task wipe --episodes 4 --fake
 $PY -m robot_skin.acquisition.robot_logger --fake --time-scale 0.1 --subject R01        # robot_sweep
 # QC / 후처리 재실행
@@ -41,7 +41,10 @@ $PY -m robot_skin.acquisition.session <session_dir> [--sync-from DIR] [--calibra
 `--calibration-from`, `--camera-format auto|npy|jpg`, `--lang ko|en`.
 
 저장 위치: `--out` 은 단일 세션 프로토콜(D1, robot_sweep, `--duration`)이면 세션 디렉터리, D2 면 부모
-디렉터리(에피소드마다 하위 디렉터리). 생략 시 `robot_skin/data/raw/<dataset>/<subject>/<session_id>`,
+디렉터리(에피소드마다 하위 디렉터리). 생략 시 `<--root>/<dataset>/<subject>/<session_id>` — `--root` 기본은
+`configs/default.yaml` `paths.raw_root`(`robot_skin/data/raw`), **`--fake` 는 `paths.synthetic_root`**
+(`robot_skin/data/synthetic`: 합성 세션이 실제 raw 와 섞여 전처리되지 않게). `--dry-run` 계획은 `<root>/<dataset>/<subject>/dry_run`
+에 남고 `datasets.build` 는 이를 `plan` 으로 건너뛴다.
 `session_id = <dataset>-<subject>-<YYYYMMDD>-<HHMMSS>[-e<NNN>-<task>-<object>-r<rep>]`.
 
 반환 코드: 0 = 전 세션 QC 통과, 3 = 기록은 됐지만 QC 실패 세션 있음, 1 = 기록 없음.
@@ -67,8 +70,12 @@ qc.json           session_qc 보고서
   (카메라) 로 남는다 — 재실행해도 누적되지 않는다. 기록 내용은 `manifest.calibration["sync"]`.
 - `phase_start.value = {"kind", "contact": none|self|object|any, "labels": [...], "block", "speed", ...}`.
   `stop()` 시 phase 마다 라벨별 segment 가 생긴다 (`none`→`no_contact`, `self`→`self_touch`, 보정 블록은
-  `[calibration, no_contact]`, 싱크 블록 `sync`). D2 는 과제 phase 전체를 덮는 `task` segment 가 추가된다.
-  이벤트는 `type` 으로 식별한다 (`instruction`/`success` 의 `name` 은 정보용).
+  `[calibration, no_contact]`, 싱크 블록 `sync`). D2 는 과제 phase 전체를 덮는 `task` segment 가 추가된다
+  (이벤트에서 나오지 않는 segment 는 `meta.recorder.explicit_segments` 에도 적힌다). 이벤트는 `type` 으로 식별한다
+  (`instruction`/`success` 의 `name` 은 정보용).
+- `events.jsonl` 이 segment 의 기준이다: 경계를 손으로 고친 뒤 `acquisition.session <dir>` 를 다시 돌리면
+  `session.json` 의 segments 가 이벤트에서 다시 만들어지고(`recorder.session_segments` + explicit segment),
+  `datasets.build` 도 같은 함수로 segments 를 만든다.
 - D2 `manifest.task = {task_id, instruction, object, target, success, repetition, template_index, template,
   instruction_source, slots, success_criteria, grasp, manipulate}`.
 - IMU 보정: `manifest.calibration` 의 `imu_offsets`/`imu_world`/`imu_sites` (+ `imu_calibration_quality`),

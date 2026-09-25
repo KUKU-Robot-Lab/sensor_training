@@ -28,6 +28,9 @@ Events: ``phase_start``/``phase_end`` (name = step id; the start ``value`` carri
 ``labels``), ``marker``, ``instruction``, ``success``. At :meth:`stop` every phase becomes one
 manifest segment per label (``labels`` or the contact default: ``none`` → ``no_contact``,
 ``self`` → ``self_touch``); phases still open are closed at the stop time (``auto_closed``).
+``events.jsonl`` stays the source of truth: :func:`session_segments` (used by the post-processing
+and ``datasets.build``) re-derives the phase segments from it after a manual edit and keeps the
+explicit ones (:meth:`Recorder.add_segment`, listed in ``meta.recorder.explicit_segments``).
 
 Two drive modes: **threaded** (real devices; one polling thread per source, :meth:`run_for`
 sleeps) and **synchronous** (:class:`~robot_skin.acquisition.sources.SimClock`; :meth:`step` polls
@@ -57,7 +60,7 @@ from .sources import Clock, MonotonicClock, SimClock, _check_sources
 
 __all__ = [
     "EVENTS_NAME", "EVENT_TYPES", "EventLog", "Recorder", "STREAM_FILES", "load_events", "phases_from_events",
-    "segments_from_events", "stream_file", "TIME_EPS",
+    "segments_from_events", "session_segments", "stream_file", "TIME_EPS",
 ]
 
 log = logging.getLogger(__name__)
@@ -188,6 +191,60 @@ def segments_from_events(events: Sequence[Mapping], t_end: float | None = None) 
     return segs
 
 
+def _seg_key(s: Mapping) -> tuple[float, float, str]:
+    return float(s["t0"]), float(s["t1"]), str(s["label"])
+
+
+def session_segments(manifest: SessionManifest, events: Sequence[Mapping],
+                     t_end: float | None = None) -> tuple[list[dict], list[str]]:
+    """Segments ``{t0, t1, label}`` of a raw session, with ``events.jsonl`` the source of truth for
+    the phase-derived ones. Returns ``(segments, notes)``.
+
+    - **Recorder sessions** (``manifest.meta["recorder"]``) with phase events: the segments are
+      re-derived from ``events`` (:func:`segments_from_events`) — a boundary fixed or a phase added
+      by editing ``events.jsonl`` reaches the labels — plus the explicitly added ones
+      (``Recorder.add_segment`` or present before recording: ``meta.recorder.explicit_segments``) and
+      the manifest segments whose label no phase produces (e.g. the D2 ``task`` span of a recording
+      made before that key existed). A difference from ``manifest.segments`` is reported in ``notes``.
+    - **Other sessions** (``datasets.synthetic`` trims its ``no_contact`` spans around contacts on
+      purpose; hand-written manifests): ``manifest.segments`` as written (the event-derived ones
+      when it has none); a manifest segment that lies outside every event phase producing its label
+      is reported in ``notes``.
+    """
+    ev_segs = segments_from_events(events, t_end) if events else []
+    man_segs = [{"t0": float(s["t0"]), "t1": float(s["t1"]), "label": str(s["label"])} for s in manifest.segments]
+    notes: list[str] = []
+    rec = (manifest.meta or {}).get("recorder")
+    if isinstance(rec, Mapping) and ev_segs:
+        # explicit = listed by the recorder + manifest segments of a label no phase produces (a
+        # recording made before explicit_segments existed, or a custom span added to session.json)
+        ev_labels = {s["label"] for s in ev_segs}
+        explicit = [{"t0": float(s["t0"]), "t1": float(s["t1"]), "label": str(s["label"])}
+                    for s in rec.get("explicit_segments") or []]
+        explicit += [s for s in man_segs if s["label"] not in ev_labels]
+        out, seen = [], set()
+        for s in ev_segs + explicit:
+            if _seg_key(s) not in seen:
+                seen.add(_seg_key(s))
+                out.append({"t0": float(s["t0"]), "t1": float(s["t1"]), "label": str(s["label"])})
+        if sorted(map(_seg_key, out)) != sorted(map(_seg_key, man_segs)):
+            n_ev = len({_seg_key(s) for s in ev_segs})
+            notes.append(f"manifest segments differ from events.jsonl (edited events?): {len(out)} segments "
+                         f"re-derived from the events ({len(out) - n_ev} explicit kept), manifest had {len(man_segs)}")
+        return out, notes
+    if not man_segs:
+        return ev_segs, notes
+    spans: dict[str, list[tuple[float, float]]] = {}
+    for s in ev_segs:
+        spans.setdefault(s["label"], []).append((float(s["t0"]), float(s["t1"])))
+    outside = [s for s in man_segs if s["label"] in spans
+               and not any(a - 1e-6 <= s["t0"] and s["t1"] <= b + 1e-6 for a, b in spans[s["label"]])]
+    if outside:
+        notes.append(f"{len(outside)} manifest segment(s) lie outside every events.jsonl phase with their label "
+                     f"(e.g. {outside[0]}); manifest segments used as written")
+    return man_segs, notes
+
+
 # ── stream buffers ───────────────────────────────────────────────────────────
 class _Buffer:
     """Accumulates samples of one non-camera stream; writes its npz at the end."""
@@ -225,7 +282,8 @@ class _Buffer:
         path = session_dir / rel
         if self.kind == "hand_pose":
             from robot_skin.pose.vision_hand import save_hand_labels
-            save_hand_labels(path, a["t"], a["global_orient"], a["finger_pose"], a["wrist_pos"], a.get("confidence"))
+            save_hand_labels(path, a["t"], a["global_orient"], a["finger_pose"], a["wrist_pos"], a.get("confidence"),
+                             register=False)                # the recorder writes session.json itself
             return rel, ["t", "global_orient[3]", "finger_pose[15,3]", "wrist_pos[3]", "confidence"]
         if self.kind == "pressure":
             a["raw"] = a["raw"].astype(np.float64)
@@ -564,13 +622,18 @@ class Recorder:
             span = float(t[-1] - t[0]) if t.size > 1 else 0.0
             stats[s.name] = {"kind": s.kind, "n": int(t.size), "t_first": float(t[0]), "t_last": float(t[-1]),
                              "rate_hz_measured": (t.size - 1) / span if span > 0 else None}
+        # segments not derived from phase events (given before recording or add_segment): kept
+        # when the phase-derived ones are re-derived from an edited events.jsonl (session_segments)
+        explicit = [dict(s) for s in m.segments] + [dict(s) for s in self._segments]
         segs = segments_from_events(self.events.events, t_end) + self._segments
         known = {(s["t0"], s["t1"], s["label"]) for s in m.segments}
         for s in segs:
             if (s["t0"], s["t1"], s["label"]) not in known:
+                known.add((s["t0"], s["t1"], s["label"]))
                 m.add_segment(s["t0"], s["t1"], s["label"])
         m.meta.setdefault("recorder", {})
         m.meta["recorder"].update({
+            "explicit_segments": explicit,
             "clock": "sim" if self.sim else "host_monotonic", "started_utc": self._started_utc,
             "duration_s": float(t_end), "events_file": EVENTS_NAME, "n_events": len(self.events.events),
             "streams": stats, "sources": {k: _jsonable(v) for k, v in infos.items()},

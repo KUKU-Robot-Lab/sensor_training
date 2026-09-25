@@ -428,6 +428,24 @@ def test_stage_run_writes_encoder_and_metrics(tmp_path):
         torch.testing.assert_close(m2.encoder.state_dict()[k], v)
 
 
+def test_stage_run_is_reproducible_for_a_fixed_train_seed(tmp_path):
+    """Regression: the encoder was built before anything seeded torch's global RNG (the Trainer
+    seeds only after the model exists), so the same config and train.seed gave different initial
+    weights — and different metrics / encoders — in every run."""
+    root = tmp_path / "processed"
+    _write_root(root)
+    res = []
+    for i, noise in enumerate((1, 2)):
+        torch.manual_seed(noise)                # whatever the process did before the stage ran
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            m = stage.run(_cfg(root, tmp_path / f"run{i}", max_epochs=1))
+        res.append((m["final_train_loss"], load_pretrained_encoder(tmp_path / f"run{i}").state_dict()))
+    assert res[0][0] == res[1][0]
+    for k, v in res[0][1].items():
+        torch.testing.assert_close(res[1][1][k], v, rtol=0, atol=0)
+
+
 def test_stage_splits_file_and_subject_split(tmp_path):
     root = tmp_path / "processed"
     _write_root(root)
@@ -545,3 +563,25 @@ def test_stage_hardware_profile_precedence():
     assert stage.resolve_config(r)["train"] == r["train"]
     assert "hardware_applied" not in stage.load_stage_config()["train"]
     assert stage.load_stage_config()["hardware_applied"] is False            # no profile → untouched
+
+
+
+def test_stage_config_rejects_unknown_keys(tmp_path):
+    """Regression: the pretrain stage never validated its keys — ``data.frame_strid``, ``data.use_tset``,
+    ``eval.bach_size`` or an unknown top-level key were silently ignored (and written to the pipeline's
+    pipeline_config.yaml), unlike every other stage; a ``train.*`` typo only warned."""
+    for ov in ({"data": {"frame_strid": 1}}, {"data": {"use_tset": True}}, {"eval": {"bach_size": 4}},
+               {"bogus_top": 1}, {"train": {"max_step": 30}}):
+        with pytest.raises(ValueError, match="unknown"):
+            stage.load_stage_config(overrides=ov)
+        with pytest.raises(ValueError, match="unknown"):
+            stage.resolve_config(ov)                                     # a raw dict given to run()
+    # through the pipeline a stage-prefixed key reaches the stage unchecked by the router: the stage rejects it
+    from robot_skin.__main__ import run_pipeline
+
+    (tmp_path / "proc").mkdir()
+    (tmp_path / "splits.json").write_text('{"train": [], "val": [], "test": []}')
+    with pytest.raises(ValueError, match="pretrain: unknown keys \\['use_tset'\\] in section 'data'"):
+        run_pipeline(tmp_path / "proc", tmp_path / "runs", stages=["pretrain"], hardware="cpu",
+                     overrides=["pretrain.data.use_tset=true"], splits=tmp_path / "splits.json")
+    assert stage.load_stage_config(overrides={"train": {"lr_mult": {"encoder": 0.1}}})["train"]["lr_mult"]

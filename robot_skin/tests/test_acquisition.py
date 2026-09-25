@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -192,3 +193,48 @@ def test_console_operator_marks_manual_phase_starts(tmp_path):
     # timed steps ran for their planned durations
     base = next(s for s in ep.steps if s.id == "baseline")
     assert ph["baseline"]["t1"] - ph["baseline"]["t0"] == pytest.approx(base.duration_s, abs=0.02)
+
+
+def test_record_fake_stays_out_of_the_raw_root_and_preprocess_skips_dry_run_plans(tmp_path, monkeypatch, caplog):
+    """Regression (README 'real data' block, no --root/--out): ``record --dry-run`` left a plan and
+    ``record --fake`` a fully synthetic session in the *real* raw root; ``preprocess`` then failed on the
+    plan (exit code 1) and built the fake session as subject S01 next to real data, with no synthetic
+    marker in episode.json."""
+    import logging
+    import shutil
+
+    from robot_skin.acquisition import _cli
+    from robot_skin.datasets.build import build_all
+    from robot_skin.datasets.build import main as build_main
+    from robot_skin.datasets.episode import Episode
+
+    raw, syn, proc = tmp_path / "raw", tmp_path / "synthetic", tmp_path / "processed"
+    monkeypatch.setattr(_cli, "default_root", lambda fake=False: syn if fake else raw)
+    assert glove_logger.main(["--protocol", "d1_motion", "--subject", "S01", "--dry-run"]) == 0
+    assert glove_logger.main(["--protocol", "d1_motion", "--subject", "S01", "--fake", "--time-scale", "0.05",
+                              "--cameras", "ego"]) == 0
+    (plan,) = _sessions(raw)                                                # only the plan in the real raw root
+    assert plan.name == "dry_run" and SessionManifest.load(plan).meta["dry_run"]
+    (fake,) = _sessions(syn)                                                # the fake session: synthetic root
+    assert fake.parent.name == "S01" and SessionManifest.load(fake).meta["fake"]
+    args = _cli.base_parser("x", "y").parse_args(["--fake", "--root", str(tmp_path / "mine")])
+    assert _cli.resolve_root(args) == tmp_path / "mine"                     # an explicit --root is kept
+    # preprocess: the dry-run plan is reported as such, not as a failure
+    assert build_main(["--raw", str(raw), "--out", str(proc), "-q"]) == 0
+    assert [r["status"] for r in build_all(raw, proc)] == ["plan"] and not proc.exists()
+    # the synthetic origin reaches episode.json; mixing synthetic with recorded sessions is warned about
+    real = tmp_path / "rec" / "motion" / "S02" / "s"
+    shutil.copytree(fake, real)
+    m = SessionManifest.load(real)
+    m.meta["fake"], m.session_id, m.subject = False, "motion-S02-real", "S02"
+    m.save(real)
+    with caplog.at_level(logging.WARNING, logger="robot_skin.datasets.build"):
+        reps = build_all([raw, syn, tmp_path / "rec"], proc)
+    assert sorted(r["status"] for r in reps) == ["built", "built", "plan"]
+    assert any("synthetic session(s)" in r.getMessage() for r in caplog.records)
+    origin = {r.get("synthetic") for r in reps if r["status"] == "built"}
+    assert origin == {"fake_recorder", None}
+    eps = {Episode.load(Path(r["episode"])).meta.subject: Episode.load(Path(r["episode"])) for r in reps
+           if r["status"] == "built"}
+    assert eps["S01"].meta.preprocessing["synthetic"] == "fake_recorder"
+    assert eps["S02"].meta.preprocessing["synthetic"] is None

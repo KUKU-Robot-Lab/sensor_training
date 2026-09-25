@@ -59,14 +59,20 @@ readout  ─ 학습 토큰 ─────────────────�
    (taxel 당 6). `TactileFeatureSpec(history k, stride s)` 이면 과거 k 프레임을 쌓는다(200 Hz tick 기준, 인과).
 2. **TaxelEncoder** — taxel 하나 = `LayerNorm(MLP(값) + MLP([Fourier(위치), 법선]))` 토큰(`TaxelTokenizer`; Fourier
    최저 옥타브 주기 0.3 m, 6 옥타브), 그 위에 pre-LN transformer. 위치는 **손/로봇 base 프레임**이라 글러브와 로봇
-   핸드가 같은 인코더를 쓴다(taxel id 임베딩 `n_taxels` 는 기본으로 끔 — 켜면 레이아웃 공유가 깨진다). `tactile.pretrained` 로 pretrain stage 의
+   핸드가 같은 인코더를 쓴다(taxel id 임베딩 `n_taxels` 는 기본으로 끔 — 켜면 레이아웃 공유가 깨진다). 두 프레임은
+   축이 다르므로(글러브 `mano_wrist` / 로봇 `urdf_root`) 번들에 학습 프레임(`tactile.taxel_frames`)을 기록하고, 글러브로
+   학습한 정책을 로봇에서 돌리면 `PolicyRunner` 가 로봇 pose 를 MANO 손목 프레임으로 옮긴다
+   (`transfer.RobotToManoTaxelFrame`, [`DEPLOYMENT.md`](DEPLOYMENT.md) §4). `tactile.pretrained` 로 pretrain stage 의
    `encoder_state.pt` 에서 시작할 수 있고(그 인코더의 특징 스펙이 우선), `tactile.freeze` 로 고정할 수 있다.
 3. **TactileTokenAdapter** — 학습 쿼리 K 개가 taxel 토큰에 cross-attention (Perceiver 식) → taxel 수와 무관하게 K
    토큰 → `d_model` 로 투영. 섞인 레이아웃 배치는 `taxel_pad` 로 패딩 taxel 을 가린다.
 4. **ContactGate** — `contact = level ≥ WEAK` (`data.contact_rule: level_ge_weak`, SATURATED 포함; `weak_or_strong`
    은 포화 제외). `model.tactile_gate: hard` 이면 샘플에 접촉 taxel 이 하나도 없을 때 K 토큰 전체가 0, `soft` 이면
    `σ(w·접촉비율 + b)` 를 곱한다(무접촉 0 은 유지). 무접촉 드리프트가 융합에 들어가지 못하게 하는 구조적 장치다.
-   항상 포화인 죽은 채널은 게이트를 늘 열어 두므로 `taxel_pad` 로 가리거나 `weak_or_strong` 을 쓴다.
+   항상 포화인 죽은 채널(`meta.preprocessing.dead_taxels`)은 게이트를 늘 열어 두므로 `VTLADataset` 이 `taxel_pad` 로
+   가린다(`data.mask_dead_taxels`, 기본 켬 — 인코더·어댑터에서 보이지 않고 게이트도 열지 못한다). 번들에
+   `tactile.mask_dead_taxels` 로 기록되고, 제어는 그 세션의 죽은 채널(처리기 `dead`)을 같은 방식으로 가린다. 끄면
+   (`false`) `level_ge_weak` 에서 stage 가 경고한다. 다른 선택지는 `weak_or_strong`(레일에 걸린 누름도 게이트에서 빠진다).
 
 ### 3.3 헤드 (`vtla/heads.py`)
 
@@ -77,6 +83,8 @@ readout  ─ 학습 토큰 ─────────────────�
   `x_0 = ε` 에서 `x_{k+1} = x_k + (1/K)·v_θ(x_k, k/K)` 로 K = `model.flow_steps` (10) 스텝 Euler. 학습 τ 는
   `uniform` 또는 `beta` (Beta(1, b), b > 1 이면 노이즈 쪽에 가중). eval 모드 손실은 `eval_seed` 로 매번 같은 (ε, τ)
   를 뽑아 epoch 간 비교가 가능하다. **이 τ 방향은 robot_skin 규약이며 π0 원문 표기와 다를 수 있다.**
+  노이즈 ε·τ 는 넘겨받은 `generator` 의 장치에서 뽑아 모델 장치로 옮긴다 — 제어·지연 측정이 쓰는
+  `torch.Generator(device=<정책 장치>)` (GPU 면 CUDA 생성기)로 flow 번들을 GPU 에서 돌릴 수 있다.
 - 두 헤드 모두 출력층이 0-초기화다(학습 전 chunk = 정규화 평균 0, flow 속도 = 0).
 
 ### 3.4 정규화와 학습 장치
@@ -163,12 +171,13 @@ python -m robot_skin pipeline --stages vtla                        # 파이프�
 python -m robot_skin train vtla --hardware rtx5090 --set data.splits=robot_skin/runs/splits.json \
     --set data.tactile_source=derived --set tactile.calibrator=robot_skin/runs/contact \
     --set tactile.baseline_model=robot_skin/runs/baseline --set tactile.pretrained=robot_skin/runs/pretrain
-python -m robot_skin train vtla --set model.head=flow --set model.flow_steps=10    # flow 헤드
+python -m robot_skin train vtla --set data.splits=robot_skin/runs/splits.json \
+    --set model.head=flow --set model.flow_steps=10                             # flow 헤드
 ```
 
 - split: `data.splits` (파이프라인과 같은 파일; 없으면 `data.split_by: subject` 로 자체 분할 + 경고).
 - 설정 검증: `check_config` 가 `DEFAULTS` 에 없는 키를 최상위와 각 섹션 한 단계에서 거부한다(`train`, `image` 는
-  열린 섹션). stage 가 `policy.*` 에서 유도하는 `model.horizon` 같은 키도 `model` 에 쓰면 오류다. `type` 이 있는
+  열린 섹션 — `train` 은 `TrainConfig` 필드가 아닌 키를, `image` 는 `build_transforms` 가 거부한다). stage 가 `policy.*` 에서 유도하는 `model.horizon` 같은 키도 `model` 에 쓰면 오류다. `type` 이 있는
   `vision.encoder` / `language.encoder` 블록은 기본 블록을 **대체**하고, 일부 키만 주면 병합된다. `null` 은 그 입력을 끈다.
 - 평가(`evaluate_policy`, best/EMA 가중치): `{val,test}/l1` (정규화 단위 masked L1), `l1_per_step[H]`, `l1_by_task`,
   `l1_raw/{wrist_pos, wrist_rot6d, finger_aa}` (원 단위 상대 행동), `n_samples`, `n_valid_steps`. 오프라인 chunk 오차만
@@ -184,7 +193,7 @@ python -m robot_skin train vtla --set model.head=flow --set model.flow_steps=10 
 | `model_config`, `state_dict` | `VTLAConfig` + 최적(EMA 켜면 EMA) 가중치 (CPU 텐서) |
 | `action` | `spec` (ActionSpec), `normalizer` (ActionNormalizer), `rel_mode`, `chunk_offset` |
 | `proprio` | `normalizer`, `history`, `source` |
-| `tactile` | `feature_spec`, `obs_mode`, `contact_rule`, `source` (derived / bootstrap / mixed), `bootstrap`, `calibrator` + `calibrator_state` (contact stage 의 `calibrator.json` 내용 내장), `baseline_model`, `pretrained_encoder`, `frozen`, `layouts` |
+| `tactile` | `feature_spec`, `obs_mode`, `contact_rule`, `mask_dead_taxels` (죽은 채널을 `taxel_pad` 로 가렸나 — 제어도 따른다), `source` (derived / bootstrap / mixed), `bootstrap`, `calibrator` + `calibrator_state` (contact stage 의 `calibrator.json` 내용 내장), `baseline_model`, `pretrained_encoder`, `frozen`, `layouts` |
 | `vision` | `cameras`, `encoder` cfg, `frozen`, `cached_features_key`, `eval_transform` 파라미터, `transform_config` |
 | `language` | `encoder` cfg, `frozen` |
 | `timing` | `policy_hz`, `source_hz`, `stride`, `horizon`, `obs_history`, `sample_stride` |
@@ -210,7 +219,7 @@ state, spec, rel_mode)` → `TemporalEnsembler` (ACT, `meta.ensemble_k` 0.01) �
 |---|---|
 | 촉각 정보량 | `features.obs_mode`: `full` (6/taxel) · `ordinal` (레벨 one-hot 4) · `binary` (접촉 1) · `none` (촉각 브랜치 없음, 토큰 0) |
 | 촉각 시간 문맥 | `features.history`, `features.stride` |
-| 접촉 게이트 | `model.tactile_gate: hard | soft`, `data.contact_rule` |
+| 접촉 게이트 | `model.tactile_gate: hard | soft`, `data.contact_rule`, `data.mask_dead_taxels` |
 | 모달리티 제거 | `vision.encoder: null`, `language.encoder: null`, `policy.cameras` |
 | 모달리티 강건성 | `model.p_drop_tactile`, `p_drop_vision`, `p_drop_language` |
 | 촉각 사전학습 효과 | `tactile.pretrained` 유/무, `tactile.freeze` |

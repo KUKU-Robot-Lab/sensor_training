@@ -8,8 +8,22 @@ Per control tick, in this order (the first applicable rule wins where they confl
     tactile stop (level ∈ stop_levels sustained  ▶ freeze_closing: joints may open, not close further
       ≥ min_ticks on any taxel)                    hold: freeze all joints · estop: e-stop
     joint limits (− margin) ────────────────────▶ clamp
-    velocity limit |Δq| ≤ max_vel·dt ───────────▶ clamp the step
-    acceleration limit |Δv| ≤ max_acc·dt ───────▶ clamp the step change
+    velocity limit |Δq| ≤ max_vel·h ────────────▶ clamp the step
+    acceleration limit |Δv| ≤ max_acc·h ────────▶ clamp the step change
+
+``h`` is the host time since the previous command (``t_send`` — default ``t`` — of the previous
+:meth:`SafetyFilter.filter` call), capped at one period ``dt``: the limits hold in wall time even when a
+late control loop sends commands back to back (a tick after an inference overrun), and a simulated
+clock gets exactly ``dt``.
+The tactile stop wins over the acceleration limit: a frozen joint stops closing at once (only the
+velocity limit bounds its retreat to the freeze position) instead of coasting ``v²/2a`` into the
+object. The watchdog keeps every stream's last reported stamp, so a stream reported only now and
+then (cameras: on policy ticks) is checked — and ages — on every tick.
+
+The command never becomes non-finite: :meth:`SafetyFilter.reset` refuses a non-finite position
+(it keeps the previous command for those joints, or raises), non-finite targets hold the last
+command. ``reset`` starts from the *measured* position (within the hard limits); a start outside the
+``margin`` band ramps into it under the rate limits instead of jumping there in one tick.
 
 The tactile stop is the skin's reflex: a taxel that stays STRONG / SATURATED for ``min_ticks``
 ticks (≈ 50 ms at 200 Hz by default) means the hand squeezes something hard — or a sensor fault
@@ -125,6 +139,7 @@ class SafetyFilter:
             raise ValueError("dt must be > 0")
         D = lo.shape[0]
         self.D, self.dt = D, float(dt)
+        self.hard_lower, self.hard_upper = lo.copy(), hi.copy()
         m = float(margin)
         self.lower = np.where(hi - lo > 2 * m, lo + m, lo)
         self.upper = np.where(hi - lo > 2 * m, hi - m, hi)
@@ -169,9 +184,24 @@ class SafetyFilter:
 
     # ── state ─────────────────────────────────────────────────────────────
     def reset(self, q_current: Sequence[float] | None) -> None:
-        """Start (or restart) from the robot's current position; clears the e-stop latch."""
-        q = None if q_current is None else np.clip(np.asarray(q_current, np.float64).reshape(self.D),
-                                                   self.lower, self.upper)
+        """Start (or restart) from the robot's current position; clears the e-stop latch.
+
+        The position is the measured one clipped to the *hard* limits (not the ``margin`` band: a
+        start outside the band ramps into it under the rate limits). Non-finite entries (a driver
+        glitch) keep the previous command of those joints; without one, ``ValueError`` — re-read
+        the state (a NaN start would make every later command NaN)."""
+        prev = getattr(self, "q_last", None)
+        q = None
+        if q_current is not None:
+            q = np.asarray(q_current, np.float64).reshape(self.D).copy()
+            bad = ~np.isfinite(q)
+            if bad.any():
+                if prev is None or not np.all(np.isfinite(prev[bad])):
+                    raise ValueError(f"reset: non-finite position for joints "
+                                     f"{[self.joint_names[i] for i in np.flatnonzero(bad)]} and no previous "
+                                     "command to keep — re-read the joint state")
+                q[bad] = prev[bad]
+            q = np.clip(q, self.hard_lower, self.hard_upper)
         self.q_last = q
         self.v_last = np.zeros(self.D)
         self.estopped = False
@@ -183,6 +213,8 @@ class SafetyFilter:
         self._stop_joints = np.zeros(self.D, dtype=bool)
         self._q_freeze: np.ndarray | None = None
         self._stale_since: float | None = None
+        self._stamps: dict[str, Any] = {}
+        self._t_cmd: float | None = None
         self.stale = False
         self.events: list[SafetyEvent] = []
         self.counts: dict[str, int] = {}
@@ -197,6 +229,11 @@ class SafetyFilter:
         if n:
             self.counts[typ] = self.counts.get(typ, 0) + int(n)
 
+    def record(self, t: float, typ: str, **detail: Any) -> None:
+        """Log (and count) an event from outside the filter — e.g. the runner dropping a
+        non-finite policy chunk — so it reaches the session log with the filter's own events."""
+        self._event(t, typ, **detail)
+
     def trigger_estop(self, reason: str, t: float, q_hold: Sequence[float] | None = None) -> None:
         """Latch the e-stop until :meth:`reset`: hold ``q_hold`` (the tactile stop passes the measured
         position — holding the last command would keep squeezing by the servo lag) or the last
@@ -205,10 +242,15 @@ class SafetyFilter:
             return
         self.estopped = True
         self.estop_reason = str(reason)
+        last = None if self.q_last is None else self.q_last.copy()
         if q_hold is not None:
-            self._q_estop = np.clip(np.asarray(q_hold, np.float64).reshape(self.D), self.lower, self.upper)
+            qh = np.asarray(q_hold, np.float64).reshape(self.D).copy()
+            bad = ~np.isfinite(qh)
+            if bad.any():                                        # never hold a NaN position
+                qh = last if last is None else np.where(bad, last, qh)
+            self._q_estop = None if qh is None else np.clip(qh, self.hard_lower, self.hard_upper)
         else:
-            self._q_estop = None if self.q_last is None else self.q_last.copy()
+            self._q_estop = last
         self._event(t, "estop", reason=str(reason))
         if self.estop_callback is not None:
             self.estop_callback(str(reason), float(t))
@@ -216,10 +258,16 @@ class SafetyFilter:
     # ── per tick ──────────────────────────────────────────────────────────
     def _watch(self, t: float, stamps: Mapping[str, float] | None) -> bool:
         cfg = self.watchdog_cfg
-        if cfg is None or not stamps:
+        if cfg is None:
+            return False
+        # every stream's last reported stamp: a stream reported only on some ticks (cameras, on
+        # policy ticks) keeps ageing in between instead of reading as recovered
+        for name, ts in (stamps or {}).items():
+            self._stamps[str(name)] = ts
+        if not self._stamps:
             return False
         stale = []
-        for name, ts in stamps.items():
+        for name, ts in self._stamps.items():
             lim = None
             for pat, v in (cfg["max_age_s"] or {}).items():
                 if fnmatch.fnmatch(name, str(pat)):
@@ -275,11 +323,25 @@ class SafetyFilter:
                 self._q_freeze = None
                 self._release = 0
 
+    def _period(self, t: float) -> float:
+        """Host time since the previous command, capped at one period (within 1 ppm → exactly
+        ``dt``, so a simulated clock reproduces the nominal-period limits bit for bit)."""
+        if self._t_cmd is None:
+            return self.dt
+        h = float(t) - self._t_cmd
+        if not math.isfinite(h) or h >= self.dt * (1.0 - 1e-6):
+            return self.dt
+        return max(h, 1e-9)
+
     def filter(self, q_target: Sequence[float], q_current: Sequence[float] | None = None, *, t: float,
-               level: np.ndarray | None = None, stamps: Mapping[str, float] | None = None) -> np.ndarray:
+               level: np.ndarray | None = None, stamps: Mapping[str, float] | None = None,
+               t_send: float | None = None) -> np.ndarray:
         """Safe command ``[D]`` for this tick. ``q_current`` (measured) seeds the state on the first
         call; ``level`` = the tick's ``ContactLevel`` per taxel; ``stamps`` = ``{stream: last
-        sample time}`` for the watchdog (host clock, same as ``t``)."""
+        sample time}`` for the watchdog (host clock, same as ``t`` = the tick's sensing time;
+        streams not reported this tick keep their last stamp). ``t_send`` (default ``t``) = when
+        the command is sent (e.g. after an inference): the rate limits use the time since the
+        previous command's ``t_send``, capped at ``dt``."""
         self.n_ticks += 1
         qt = np.asarray(q_target, dtype=np.float64).reshape(-1)
         if qt.shape != (self.D,):
@@ -288,12 +350,15 @@ class SafetyFilter:
             if q_current is None:
                 raise ValueError("first filter() call needs q_current (or call reset(q_current))")
             self.reset(q_current)
+        ts = float(t if t_send is None else t_send)
+        h = self._period(ts)
+        self._t_cmd = ts
         prev = self.q_last
         if self.estopped:
             return (self._q_estop if self._q_estop is not None else prev).copy()
         if self._watch(t, stamps):
             if self.estopped:
-                return self._q_estop.copy()
+                return (self._q_estop if self._q_estop is not None else prev).copy()
             self.v_last = np.zeros(self.D)
             return prev.copy()
         if not np.all(np.isfinite(qt)):
@@ -303,12 +368,13 @@ class SafetyFilter:
         # would keep closing into the object by the tracking lag)
         qm = None if q_current is None else np.asarray(q_current, dtype=np.float64).reshape(-1)
         hold_at = prev if qm is None or qm.shape != prev.shape or not np.all(np.isfinite(qm)) else \
-            np.clip(qm, self.lower, self.upper)
+            np.clip(qm, self.hard_lower, self.hard_upper)
         self._tactile(t, level, hold_at)
         if self.estopped:
-            return self._q_estop.copy()
+            return (self._q_estop if self._q_estop is not None else prev).copy()
         q = qt.copy()
-        if self.stop_active and self._q_freeze is not None:
+        frozen = self.stop_active and self._q_freeze is not None
+        if frozen:
             mode = self.tactile_cfg["mode"]
             J = self._stop_joints
             if mode == "hold":
@@ -322,21 +388,50 @@ class SafetyFilter:
         self._count("limit_clamp", int(np.any(c != q)))
         q = c
         dq = q - prev
-        if self.max_vel is not None:
-            lim = self.max_vel * self.dt
-            c = np.clip(dq, -lim, lim)
+        step = None if self.max_vel is None else self.max_vel * h
+        if step is not None:
+            c = np.clip(dq, -step, step)
             self._count("vel_clamp", int(np.any(c != dq)))
             dq = c
         if self.max_acc is not None:
-            v = dq / self.dt
-            lim = self.max_acc * self.dt
+            v = dq / h
+            lim = self.max_acc * h
             v2 = np.clip(v, self.v_last - lim, self.v_last + lim)
             self._count("acc_clamp", int(np.any(np.abs(v2 - v) > 1e-12)))
-            dq = v2 * self.dt
-        q = np.clip(prev + dq, self.lower, self.upper)
-        self.v_last = (q - prev) / self.dt
+            dq = v2 * h
+        # a start outside the margin band (reset at the measured position) ramps into it: the
+        # command may stay where it is, it may not move further out
+        q = np.clip(prev + dq, np.minimum(self.lower, prev), np.maximum(self.upper, prev))
+        if frozen:
+            q = self._apply_freeze(q, prev, step)
+        if not np.all(np.isfinite(q)):                           # cannot happen with a finite prev
+            self._event(t, "nonfinite_command")
+            q = np.where(np.isfinite(q), q, prev)
+        self.v_last = (q - prev) / h
         self.q_last = q
         return q.copy()
+
+    def _apply_freeze(self, q: np.ndarray, prev: np.ndarray, step: np.ndarray | None) -> np.ndarray:
+        """The tactile stop precedes the acceleration limit (and the soft margin): after the rate
+        limits, a frozen joint may not be further closed than its freeze position — or, when the
+        last command was already beyond it (servo lag), than that command retreating at
+        ``max_vel`` (``hold``: moving toward the freeze at ``max_vel``). Without this, a joint
+        closing at speed keeps closing ``v²/(2·max_acc)`` past the freeze."""
+        J = self._stop_joints
+        qf = self._q_freeze
+        big = np.full(self.D, np.inf) if step is None else step
+        if self.tactile_cfg["mode"] == "hold":
+            toward = prev + np.clip(qf - prev, -big, big)
+            moved = J & (np.abs(q - toward) > 1e-12)
+            q = np.where(J, toward, q)
+        else:
+            s = self.closing
+            x, xf, xp = s * q, s * qf, s * prev
+            cap = np.maximum(xf, xp - big)                           # in closing coordinates
+            moved = J & (s != 0) & (x > cap + 1e-12)
+            q = np.where(moved, s * cap, q)
+        self._count("tactile_freeze_override", int(moved.any()))
+        return q
 
     def summary(self) -> dict:
         """Counts, e-stop state and the logged transition events (JSON-able)."""

@@ -6,7 +6,11 @@ send); the policy runs every ``stride`` ticks (20 Hz → one inference per 50 ms
 inference longer than one control period delays that tick (an *overrun*, counted by the runner),
 so on a CPU the policy should stay well under ~5 ms or the loop falls behind; with ACT-style
 chunking + temporal ensembling (Zhao et al., arXiv:2304.13705) the robot keeps executing the
-previous chunk, so occasional overruns degrade smoothness rather than safety.
+previous chunk. Overruns degrade smoothness and tracking rather than safety because the runner's
+catch-up ticks get samples interpolated at their scheduled times (the tactile processor sees
+uniform ticks) and :class:`~robot_skin.control.safety.SafetyFilter` bounds every step by
+``max_vel`` × the wall time since the previous command. The hand is slower while the loop stalls:
+no command is sent during an inference.
 
 - :class:`LatencyMeter` — accumulate per-call wall times (``time.perf_counter``) and summarise.
 - :func:`percentile_summary` — ``{n, mean_ms, p50_ms, p95_ms, p99_ms, max_ms}``.

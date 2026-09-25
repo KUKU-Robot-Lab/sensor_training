@@ -13,6 +13,12 @@ passed to ``train_fn(cfg) -> float | {"metric": float, ...}``; results are appen
 ``out_dir/results.jsonl`` as trials finish (crash-safe, and already-finished trials are skipped
 when a sweep is restarted).
 
+Hardware profiles (:func:`trial_config`): a ``hardware`` profile in the base config (or
+``--hardware``, or a swept ``hardware`` axis) is applied to every trial exactly like the stages'
+``load_stage_config`` does — profile first, then the trial's overrides, and ``hardware_applied``
+is set so the stage's ``run()`` does not apply the profile a second time. A swept
+``train.batch_size`` / ``precision`` / ``grad_accum`` … therefore beats the profile.
+
 Multi-machine (e.g. an RTX 5090 box and an RTX 4090 box on a Tailscale tailnet): generate the
 same trial list on every machine (same space + seed) and run a disjoint slice with
 :func:`shard` (``--shard 0/2`` and ``--shard 1/2``), then ``rsync`` the ``results.jsonl`` files
@@ -32,8 +38,10 @@ import importlib
 import itertools
 import json
 import math
+import sys
 import time
 import traceback
+import warnings
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -42,9 +50,11 @@ import numpy as np
 from robot_skin.config import deep_merge
 
 __all__ = ["set_by_path", "get_by_path", "unflatten", "flatten", "expand_grid", "sample_random",
-           "shard", "run_sweep", "load_results", "suggest_from_space", "run_optuna", "main"]
+           "shard", "trial_config", "run_sweep", "load_results", "suggest_from_space",
+           "run_optuna", "main"]
 
 _DIST_KEYS = ("log_uniform", "uniform", "int", "choice")
+_HW_KEYS = ("hardware", "hardware_applied")
 
 
 # ───────────────────────────────────────────────────────────────────────────── dotted paths
@@ -233,16 +243,75 @@ def _extract_metric(result: Any, metric_key: str | None) -> tuple[float, dict]:
     return float(result), {}
 
 
+def _apply_profile_once(cfg: dict, stage: str | None) -> dict:
+    """Apply ``cfg["hardware"]`` unless ``hardware_applied`` (same rules as the stages'
+    ``apply_stage_hardware``): export the profile ``env`` (``setdefault``), merge
+    ``suggest.<stage>`` and the profile ``train`` keys over ``cfg["train"]``, set
+    ``hardware_applied``. ``"auto"`` without a matching profile only warns."""
+    hw = cfg.get("hardware")
+    if not hw or cfg.get("hardware_applied"):
+        return cfg
+    from .hardware import apply_hw_profile, apply_profile_env, detect_hw_profile, load_hw_profile
+
+    if hw == "auto" and detect_hw_profile() is None:
+        warnings.warn("hardware: auto — no built-in profile matches this machine; using the "
+                      "stage defaults", stacklevel=3)
+    else:
+        prof = dict(hw) if isinstance(hw, Mapping) else load_hw_profile(hw)
+        apply_profile_env(prof)
+        stage = stage or cfg.get("stage")
+        if not stage and prof.get("suggest"):
+            warnings.warn(f"hardware profile {prof.get('name', hw)!r} applied without a stage name: "
+                          "its suggest.<stage> batch sizes are not used (set `stage` in the base "
+                          "config or pass stage=...)", stacklevel=3)
+        cfg = apply_hw_profile(cfg, prof, stage=stage)
+    cfg["hardware_applied"] = True
+    return cfg
+
+
+def trial_config(base_cfg: Mapping[str, Any], override: Mapping[str, Any], *,
+                 stage: str | None = None) -> dict:
+    """``base_cfg`` ⊕ hardware profile ⊕ ``override`` — the precedence of the stages'
+    ``load_stage_config``: a ``hardware`` profile (from the override, else the base) that is not
+    yet applied is applied first (``suggest.<stage>`` with ``stage`` or ``cfg["stage"]``), then
+    the other override keys are merged, so a swept ``train.batch_size`` / ``precision`` beats the
+    profile. ``hardware_applied`` is set, so the stage's ``run()`` does not re-apply the profile
+    over the trial's values. Without ``hardware`` this is plain ``deep_merge``."""
+    ov = copy.deepcopy(dict(override))
+    hw = {k: ov.pop(k) for k in _HW_KEYS if k in ov}
+    if "hardware" in hw:
+        hw.setdefault("hardware_applied", False)     # a swept profile is applied to this trial
+    cfg = _apply_profile_once(deep_merge(base_cfg, hw), stage)
+    return deep_merge(cfg, ov)
+
+
+def _set_trial_dir(cfg: dict, key: str | None, trial_dir: Path) -> None:
+    """Point the trial's output directory at ``trial_dir``: ``key`` (default ``train.out_dir``) and, for
+    that default, also a top-level ``out_dir`` the config carries — the stage runners prefer
+    ``cfg["out_dir"]`` over ``train.out_dir``, so a base config with ``out_dir`` set (e.g. a pipeline's
+    ``<runs>/<stage>/pipeline_config.yaml``) would otherwise make every trial write into that one
+    directory (overwriting its results and each other)."""
+    if not key:
+        return
+    set_by_path(cfg, key, str(trial_dir))
+    if key == "train.out_dir" and "out_dir" in cfg:
+        cfg["out_dir"] = str(trial_dir)
+
+
 def run_sweep(train_fn: Callable[[dict], Any], base_cfg: Mapping[str, Any],
               overrides: Sequence[Mapping[str, Any]], out_dir: str | Path | None = None, *,
               mode: str = "min", metric_key: str | None = None,
               trial_dir_key: str | None = "train.out_dir", resume: bool = True,
-              catch_errors: bool = True, indices: Sequence[int] | None = None) -> list[dict]:
-    """Run ``train_fn(deep_merge(base_cfg, override))`` for every override.
+              catch_errors: bool = True, indices: Sequence[int] | None = None,
+              stage: str | None = None) -> list[dict]:
+    """Run ``train_fn(trial_config(base_cfg, override))`` for every override (a plain
+    ``deep_merge`` unless a hardware profile is involved — see :func:`trial_config`; ``stage``
+    names the profile's ``suggest.<stage>`` entry when the base has no ``stage`` key).
 
     ``train_fn`` returns a float or a mapping holding ``metric_key`` (dotted path allowed,
     default ``"metric"``). When ``out_dir`` is set each trial gets ``out_dir/trial_XXX`` written
-    at ``trial_dir_key``, results are appended to ``out_dir/results.jsonl`` and (``resume``)
+    at ``trial_dir_key`` (for the default ``train.out_dir`` also at a top-level ``out_dir`` the
+    config has — the stages prefer it), results are appended to ``out_dir/results.jsonl`` and (``resume``)
     overrides already recorded as ``ok`` are not re-run. Failed trials are recorded
     (``status: failed`` + error) unless ``catch_errors=False``. ``indices`` gives the global
     trial numbers (default ``0..len-1``; used with :func:`shard` so trial directories stay unique
@@ -267,12 +336,11 @@ def run_sweep(train_fn: Callable[[dict], Any], base_cfg: Mapping[str, Any],
         if k in done:
             results.append(done[k])
             continue
-        cfg = deep_merge(base_cfg, ov)
+        cfg = trial_config(base_cfg, ov, stage=stage)
         trial_dir = None
         if out is not None:
             trial_dir = out / f"trial_{i:03d}"
-            if trial_dir_key:
-                set_by_path(cfg, trial_dir_key, str(trial_dir))
+            _set_trial_dir(cfg, trial_dir_key, trial_dir)
         rec: dict[str, Any] = {"trial": i, "overrides": flatten(ov), "status": "ok",
                                "metric": None}
         if trial_dir is not None:
@@ -334,9 +402,10 @@ def run_optuna(train_fn: Callable[[dict], Any], base_cfg: Mapping[str, Any],
                space: Mapping[str, Any], n_trials: int, out_dir: str | Path | None = None, *,
                mode: str = "min", metric_key: str | None = None, seed: int = 0,
                study_name: str | None = None, storage: str | None = None,
-               trial_dir_key: str | None = "train.out_dir") -> Any:
+               trial_dir_key: str | None = "train.out_dir", stage: str | None = None) -> Any:
     """Optuna TPE search (requires ``pip install optuna``). ``storage`` (e.g. an SQLite or
-    PostgreSQL URL reachable over Tailscale) lets several machines share one study.
+    PostgreSQL URL reachable over Tailscale) lets several machines share one study. Trial
+    configs are built with :func:`trial_config` (hardware profile under the trial's values).
     Returns the ``optuna.Study``."""
     try:
         import optuna  # type: ignore[import-not-found]
@@ -351,9 +420,9 @@ def run_optuna(train_fn: Callable[[dict], Any], base_cfg: Mapping[str, Any],
 
     def objective(trial: Any) -> float:
         ov = suggest_from_space(trial, space)
-        cfg = deep_merge(base_cfg, ov)
-        if out is not None and trial_dir_key:
-            set_by_path(cfg, trial_dir_key, str(out / f"optuna_{trial.number:04d}"))
+        cfg = trial_config(base_cfg, ov, stage=stage)
+        if out is not None:
+            _set_trial_dir(cfg, trial_dir_key, out / f"optuna_{trial.number:04d}")
         value, extra = _extract_metric(train_fn(cfg), metric_key)
         if out is not None:
             out.mkdir(parents=True, exist_ok=True)
@@ -368,6 +437,12 @@ def run_optuna(train_fn: Callable[[dict], Any], base_cfg: Mapping[str, Any],
 
 
 # ───────────────────────────────────────────────────────────────────────────── CLI
+
+def _auto_unmatched() -> bool:
+    from .hardware import detect_hw_profile
+
+    return detect_hw_profile() is None
+
 
 def _load_callable(spec: str) -> Callable[[dict], Any]:
     if ":" not in spec:
@@ -397,7 +472,9 @@ def main(argv: Sequence[str] | None = None) -> list[dict]:
     ap.add_argument("--n", type=int, default=None, help="random trials")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--shard", default="0/1", help="i/n: run every n-th trial starting at i")
-    ap.add_argument("--hardware", default=None, help="hardware profile applied to every trial")
+    ap.add_argument("--hardware", default=None,
+                    help="hardware profile applied to every trial (under the trial's overrides; "
+                         "default: the base config's `hardware`)")
     args = ap.parse_args(argv)
 
     spec = yaml.safe_load(Path(args.space).read_text()) or {}
@@ -405,13 +482,18 @@ def main(argv: Sequence[str] | None = None) -> list[dict]:
     mode = args.mode or spec.get("mode", "grid")
     seed = args.seed if args.seed is not None else int(spec.get("seed", 0))
     base = yaml.safe_load(Path(args.base).read_text()) if args.base else {}
-    base = base or {}
-    if args.hardware:
-        from .hardware import apply_hw_profile, apply_profile_env, load_hw_profile
+    base = dict(base or {})
+    if args.hardware:                  # replaces the base's profile; applied per trial (trial_config)
+        base.update(hardware=args.hardware, hardware_applied=False)
+    hw = base.get("hardware")
+    if hw and not base.get("hardware_applied") and not (hw == "auto" and _auto_unmatched()):
+        from .hardware import apply_profile_env, load_hw_profile
 
-        profile = load_hw_profile(args.hardware)
-        apply_profile_env(profile)  # e.g. PYTORCH_CUDA_ALLOC_CONF — before any CUDA init
-        base = apply_hw_profile(base, profile)
+        # e.g. PYTORCH_CUDA_ALLOC_CONF — exported before any CUDA init
+        apply_profile_env(dict(hw) if isinstance(hw, Mapping) else load_hw_profile(hw))
+    fn = _load_callable(args.fn)
+    stage = base.get("stage") or getattr(sys.modules.get(getattr(fn, "__module__", "")), "STAGE", None)
+    stage = stage if isinstance(stage, str) else None
     if mode == "grid":
         trials = expand_grid(space)
     else:
@@ -422,9 +504,8 @@ def main(argv: Sequence[str] | None = None) -> list[dict]:
     except ValueError as e:
         raise SystemExit(f"--shard must look like 0/2, got {args.shard!r}") from e
     picked = shard(list(enumerate(trials)), i, n_sh)
-    fn = _load_callable(args.fn)
     ranked = run_sweep(fn, base, [ov for _, ov in picked], args.out, mode=args.direction,
-                       metric_key=args.metric, indices=[k for k, _ in picked])
+                       metric_key=args.metric, indices=[k for k, _ in picked], stage=stage)
     for r in ranked[:10]:
         print(json.dumps({k: r.get(k) for k in ("trial", "metric", "status", "overrides")},
                          default=str))

@@ -7,12 +7,13 @@
 |---|---|
 | `CapsuleSkeleton.from_mano(skeleton, finger_pose)` | `ManoSkeleton.capsules` (15 마디 + 손바닥 4) — 손 좌표계(go = 0, 손목 원점), palmar = 뼈 정렬 프레임의 −y |
 | `CapsuleSkeleton.from_urdf(model, q, palmar_axis=...)` | URDF 링크 → 캡슐 (부모 원점 → 자식 원점, 말단 링크는 들어오는 뼈 방향으로 연장, 같은 위치 프레임은 건너뜀) |
-| `project_to_skeleton(pos[...,N,3], skeleton, taxel_groups=...)` | 가장 가까운 캡슐: `segment`, `t`(뼈 위치 0–1), `closest`/`offset`, `distance`/`surface_distance`, 정규 좌표 `finger`, `u`(손가락 기저 0 → 끝 1), `side`(+1 바닥면 / −1 등), `v`(손바닥 가로 위치: 검지 0 → 새끼 1) |
+| `project_to_skeleton(pos[...,N,3], skeleton, taxel_groups=...)` | 가장 가까운 캡슐: `segment`, `t`(뼈 위치 0–1), `closest`/`offset`, `distance`/`surface_distance`, 정규 좌표 `finger`, `u`(손가락 기저 0 → 끝 1), `side`(+1 바닥면 / −1 등), `v`(손바닥 가로 위치: 검지 0 → 새끼 1, 연속값 — 가장 가까운 손목→손가락 기저 캡슐과 반대편 이웃 캡슐 사이를 손바닥 평면 안 수직 거리로 선형 보간, 바깥쪽 캡슐 밖은 그 값) |
 | `project_to_mano(pos, skeleton=None, finger_pose=None)` | 위의 MANO 버전 (옛 스텁 이름 유지) |
 | `taxel_groups(layout)` / `layout_rest_poses(layout, urdf=...)` | taxel 별 손가락 그룹(`finger_<f>`/`palm` 그룹 또는 부모 이름), 손 좌표계 기준 자세 |
-| `align_layouts(src, dst, ...)` → `LayoutAlignment` | dst taxel → src taxel k 개 (역거리 가중), **같은 손가락 그룹 안에서만**. 두 골격을 주면 `skeleton` 공간(`|Δu| + side·|Δside|/2 + lateral·|Δv|`), 아니면 공통 좌표계의 유클리드 거리(+ 법선 항). `max_dist` 로 먼 대응 무효화. `matrix()`, `to_dict/save/load` |
-| `map_taxel_values(values, mapping, taxel_axis, reduce)` | 값 이식: `weighted`(z·ΔS), `nearest`(임의 dtype), `max`(ordinal level·접촉 플래그); 무효 taxel 은 fill (float NaN / int −1 / bool False) |
+| `align_layouts(src, dst, ...)` → `LayoutAlignment` | dst taxel → src taxel k 개 (역거리 가중), **같은 손가락 그룹 안에서만**. 두 골격을 주면 `skeleton` 공간(`|Δu| + side·|Δside|/2 + lateral·|Δv|`), 아니면 공통 좌표계의 유클리드 거리(+ 법선 항). `max_dist` 는 k 개 대응 모두에 적용(가장 가까운 대응이 멀면 무효). 그룹의 source 가 k 개보다 적으면(손끝 패드는 손마다 1 개) 남는 열은 가장 가까운 대응을 반복(가중치 0, 거리 inf) — 다른 손가락 값이 섞이지 않는다. `matrix()`, `to_dict/save/load` |
+| `map_taxel_values(values, mapping, taxel_axis, reduce)` | 값 이식: `weighted`(z·ΔS), `nearest`(임의 dtype), `max`(ordinal level·접촉 플래그); 실제 대응만 쓴다(`max` 는 거리 inf 항목, `weighted` 는 가중치 0 항목 제외 — 그 NaN 도 안 섞임); 무효 taxel 은 fill (float NaN / int −1 / bool False) |
 | `RobotToManoEstimator(forward_retargeter)` | 역 리타게팅: 로봇 q → MANO 손가락 자세 (15 굴곡 + 5 외전 파라미터, `FingertipRetargeter` 목적함수를 역할만 바꿔 사용). `PolicyRunner(hand_state_fn=...)` 로 hand_mano 정책의 proprio 추정 |
+| `RobotToManoTaxelFrame(forward_retargeter)` | 로봇 taxel pose (URDF 루트) → MANO 손목 프레임: `p ↦ R_hrᵀ R_bᵀ (p − t_b) / scale`, `n ↦ R_hrᵀ R_bᵀ n` (리타게터 사상의 역). 글러브로 학습한 촉각 인코더에 로봇 pose 를 넣을 때 — `PolicyRunner` 가 자동으로 쓴다 |
 
 ```python
 from robot_skin.transfer import CapsuleSkeleton, align_layouts, layout_rest_poses, map_taxel_values

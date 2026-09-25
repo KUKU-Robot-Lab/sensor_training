@@ -41,7 +41,7 @@ _EXPORTS: dict[str, str] = {
     "setup_logging": "logging_utils",
     # sweep
     "expand_grid": "sweep", "sample_random": "sweep", "shard": "sweep", "run_sweep": "sweep",
-    "load_results": "sweep",
+    "load_results": "sweep", "trial_config": "sweep", "run_optuna": "sweep", "suggest_from_space": "sweep",
 }
 
 __all__ = list(_EXPORTS)
@@ -74,4 +74,5 @@ if TYPE_CHECKING:  # static analysers / IDEs see the real symbols
                            maybe_apply_hw_profile, resolve_device, resolve_precision)
     from .logging_utils import JsonlLogger, read_jsonl, setup_logging
     from .optim import EMA, build_optimizer, build_scheduler, lr_factor, param_groups
-    from .sweep import expand_grid, load_results, run_sweep, sample_random, shard
+    from .sweep import (expand_grid, load_results, run_optuna, run_sweep, sample_random, shard,
+                        suggest_from_space, trial_config)

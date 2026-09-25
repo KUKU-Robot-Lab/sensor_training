@@ -6,9 +6,11 @@ training stage reads only Episodes, so all alignment / calibration / labelling d
 
     pressure.npz ─ loader (injectable: mk555 .bin) ─ layout.by_channel ─ [low-pass] ─┐
     imu.npz ─ manifest.calibration offsets (G⁻¹ ⊗ q ⊗ q_off, R_offᵀ v) ─ continuity ─┤
-    hand_pose.npz ─ smooth_hand_labels (confidence gate, gap SLERP, low-pass) ──────┤ master clock
+    hand_pose.npz* ─ smooth_hand_labels (confidence gate, gap SLERP, low-pass) ─────┤ master clock
     joint_state.npz ─ URDFModel.reorder_q (URDF actuated order) ────────────────────┤ (200 Hz)
-    object_pose.npz, camera_<name>/timestamps.npy (zoh → cam_<name>_idx) ───────────┘
+    object_pose.npz*, camera_<name>/timestamps.npy (zoh → cam_<name>_idx) ──────────┘
+      (* offline products: read from their canonical file even when session.json does not list them)
+      → segments (events.jsonl → ``acquisition.recorder.session_segments``)
       → baseline_raw (median over the first ``no_contact`` segment) → ΔS% (SATS sign) → saturated
       → q / qd (Savitzky–Golay) → taxel poses (MANO skeleton | URDF FK) → self_touch (capsules)
       → phase_id / meta.phases (events.jsonl) → contact_label (segments + self-touch)
@@ -16,8 +18,10 @@ training stage reads only Episodes, so all alignment / calibration / labelling d
 Conventions (the contract of ``episode.py`` / ``docs/DATA_FORMAT.md``)
 - Master clock: uniform ``1/hz`` grid on the **session clock** (``t`` values are multiples of
   ``1/hz``), spanning the overlap of the ``clock.reference`` streams (pressure + IMU / joint state).
-  Streams that do not cover a frame are edge-held there; their validity is carried by
-  ``hand_pose_valid`` / ``cam_<name>_idx = -1``.
+  Streams that do not cover a frame are edge-held there, and a gap between two native samples wider
+  than ``max(clock.max_gap_s, 4 × median spacing)`` is bridged; neither is a measurement — validity
+  is carried by ``imu_valid`` / ``joint_state_valid`` (span and gaps), ``hand_pose_valid``,
+  ``cam_<name>_idx = -1``, and pressure frames inside a gap are flagged ``saturated``.
 - Continuous streams are linearly interpolated; quaternions are interpolated component-wise on
   continuity-fixed (same-hemisphere) sequences and renormalised (≈ SLERP at 200 Hz over ≤ 100 Hz
   samples); axis-angle labels go through quaternions for the same reason.
@@ -27,7 +31,8 @@ Conventions (the contract of ``episode.py`` / ``docs/DATA_FORMAT.md``)
   over frames without a saturated taxel; fallbacks: ``manifest.baseline`` then the recording start.
 - ``saturated`` = raw on/near an ADC rail (or non-finite: missing samples of an injected loader are
   bridged by interpolation so ΔS stays finite) at *either* bracketing raw sample (so a dropout
-  never leaks into a half-interpolated "valid" value) or ``|ΔS| ≥ max_abs_pct``.
+  never leaks into a half-interpolated "valid" value), inside a pressure sample gap, or
+  ``|ΔS| ≥ max_abs_pct``.
 - ``taxel_pos`` / ``taxel_nrm`` are in the **hand / robot base frame** (``episode.py`` contract):
   glove = MANO wrist-joint frame (``global_orient`` and ``wrist_pos`` removed, i.e. only the finger
   pose moves the taxels — the frame an online IMU→pose model reproduces and the one the robot's
@@ -39,6 +44,9 @@ Conventions (the contract of ``episode.py`` / ``docs/DATA_FORMAT.md``)
   last 50 ms evaluated at its newest sample): an online controller recomputes exactly the same
   ``qd`` from its q ring buffer, so offline-trained stages match deployment (``qd.method: savgol``
   gives the smoother centred estimate for offline-only use).
+- Segments: ``events.jsonl`` is the source of truth for the phase-derived ones (recorder sessions: an
+  operator's boundary fix in the events reaches the labels without editing ``session.json``);
+  synthetic / hand-written manifest segments are used as written.
 - ``contact_label``: 0 inside ``no_contact`` segments, 1 where the geometric self-touch label is set,
   −1 otherwise (D2 object contact stays −1 for later pseudo-labelling); a geometric self-touch inside
   a ``no_contact`` segment is a conflict → −1 (``labels.conflict``).
@@ -68,6 +76,7 @@ import logging
 import os
 import shutil
 import sys
+import warnings
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -78,27 +87,29 @@ from common.layouts import Layout, load_layout
 from common.signal import estimate_baseline, relative_change, saturation_mask
 from common.timeline import MASTER_HZ, Stream, master_clock, resample
 from robot_skin.acquisition.manifest import MANIFEST_NAME, SessionManifest
-from robot_skin.acquisition.recorder import load_events, phases_from_events, segments_from_events
+from robot_skin.acquisition.recorder import load_events, phases_from_events, session_segments
 from robot_skin.config import deep_merge
 
 from .episode import (
     EPISODE_JSON, K_CONTACT_LABEL, K_DELTA, K_HAND_FINGERS, K_HAND_GLOBAL, K_HAND_VALID, K_HAND_WRIST,
-    K_IMU_ACC, K_IMU_GYRO, K_IMU_QUAT, K_OBJECT_POS, K_OBJECT_QUAT, K_PHASE, K_PRESSURE_RAW, K_Q, K_QD,
-    K_SATURATED, K_SELF_TOUCH, K_T, K_TAXEL_NRM, K_TAXEL_POS, S_BASELINE_RAW, S_CHANNELS, Episode,
-    EpisodeMeta, cam_idx_key,
+    K_IMU_ACC, K_IMU_GYRO, K_IMU_QUAT, K_IMU_VALID, K_JOINT_VALID, K_OBJECT_POS, K_OBJECT_QUAT, K_PHASE,
+    K_PRESSURE_RAW, K_Q, K_QD, K_SATURATED, K_SELF_TOUCH, K_T, K_TAXEL_NRM, K_TAXEL_POS, S_BASELINE_RAW,
+    S_CHANNELS, Episode, EpisodeMeta, cam_idx_key,
 )
 
 __all__ = [
     "PREPROCESS_VERSION", "DEFAULTS", "CONFIG_PATH", "LAYOUT_FILE", "GT_FILE", "GT_KEYS", "HAND_Q_NAMES",
-    "load_preprocess_config", "resolve_layout", "load_episode_layout", "load_pressure_npz", "joint_velocity",
-    "qd_support", "camera_frame_index", "phase_ids", "contact_labels", "episode_dir", "preprocess_session",
-    "find_sessions", "build_all", "main",
+    "OFFLINE_STREAMS", "load_preprocess_config", "resolve_layout", "load_episode_layout", "load_pressure_npz",
+    "joint_velocity", "qd_support", "camera_frame_index", "phase_ids", "contact_labels", "episode_dir",
+    "preprocess_session", "find_sessions", "synthetic_origin", "build_all", "main",
 ]
 
 log = logging.getLogger(__name__)
 
 #: bump when the processed output changes for the same raw session + config
-PREPROCESS_VERSION = "robot_skin.datasets.build/2"   # 2: glove taxel poses in the hand frame
+#: 2: glove taxel poses in the hand frame; 3: segments from events.jsonl, stream gaps / coverage
+#: (imu_valid, joint_state_valid, pressure gaps flagged saturated), offline hand/object pose files
+PREPROCESS_VERSION = "robot_skin.datasets.build/3"
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs" / "stages" / "preprocess.yaml"
 LAYOUT_FILE = "layout.yaml"            # copy of the session layout inside every episode
 GT_FILE = "gt_synthetic.npz"           # = datasets.synthetic.GT_FILE (not imported: keeps torch-free paths light)
@@ -108,6 +119,10 @@ GT_KEYS = {"artefact_pct": "gt_artefact_pct", "press_pct": "gt_press_pct", "cont
 _CAMERA_MODES = ("copy", "symlink", "none")
 _QD_METHODS = ("savgol", "savgol_causal", "gradient")
 _CONFLICT = ("unknown", "segment", "geometry")
+#: offline products added to a session directory after recording (vision / mocap passes). Read from
+#: this canonical file even when ``session.json`` does not list the stream (a real recording never
+#: does: labels are made later, docs/DATA_ACQUISITION.md §9); ``save_hand_labels`` registers it.
+OFFLINE_STREAMS = {"hand_pose": "hand_pose.npz", "object_pose": "object_pose.npz"}
 
 #: Defaults of every preprocessing knob (``configs/stages/preprocess.yaml`` mirrors this dict).
 DEFAULTS: dict[str, Any] = {
@@ -116,11 +131,12 @@ DEFAULTS: dict[str, Any] = {
     "out_root": "robot_skin/data/processed",
     "master_hz": None,                 # None → manifest.master_hz (200)
     "layout": None,                    # override manifest.layout (built-in name or YAML path)
-    "clock": {"reference": ["pressure", "imu", "joint_state"], "span": "intersection"},
+    "clock": {"reference": ["pressure", "imu", "joint_state"], "span": "intersection", "max_gap_s": 0.1},
     "pressure": {"loader": None, "lowpass_hz": None, "lowpass_order": 2, "adc_min": 0.0,
                  "adc_max": float(2 ** 24 - 1), "rail_margin": 0.0, "max_abs_pct": 90.0},
     "baseline": {"phase": None, "duration_s": 1.0, "trim_s": 0.0, "fallback_s": 1.0, "use_manifest": True},
-    "imu": {"apply_calibration": True, "calibrate_if_missing": False, "calibration_phase": "imu_calibration"},
+    "imu": {"apply_calibration": True, "calibrate_if_missing": False, "calibration_phase": "imu_calibration",
+            "vec_frame": "sensor"},
     "hand_pose": {"min_conf": 0.5, "max_gap_s": 0.25, "cutoff_hz": 6.0, "order": 2, "mano_model": None},
     "qd": {"method": "savgol_causal", "window_s": 0.05, "polyorder": 2, "source": "derivative"},
     "robot": {"urdf": None},
@@ -128,7 +144,7 @@ DEFAULTS: dict[str, Any] = {
     "labels": {"conflict": "unknown"},
     "cameras": {"copy_frames": "symlink", "max_age_s": None},
     "synthetic_gt": {"check": True, "store": True},
-    "qc": {"skip_failed": False},
+    "qc": {"skip_failed": True},
 }
 
 #: glove ``q`` column names: MANO finger joints (``pose.mano.MANO_JOINTS[1:]``) × axis-angle xyz
@@ -171,6 +187,9 @@ def _check_cfg(cfg: Mapping[str, Any]) -> None:
         raise ValueError(f"labels.conflict must be one of {_CONFLICT}")
     if cfg["clock"]["span"] not in ("intersection", "pressure"):
         raise ValueError("clock.span must be 'intersection' or 'pressure'")
+    mg = cfg["clock"]["max_gap_s"]
+    if mg is not None and not (isinstance(mg, (int, float)) and not isinstance(mg, bool) and mg > 0):
+        raise ValueError(f"clock.max_gap_s must be a positive number of seconds or null, got {mg!r}")
 
 
 def _merge_cfg(cfg: Mapping[str, Any] | None) -> dict:
@@ -185,17 +204,92 @@ def _cfg_hash(cfg: Mapping[str, Any]) -> str:
 
 
 def _source_fingerprint(sdir: Path, man: SessionManifest) -> str:
-    """Hash of the raw session's file names and sizes (manifest, events, streams, camera
-    timestamps): changes when e.g. ``hand_pose.npz`` is added later or the sync rewrites stream
-    files, but not when a dataset is merely copied."""
+    """Hash of what preprocessing reads from the raw session: the manifest and ``events.jsonl``
+    (content), every stream file and camera ``timestamps.npy`` (size + a content hash of the time
+    vector: npz ``t`` / the ``.npy``) and the unregistered offline products (:data:`OFFLINE_STREAMS`,
+    also while absent). Changes when e.g. ``hand_pose.npz`` is added later, events are edited or a
+    sync / ``apply_clock_models`` rewrites timestamps in place (same file sizes), but not when a
+    dataset is merely copied (no mtimes)."""
     files = [MANIFEST_NAME, "events.jsonl"]
     for name, info in sorted(man.streams.items()):
         files.append(f"{info.file}/timestamps.npy" if name.startswith("camera_") else info.file)
+    files += [f for name, f in OFFLINE_STREAMS.items() if name not in man.streams and f not in files]
     items = []
     for f in files:
         p = sdir / f
-        items.append((f, p.stat().st_size if p.is_file() else -1))
+        items.append((f, p.stat().st_size, _content_hash(p)) if p.is_file() else (f, -1))
     return hashlib.sha1(json.dumps(items).encode()).hexdigest()[:12]
+
+
+def _content_hash(p: Path) -> str | None:
+    """sha1 of a small text file, of an npz's ``t`` vector or of an ``.npy`` (camera timestamps);
+    None for other (large / foreign) files, which are fingerprinted by size only."""
+    try:
+        if p.suffix in (".json", ".jsonl"):
+            return hashlib.sha1(p.read_bytes()).hexdigest()[:12]
+        if p.suffix == ".npz":
+            with np.load(p) as z:
+                if "t" not in z.files:
+                    return None
+                t = np.ascontiguousarray(z["t"], dtype=np.float64)
+            return hashlib.sha1(t.tobytes()).hexdigest()[:12]
+        if p.suffix == ".npy":
+            return hashlib.sha1(np.ascontiguousarray(np.load(p)).tobytes()).hexdigest()[:12]
+    except Exception:  # noqa: BLE001 - a corrupt file must not break the skip check (the build reports it)
+        return "unreadable"
+    return None
+
+
+def _stream_file(sdir: Path, man: SessionManifest, name: str, notes: list[str]) -> Path | None:
+    """File of an optional stream: the manifest entry when the file exists, else — for the offline
+    products (:data:`OFFLINE_STREAMS`) that are not registered — their canonical file in the session
+    dir (noted)."""
+    if name in man.streams:
+        p = man.stream_path(sdir, name)
+        if p.is_file():
+            return p
+        notes.append(f"stream {name!r}: {man.streams[name].file} not found (ignored)")
+        return None
+    f = OFFLINE_STREAMS.get(name)
+    if f is None or not (sdir / f).is_file():
+        return None
+    started = _recording_start_epoch(man)
+    if started is not None and (sdir / f).stat().st_mtime < started - 60.0:
+        # offline labels are made from this take's recording; an older file is a leftover of an earlier
+        # take (Recorder(overwrite=True) keeps files it does not write)
+        notes.append(f"{f} is not registered in session.json and predates the recording (earlier take?): ignored")
+        return None
+    notes.append(f"{f} is not registered in session.json: read from the session directory")
+    return sdir / f
+
+
+def _recording_start_epoch(man: SessionManifest) -> float | None:
+    rec = man.meta.get("recorder") if isinstance(man.meta, Mapping) else None
+    ts = rec.get("started_utc") if isinstance(rec, Mapping) else None
+    if not ts:
+        return None
+    try:
+        from datetime import datetime
+
+        return datetime.fromisoformat(str(ts)).timestamp()
+    except ValueError:
+        return None
+
+
+def _gap_frames(t_src: np.ndarray, tm: np.ndarray, max_gap_s: float | None) -> np.ndarray:
+    """``[T]`` master frames strictly inside a gap of a native stream: consecutive samples farther
+    apart than ``max(max_gap_s, 4 × median spacing)`` (dropped samples / a stalled device — the
+    linear interpolation across them is not a measurement). ``max_gap_s=None`` → none."""
+    t = np.sort(np.asarray(t_src, dtype=np.float64).reshape(-1))
+    tm = np.asarray(tm, dtype=np.float64)
+    if max_gap_s is None or t.shape[0] < 2:
+        return np.zeros(tm.shape[0], dtype=bool)
+    dt = np.diff(t)
+    thr = max(float(max_gap_s), 4.0 * float(np.median(dt)))
+    k = np.searchsorted(t, tm, side="right") - 1                    # t[k] ≤ tm < t[k+1]
+    inside = (k >= 0) & (k < t.shape[0] - 1)
+    kk = np.clip(k, 0, t.shape[0] - 2)
+    return inside & (dt[kk] > thr) & (tm > t[kk])
 
 
 def _jsonable(x: Any) -> Any:
@@ -556,7 +650,8 @@ def preprocess_session(session_dir: str | Path, out_root: str | Path | None = No
     if final is not None and (final / EPISODE_JSON).exists() and not overwrite:
         raise FileExistsError(f"episode {final} exists (pass overwrite=True / --force)")
     pre: dict[str, Any] = {"version": PREPROCESS_VERSION, "config_hash": _cfg_hash(cfg),
-                           "source_fingerprint": _source_fingerprint(sdir, man), "notes": notes}
+                           "source_fingerprint": _source_fingerprint(sdir, man), "notes": notes,
+                           "synthetic": synthetic_origin(man)}
     layout, layout_ref = resolve_layout(sdir, man, cfg["layout"])
     N = layout.n
     hz = float(cfg["master_hz"] or man.master_hz or MASTER_HZ)
@@ -601,6 +696,14 @@ def preprocess_session(session_dir: str | Path, out_root: str | Path | None = No
     pre.update(master_hz=hz, t_span=[float(tm[0]), float(tm[-1])], clock_reference=ref,
                stream_spans={k: list(v) for k, v in spans.items()})
     arrays: dict[str, np.ndarray] = {K_T: tm}
+    max_gap = cfg["clock"]["max_gap_s"]
+    gaps: dict[str, int] = {}
+
+    # ── segments: events.jsonl is the source of truth (recorder sessions; a hand-edited boundary
+    #    reaches labels and the baseline window), synthetic / hand-written manifests as written ──
+    t_end = float(max(tm[-1], t_p[-1]))
+    segments, seg_notes = session_segments(man, events, t_end)
+    notes += seg_notes
 
     # ── pressure → ΔS, saturation ─────────────────────────────────────────
     bad_raw = ~np.isfinite(raw_n)                      # e.g. missing packets from an injected loader
@@ -626,7 +729,12 @@ def preprocess_session(session_dir: str | Path, out_root: str | Path | None = No
     raw_m, _ = _resample(t_p, raw_f, tm)
     sat_native, _ = _resample(t_p, rails.astype(np.float64), tm)
     sat_native = sat_native > 1e-9
-    base, bsrc = _estimate_baseline(tm, raw_m, sat_native, man, layout, events, cfg, notes)
+    gap_p = _gap_frames(t_p, tm, max_gap)          # dropped samples: the bridged ramp is no measurement
+    gaps["pressure"] = int(gap_p.sum())
+    if gap_p.any():
+        sat_native |= gap_p[:, None]
+        notes.append(f"pressure: {int(gap_p.sum())} frames inside sample gaps > {max_gap} s: flagged saturated")
+    base, bsrc = _estimate_baseline(tm, raw_m, sat_native, man, layout, events, segments, cfg, notes)
     dead = ~(np.isfinite(base) & (base > 0))
     if dead.any():
         notes.append(f"non-positive baseline for taxels {[layout.taxels[i].id for i in np.flatnonzero(dead)]} "
@@ -648,11 +756,13 @@ def preprocess_session(session_dir: str | Path, out_root: str | Path | None = No
     imu_sites: list[str] = []
     if imu is not None:
         imu_sites = _process_imu(imu, tm, layout, man, sdir, cfg, arrays, pre, notes)
+        gaps["imu"] = _stream_valid(K_IMU_VALID, "imu", imu["t"], tm, max_gap, arrays, notes)
 
-    # ── hand pose (glove labels) ──────────────────────────────────────────
+    # ── hand pose (glove labels; an offline product, possibly not registered in the manifest) ──
     hand = None
-    if "hand_pose" in man.streams and man.stream_path(sdir, "hand_pose").is_file():
-        hand = _process_hand(man.stream_path(sdir, "hand_pose"), tm, cfg, arrays, pre, notes)
+    hand_file = _stream_file(sdir, man, "hand_pose", notes)
+    if hand_file is not None:
+        hand = _process_hand(hand_file, tm, cfg, arrays, pre, notes)
 
     # ── q / qd ───────────────────────────────────────────────────────────
     joint_names: list[str] = []
@@ -660,6 +770,7 @@ def preprocess_session(session_dir: str | Path, out_root: str | Path | None = No
     qc = cfg["qd"]
     if joints is not None:
         joint_names, model = _process_joints(joints, tm, hz, sdir, man, cfg, arrays, pre, notes)
+        gaps["joint_state"] = _stream_valid(K_JOINT_VALID, "joint_state", joints["t"], tm, max_gap, arrays, notes)
     elif hand is not None:
         arrays[K_Q] = arrays[K_HAND_FINGERS].reshape(T, 45).astype(np.float32)
         arrays[K_QD] = joint_velocity(arrays[K_Q], hz, method=qc["method"], window_s=qc["window_s"],
@@ -675,8 +786,9 @@ def preprocess_session(session_dir: str | Path, out_root: str | Path | None = No
     st = _taxel_poses(layout, man, hand, model, tm, cfg, arrays, pre, notes)
 
     # ── object pose ──────────────────────────────────────────────────────
-    if "object_pose" in man.streams and man.stream_path(sdir, "object_pose").is_file():
-        with np.load(man.stream_path(sdir, "object_pose")) as z:
+    obj_file = _stream_file(sdir, man, "object_pose", notes)
+    if obj_file is not None:
+        with np.load(obj_file) as z:
             t_o, pos_o = _sorted_stream(z["t"], z["pos"])
             arrays[K_OBJECT_POS] = _resample(t_o, pos_o.astype(np.float64), tm)[0].astype(np.float32)
             if "quat" in z.files:
@@ -685,9 +797,8 @@ def preprocess_session(session_dir: str | Path, out_root: str | Path | None = No
         pre["object_frame"] = syn.get("object_frame", man.meta.get("object_frame", "world"))
 
     # ── phases, segments, contact labels ──────────────────────────────────
-    t_end = float(max(tm[-1], t_p[-1]))
+    pre["invalid_frames"] = gaps
     phases = phases_from_events(events, t_end=t_end)
-    segments = list(man.segments) or segments_from_events(events, t_end)
     if not phases and segments:
         phases = [{"name": s["label"], "t0": s["t0"], "t1": s["t1"], "value": None, "closed": True,
                    "source": "segments"} for s in segments]
@@ -756,7 +867,7 @@ def preprocess_session(session_dir: str | Path, out_root: str | Path | None = No
     return _write_episode(ep, final, layout, cam_src, cfg, overwrite)
 
 
-def _estimate_baseline(tm, raw_m, sat_m, man, layout, events, cfg, notes):
+def _estimate_baseline(tm, raw_m, sat_m, man, layout, events, segs, cfg, notes):
     bc = cfg["baseline"]
     sat_any = sat_m.any(1)
     rows, span, src = np.zeros(tm.shape[0], dtype=bool), (), None
@@ -767,7 +878,6 @@ def _estimate_baseline(tm, raw_m, sat_m, man, layout, events, cfg, notes):
             src = f"phase:{bc['phase']}"
         else:
             notes.append(f"baseline phase {bc['phase']!r} not found; using the first no_contact segment")
-    segs = list(man.segments) or segments_from_events(events)
     if not rows.any():
         rows, span = _first_baseline_rows(tm, [(s["t0"], s["t1"]) for s in segs if s["label"] == "no_contact"],
                                           sat_any, float(bc["trim_s"]))
@@ -801,11 +911,23 @@ def _process_imu(imu, tm, layout, man, sdir, cfg, arrays, pre, notes) -> list[st
     gyro = None if "gyro" not in imu else np.asarray(imu["gyro"], dtype=np.float64)[:, cols]
     acc = None if "acc" not in imu else np.asarray(imu["acc"], dtype=np.float64)[:, cols]
     ic = cfg["imu"]
+    vec_frame = str(ic.get("vec_frame") or "sensor")
+    if vec_frame not in ("sensor", "world"):
+        raise ValueError(f"imu.vec_frame must be 'sensor' or 'world', got {vec_frame!r}")
+    # vec_frame: frame of the stored gyro/acc — what pose.imu_model.imu_features(vec_frame=...) must be told
     info: dict[str, Any] = {"calibrated": False, "calibration_source": None, "wrist_index": _wrist_index(layout, sites),
-                            "frame": "sensor"}
+                            "frame": "sensor", "vec_frame": vec_frame}
     offsets = world = None
+    calib = dict(man.calibration or {})
+    if (calib.get("imu_offsets") is not None and calib.get("imu_sites") is None and imu.get("sites") is not None
+            and np.asarray(calib["imu_offsets"]).reshape(-1, 4).shape[0] == len(imu["sites"])):
+        # offsets are in IMU *file* site order (DATA_FORMAT §1.8) while ``sites`` is the layout
+        # order the columns were just permuted to: name them so they are reordered, not misapplied
+        calib["imu_sites"] = [str(x) for x in imu["sites"]]
+        if ic["apply_calibration"]:
+            notes.append("calibration has no imu_sites: imu_offsets taken in imu.npz site order")
     if ic["apply_calibration"]:
-        offsets, world = imu_calibration_from_dict(man.calibration or {}, sites)
+        offsets, world = imu_calibration_from_dict(calib, sites)
         if offsets is not None:
             info["calibration_source"] = "manifest"
         elif ic["calibrate_if_missing"]:
@@ -821,8 +943,10 @@ def _process_imu(imu, tm, layout, man, sdir, cfg, arrays, pre, notes) -> list[st
             notes.append("no IMU calibration in manifest.calibration: IMU streams left in the raw sensor frames")
     if offsets is not None:
         q = apply_imu_offsets(q, offsets, world=world)
-        gyro = None if gyro is None else apply_imu_offsets_to_vectors(gyro, offsets)
-        acc = None if acc is None else apply_imu_offsets_to_vectors(acc, offsets)
+        # sensor-frame vectors: R_offᵀ v (segment frame); world-frame vectors: G⁻¹ v (model world)
+        vkw = {"vec_frame": vec_frame, "world": world}
+        gyro = None if gyro is None else apply_imu_offsets_to_vectors(gyro, offsets, **vkw)
+        acc = None if acc is None else apply_imu_offsets_to_vectors(acc, offsets, **vkw)
         info.update(calibrated=True, frame="segment", world_aligned=world is not None)
     arrays[K_IMU_QUAT] = _resample_quat(imu["t"], q, tm)[0].astype(np.float32)
     t_i = np.asarray(imu["t"], dtype=np.float64)
@@ -832,6 +956,23 @@ def _process_imu(imu, tm, layout, man, sdir, cfg, arrays, pre, notes) -> list[st
             arrays[key] = _resample(ts, vs, tm)[0].astype(np.float32)
     pre["imu"] = info
     return sites
+
+
+def _stream_valid(key: str, name: str, t_src, tm: np.ndarray, max_gap_s: float | None,
+                  arrays: dict, notes: list[str]) -> int:
+    """``arrays[key]`` = ``[T]`` bool: master frames the native stream actually measured — inside its
+    own time span (``clock.span: pressure`` edge-holds it outside) and not inside a sample gap
+    (:func:`_gap_frames`). Returns the number of invalid frames (noted when > 0)."""
+    t = np.asarray(t_src, dtype=np.float64).reshape(-1)
+    span = (tm >= np.min(t)) & (tm <= np.max(t))
+    gap = _gap_frames(t, tm, max_gap_s)
+    valid = span & ~gap
+    arrays[key] = valid
+    if (~span).any():
+        notes.append(f"{name}: {int((~span).sum())} frames outside its time span (edge-held): {key} false")
+    if gap.any():
+        notes.append(f"{name}: {int(gap.sum())} frames inside sample gaps > {max_gap_s} s: {key} false")
+    return int((~valid).sum())
 
 
 def _process_hand(path, tm, cfg, arrays, pre, notes):
@@ -883,8 +1024,21 @@ def _process_joints(joints, tm, hz, sdir, man, cfg, arrays, pre, notes):
     model = None
     if urdf is not None:
         model = URDFModel.from_file(urdf)
-        q = model.reorder_q(q, names)
-        qd_file = None if qd_file is None else model.reorder_q(qd_file, names)
+        missing = [n for n in model.joint_names if n not in names]
+        if len(missing) == len(model.joint_names):
+            raise ValueError(f"joint_state names {names[:4]}… match none of the URDF {urdf.name} joints "
+                             f"{list(model.joint_names)[:4]}… (namespace prefix / other robot?): q would be all "
+                             "zeros — rename the driver joints or give the matching URDF (robot.urdf)")
+        if missing:
+            msg = (f"joint_state lacks {len(missing)}/{len(model.joint_names)} URDF joints {missing}: "
+                   "q / qd are 0 there (static joints)")
+            notes.append(msg)
+            log.warning("%s: %s", sdir, msg)
+            pre["zero_filled_joints"] = missing
+        with warnings.catch_warnings():               # reported above (notes + meta), once per session
+            warnings.simplefilter("ignore")
+            q = model.reorder_q(q, names)
+            qd_file = None if qd_file is None else model.reorder_q(qd_file, names)
         names = list(model.joint_names)
         pre["urdf"] = str(urdf)
     else:
@@ -1072,6 +1226,18 @@ def find_sessions(root: str | Path) -> list[Path]:
     return sorted(out)
 
 
+def synthetic_origin(man: SessionManifest) -> str | None:
+    """``"fake_recorder"`` for a ``record … --fake`` session (``meta.fake``), ``"generator"`` for a
+    ``datasets.synthetic`` session (``meta.synthetic`` / ``meta.generator``), ``None`` for recorded data —
+    copied into the episode's ``meta.preprocessing.synthetic``."""
+    meta = man.meta or {}
+    if meta.get("fake"):
+        return "fake_recorder"
+    if meta.get("synthetic") or str(meta.get("generator") or "").startswith("robot_skin.datasets.synthetic"):
+        return "generator"
+    return None
+
+
 def _qc_failed(session_dir: Path) -> bool:
     p = session_dir / "qc.json"
     if not p.is_file():
@@ -1089,8 +1255,10 @@ def build_all(raw_roots: str | Path | Sequence[str | Path], out_root: str | Path
     episode already exists are ``skipped`` (``force`` rebuilds them); a skipped episode built with
     another config / preprocessing version / raw file set is reported ``stale``. Two sessions that map
     to the same ``<dataset>/<session_id>`` in one run are an error for the second (never a silent
-    overwrite / skip). Returns one report per session ``{session, episode, status:
-    built|skipped|qc_failed|failed, stale?, error?}``."""
+    overwrite / skip). ``record --dry-run`` plans (``meta.dry_run``: nothing recorded) are reported
+    ``plan`` and skipped; synthetic sessions (``record --fake``, ``datasets.synthetic``) mixed with
+    recorded ones are warned about. Returns one report per session ``{session, episode, status:
+    built|skipped|qc_failed|plan|failed, stale?, synthetic?, error?}``."""
     cfg = _merge_cfg(cfg)
     roots = [raw_roots] if isinstance(raw_roots, (str, Path)) else list(raw_roots)
     sessions = sorted({s.resolve() for r in roots for s in find_sessions(r)})
@@ -1100,6 +1268,14 @@ def build_all(raw_roots: str | Path | Sequence[str | Path], out_root: str | Path
         rep: dict[str, Any] = {"session": str(s)}
         try:
             man = SessionManifest.load(s)
+            if (man.meta or {}).get("dry_run"):        # a `record --dry-run` plan: no streams were recorded
+                rep["status"] = "plan"
+                log.info("%s: dry-run plan (nothing recorded) — skipped", s)
+                reports.append(rep)
+                continue
+            origin = synthetic_origin(man)
+            if origin:
+                rep["synthetic"] = origin
             dest = episode_dir(out_root, man)
             rep["episode"] = str(dest)
             key = dest.resolve()
@@ -1126,6 +1302,13 @@ def build_all(raw_roots: str | Path | Sequence[str | Path], out_root: str | Path
             rep.update(status="failed", error=f"{type(e).__name__}: {e}")
             log.error("%s: %s", s, rep["error"])
         reports.append(rep)
+    syn = [r for r in reports if r.get("synthetic")]
+    real = [r for r in reports if r.get("episode") and not r.get("synthetic")]
+    if syn and real:
+        log.warning("%d synthetic session(s) (record --fake / datasets.synthetic) are preprocessed together with %d "
+                    "recorded one(s) into %s — synthetic data must not be mixed with real data (keep it under "
+                    "paths.synthetic_root and give it its own --out), e.g. %s", len(syn), len(real), out_root,
+                    syn[0]["session"])
     return reports
 
 
@@ -1172,6 +1355,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
         if not args.quiet:
             extra = f"  ({r['error']})" if "error" in r else (" (stale)" if r.get("stale") else "")
+            extra += "  (dry-run plan, nothing recorded)" if r["status"] == "plan" else ""
             print(f"{r['status']:9s} {r['session']}{extra}")
     print("summary: " + (", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "no sessions found"))
     if args.json:

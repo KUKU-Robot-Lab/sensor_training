@@ -26,7 +26,9 @@ data:
   tactile_source: auto          # auto | derived (require the contact stage) | bootstrap (tests only)
   bootstrap: {}                 # vtla.dataset.BOOTSTRAP_DEFAULTS overrides (weak_z, strong_z, weak_pct, …)
   contact_rule: level_ge_weak   # ContactGate input: level_ge_weak (WEAK/STRONG/SAT) | weak_or_strong
-                                # (a dead, always-saturated channel keeps level_ge_weak's gate open)
+                                # (a dead, always-saturated channel keeps level_ge_weak's gate open …
+  mask_dead_taxels: true        # … unless masked: hide meta.preprocessing.dead_taxels via taxel_pad
+                                # (stored in the bundle; control then masks the session's dead channels)
   aux_target: label             # aux contact target: label (contact_label ≥ 0) | level | gt (synthetic)
 
 policy:

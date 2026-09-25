@@ -22,13 +22,15 @@ _EXPORTS = {
                 "FakeJointSource", "FakeObjectPoseSource", "FakePressureSource", "ImuSource", "MonotonicClock",
                 "PlaybackSource", "RosJointStateSource", "STREAM_KINDS", "SerialPressureSource", "SimClock",
                 "StreamSource", "fake_sources", "validate_source"),
-    "recorder": ("EVENTS_NAME", "EventLog", "Recorder", "load_events", "phases_from_events", "segments_from_events"),
+    "recorder": ("EVENTS_NAME", "EventLog", "Recorder", "load_events", "phases_from_events", "segments_from_events",
+                 "session_segments"),
     "sync": ("ClockModel", "OffsetEstimate", "apply_clock_models", "apply_offset", "change_envelope", "detect_taps",
              "estimate_offset", "fit_clock_drift", "sync_session", "sync_windows"),
     "calibration": ("calibrate_session_imu", "compute_imu_calibration"),
     "qc": ("DEFAULT_THRESHOLDS", "format_report", "rest_spans", "session_qc", "stream_timing"),
     "session": ("AutoOperator", "ConsoleOperator", "adhoc_plan", "copy_imu_calibration", "fake_source_factory",
-                "planned_streams", "postprocess_session", "record_episode", "run_plan", "write_dry_run"),
+                "planned_streams", "postprocess_session", "record_episode", "refresh_segments", "run_plan",
+                "write_dry_run"),
     "fake": ("FakeConfig", "FakeScene"),
 }
 _WHERE = {name: mod for mod, names in _EXPORTS.items() for name in names}

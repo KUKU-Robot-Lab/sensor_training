@@ -320,6 +320,136 @@ def test_resume_auto_without_checkpoint_starts_fresh(tmp_path):
     assert tr.resumed_from is None and tr.step == 2
 
 
+def test_resume_auto_ignores_stage_artefacts(tmp_path):
+    """Regression: find_last fell back to *any* *.pt, and every stage writes its artefact into
+    the run directory — with the Trainer checkpoints pruned, resume='auto' loaded e.g.
+    policy_bundle.pt and crashed with KeyError 'model' instead of starting fresh."""
+    run = tmp_path / "run"
+    save_checkpoint(run / "policy_bundle.pt", format="x", config={}, state_dict={})
+    save_checkpoint(run / "imu_pose_model.pt", format="y", state_dict={"w": torch.zeros(1)})
+    assert find_last(run) is None
+    with pytest.raises(FileNotFoundError):
+        load_checkpoint(run)
+    tr = Trainer(_model(), mse_loss, _cfg(tmp_path, resume="auto", max_epochs=1), _data(32),
+                 dist_info=SINGLE)
+    tr.fit()
+    assert tr.resumed_from is None and tr.step == 2
+    assert find_last(run).name == LAST_NAME
+
+
+def test_resume_of_an_early_stopped_run_takes_no_step(tmp_path):
+    """Regression: stopped_early was not checkpointed, so every resume='auto' relaunch of a run
+    that had finished by early stopping trained one more epoch (and rewrote its files)."""
+    seq = [1.0, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3]
+
+    def run(**kw):
+        cfg = _cfg(tmp_path, max_epochs=10, monitor="val/custom", **kw)
+        tr = Trainer(_model(), mse_loss, cfg, _data(32),
+                     callbacks=[lambda t, row: {"val/custom": seq[row["epoch"] - 1]}], dist_info=SINGLE)
+        tr.fit()
+        return tr
+
+    first = run(early_stop_patience=2)
+    assert first.epoch == 4 and first.stopped_early
+    again = run(early_stop_patience=2, resume="auto")
+    assert again.resumed_from is not None and again.epoch == 4 and len(again.history) == 4
+    assert again.stopped_early
+    assert json.loads((tmp_path / "run" / "summary.json").read_text())["stopped_early"] is True
+    assert load_checkpoint(tmp_path / "run" / LAST_NAME)["epoch"] == 4
+    more = run(early_stop_patience=4, resume="auto")        # raised patience: keeps training
+    assert more.epoch == 6 and more.stopped_early and more.best_epoch == 2
+
+
+def test_resume_applies_the_current_lr_and_weight_decay(tmp_path):
+    """Regression: the restored optimizer / scheduler state carried the checkpoint's peak lr and
+    weight decay, so continuing a run with a lower lr silently kept the old one."""
+    ds = _data(32)
+    Trainer(_model(), mse_loss, _cfg(tmp_path, max_epochs=2, lr=0.05, weight_decay=0.1), ds,
+            dist_info=SINGLE).fit()
+    tr = Trainer(_model(), mse_loss, _cfg(tmp_path, max_epochs=4, lr=0.001, resume="auto"), ds,
+                 dist_info=SINGLE)
+    with pytest.warns(UserWarning, match=r"changed optimizer settings \['lr', 'weight_decay'\]"):
+        tr.fit()
+    assert [r["lr"] for r in tr.history] == pytest.approx([0.05, 0.05, 0.001, 0.001])
+    assert all(g["weight_decay"] == 0.0 for g in tr.optimizer.param_groups)
+    # a decaying schedule continues at the restored step from the *new* peak lr
+    Trainer(_model(), mse_loss, _cfg(tmp_path, "c", max_epochs=2, lr=0.05, schedule="cosine"), ds,
+            dist_info=SINGLE).fit()
+    res = Trainer(_model(), mse_loss, _cfg(tmp_path, "c", max_epochs=4, lr=0.01, schedule="cosine",
+                                           resume="auto"), ds, dist_info=SINGLE)
+    with pytest.warns(UserWarning, match="changed optimizer settings"):
+        res.resume("auto")
+    assert res.step == 4 and res.current_lr() == pytest.approx(0.01 * lr_factor(4, "cosine", 0, 8, 0.1))
+    assert res.scheduler.get_last_lr()[0] == pytest.approx(res.current_lr())
+
+
+def test_resume_on_another_training_set_warns_and_keeps_the_callers_extra_state(tmp_path):
+    """Regression: a resume onto other data (another split / processed root) continued the old
+    model without a word, and replaced the caller's freshly computed extra_state (normalisers)
+    with the checkpoint's."""
+    Trainer(_model(), mse_loss, _cfg(tmp_path, max_epochs=1), _data(32), extra_state={"norm": 1.0},
+            dist_info=SINGLE).fit()
+    tr = Trainer(_model(), mse_loss, _cfg(tmp_path, max_epochs=2), _data(48), extra_state={"norm": 2.0},
+                 dist_info=SINGLE)
+    with pytest.warns(UserWarning, match=r"different training set \(32 → 48 samples\)"):
+        tr.resume("auto")
+    assert tr.extra_state == {"norm": 2.0}
+    tr = Trainer(_model(), mse_loss, _cfg(tmp_path, max_epochs=2), _data(32), dist_info=SINGLE)
+    tr.resume("auto")
+    assert tr.extra_state == {"norm": 1.0}                      # restored when none is given
+
+
+def test_fresh_run_sets_aside_the_previous_runs_files(tmp_path):
+    """Regression: a fresh (not resumed) run into a used out_dir kept the old ckpt_best.pt — the
+    stages exported it as this run's model when the new run never recorded a finite monitor
+    value — and appended to the old metrics.jsonl (restarting step numbers)."""
+    from robot_skin.stages import restore_best_weights
+
+    run = tmp_path / "run"
+    ds = _data(32)
+    Trainer(_model(), mse_loss, _cfg(tmp_path, max_epochs=2), ds, dist_info=SINGLE).fit()
+    stale = load_checkpoint(run / BEST_NAME)
+    tr = Trainer(_model(seed=5), mse_loss, _cfg(tmp_path, max_epochs=1, lr=0.01, monitor="val/custom"), ds,
+                 callbacks=[lambda t, row: {"val/custom": float("nan")}], dist_info=SINGLE)
+    tr.fit()
+    assert tr.best_step is None and not (run / BEST_NAME).exists()
+    assert {p.name for p in (run / "previous").iterdir()} == {LAST_NAME, BEST_NAME, "metrics.jsonl",
+                                                              "history.json"}
+    assert [r["epoch"] for r in read_jsonl(run / "metrics.jsonl", kind="epoch")] == [1]
+    # the stages' export helper never loads a best checkpoint this run did not write
+    save_checkpoint(run / BEST_NAME, **stale)
+    m = copy.deepcopy(tr.model)
+    assert restore_best_weights(tr, m) == "last"
+    torch.testing.assert_close(_params(m), _params(tr.model))
+    # a resumed run keeps its files
+    Trainer(_model(), mse_loss, _cfg(tmp_path, max_epochs=2, lr=0.01, resume="auto"), ds, dist_info=SINGLE).fit()
+    assert (run / BEST_NAME).exists() and (run / "previous" / BEST_NAME).exists()
+
+
+def test_tf32_is_set_for_every_trainer_not_inherited(tmp_path, monkeypatch):
+    """Regression: TF32 was only ever *enabled* (process-global) — a later Trainer with tf32: false
+    or on CPU in the same process (pipeline, sweep) still ran fp32 matmuls in TF32."""
+    from robot_skin.train import engine
+    from robot_skin.train.hardware import PrecisionPlan
+
+    prev = torch.get_float32_matmul_precision()
+    monkeypatch.setattr(engine, "resolve_device", lambda *a, **k: torch.device("cuda", 0))
+    monkeypatch.setattr(engine, "resolve_precision", lambda *a, **k: PrecisionPlan("fp32", None, False, "cuda"))
+    monkeypatch.setattr(nn.Module, "to", lambda self, *a, **k: self)
+    try:
+        torch.set_float32_matmul_precision("highest")
+        Trainer(_model(), mse_loss, _cfg(tmp_path, tf32=True), dist_info=SINGLE)
+        assert torch.get_float32_matmul_precision() == "high"
+        Trainer(_model(), mse_loss, _cfg(tmp_path, tf32=False), dist_info=SINGLE)
+        assert torch.get_float32_matmul_precision() == "highest"
+        torch.set_float32_matmul_precision("high")
+        monkeypatch.setattr(engine, "resolve_device", lambda *a, **k: torch.device("cpu"))
+        Trainer(_model(), mse_loss, _cfg(tmp_path, tf32=True), dist_info=SINGLE)   # CPU run
+        assert torch.get_float32_matmul_precision() == "highest"
+    finally:
+        torch.set_float32_matmul_precision(prev)
+
+
 @pytest.mark.parametrize("mode,best_epoch", [("min", 4), ("max", 5)])
 def test_best_checkpoint_by_monitor(tmp_path, mode, best_epoch):
     seq = [3.0, 1.0, 2.0, 0.5, 4.0]

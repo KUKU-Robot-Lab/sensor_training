@@ -11,7 +11,11 @@ layout: null                    # override manifest.layout (built-in name or YAM
 
 clock:
   reference: [pressure, imu, joint_state]   # master clock = overlap of these streams (if present)
-  span: intersection                        # intersection | pressure (pressure span only)
+  span: intersection                        # intersection | pressure (pressure span only; frames outside
+                                            #   the IMU / joint_state span → imu_valid / joint_state_valid false)
+  max_gap_s: 0.1                            # native samples farther apart than max(this, 4 × median spacing)
+                                            #   = a gap: pressure frames inside → saturated, IMU / joint_state
+                                            #   frames → imu_valid / joint_state_valid false (null → off)
 
 pressure:
   loader: null                  # "package.module:function" (session_dir, manifest) -> (t[T], raw[T,C]),
@@ -34,6 +38,7 @@ imu:
   apply_calibration: true       # manifest.calibration imu_offsets / imu_world → segment frames
   calibrate_if_missing: false   # compute it from the calibration phase (acquisition.calibration, not saved)
   calibration_phase: imu_calibration
+  vec_frame: sensor             # raw imu.npz gyro/acc frame: sensor (IMU body, DATA_FORMAT) | world (device world frame)
 
 hand_pose:                      # pose.vision_hand.smooth_hand_labels
   min_conf: 0.5                 # confidence gate → hand_pose_valid
@@ -69,4 +74,5 @@ synthetic_gt:                   # datasets.synthetic sidecar gt_synthetic.npz (i
   store: true                   # store gt_artefact_pct / gt_press_pct / gt_contact / gt_self_touch / gt_object_contact
 
 qc:
-  skip_failed: false            # skip sessions whose qc.json says passed: false
+  skip_failed: true             # build_all / CLI: skip sessions whose qc.json says passed: false (reported
+                                #   qc_failed; docs/DATA_ACQUISITION.md §10). false → build them anyway

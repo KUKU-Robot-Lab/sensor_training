@@ -84,7 +84,9 @@ def layout_rest_poses(layout: Any, *, skeleton: Any = None, urdf: Any = None, q:
 class LayoutAlignment:
     """``dst`` taxel ``i`` ← ``src`` taxels ``index[i, :k]`` with ``weight[i]`` (sum 1),
     ``distance[i]`` (in the matching space) and ``valid[i]`` (a same-group source exists within
-    ``max_dist``)."""
+    ``max_dist``). A column without a usable match (the group has fewer than ``k`` sources, or the
+    source is beyond ``max_dist``) repeats the row's best match ``index[i, 0]`` with weight 0 and
+    distance ``inf``, so no column ever names a source of another finger group."""
 
     index: np.ndarray
     weight: np.ndarray
@@ -160,7 +162,9 @@ def align_layouts(src: Any, dst: Any, *, src_pos: np.ndarray | None = None, dst_
     (:class:`~robot_skin.transfer.CapsuleSkeleton` in the same frame as the respective positions)
     matching uses the canonical ``(u, side)`` coordinates, otherwise Euclidean distance (positions
     must share a frame). ``k`` sources per destination (inverse-distance weights); ``by_group``
-    keeps finger groups apart; ``max_dist`` (in the matching space) invalidates far matches."""
+    keeps finger groups apart — also for ``k`` larger than a group's source count; ``max_dist`` (in
+    the matching space) drops every match beyond it and invalidates destinations whose best match
+    is too far."""
     S, Dl = _layout(src), _layout(dst)
     if int(k) < 1:
         raise ValueError("k must be >= 1")
@@ -192,13 +196,22 @@ def align_layouts(src: Any, dst: Any, *, src_pos: np.ndarray | None = None, dst_
     kk = min(int(k), S.n)
     order = np.argsort(Dm, axis=1, kind="stable")[:, :kk]
     dist = np.take_along_axis(Dm, order, axis=1)
-    finite = np.isfinite(dist)
-    w = np.where(finite, 1.0 / (dist + eps), 0.0)
+    # a usable match is same-group (finite distance) and within max_dist — for every one of the k
+    # columns, not only the nearest (a group with fewer than k sources, e.g. one fingertip pad per
+    # hand, would otherwise fill the row with other fingers' taxels)
+    usable = np.isfinite(dist)
+    if max_dist is not None:
+        usable &= dist <= float(max_dist)
+    w = np.where(usable, 1.0 / (np.where(usable, dist, 0.0) + eps), 0.0)
     w_sum = w.sum(1, keepdims=True)
     w = np.where(w_sum > 0, w / np.where(w_sum > 0, w_sum, 1.0), 0.0)
-    if max_dist is not None:
-        valid &= dist[:, 0] <= float(max_dist)
-    valid &= finite[:, 0]
+    valid &= usable[:, 0]
+    # unusable extra columns repeat the row's best match (weight 0, distance inf): index never names
+    # a cross-group / too-far source, so ``max`` / ``weighted`` over the k columns cannot leak it
+    pad = ~usable
+    pad[:, 0] = False
+    order = np.where(pad, order[:, :1], order)
+    dist = np.where(pad, np.inf, dist)
     return LayoutAlignment(order.astype(np.int64), w, dist, valid, S.n, sg, dg, space)
 
 
@@ -207,7 +220,9 @@ def map_taxel_values(values_src: Any, mapping: LayoutAlignment, *, taxel_axis: i
     """Carry per-taxel values ``[..., N_src, ...]`` (taxel axis ``taxel_axis``) to the destination
     layout ``[..., N_dst, ...]``. ``reduce``: ``weighted`` (inverse-distance average — continuous
     values such as residual z or ΔS), ``nearest`` (the best match — any dtype), ``max`` (over the
-    ``k`` matches — ordinal levels / contact flags). Invalid destinations get ``fill`` (default NaN
+    ``k`` matches — ordinal levels / contact flags). Only real matches contribute: ``max`` skips
+    entries with a non-finite distance (another finger group) and ``weighted`` entries with weight 0
+    (so a NaN there cannot poison the destination). Invalid destinations get ``fill`` (default NaN
     for floats, −1 for ints, False for bools)."""
     if reduce not in REDUCE_MODES:
         raise ValueError(f"reduce must be one of {REDUCE_MODES}")
@@ -220,12 +235,18 @@ def map_taxel_values(values_src: Any, mapping: LayoutAlignment, *, taxel_axis: i
     if reduce == "nearest":
         out = g[..., 0]
     elif reduce == "max":
-        out = g.max(-1)
+        # only real matches count: an entry with a non-finite distance (another finger group — e.g.
+        # an alignment saved before align_layouts padded such columns) is replaced by the best match
+        use = np.isfinite(np.asarray(mapping.distance, np.float64))
+        use[:, 0] = True
+        out = np.where(use, g, g[..., :1]).max(-1)
     else:
         if not np.issubdtype(x.dtype, np.floating):
             x = x.astype(np.float64)
             g = x[..., mapping.index]
-        out = np.sum(g * mapping.weight, axis=-1)
+        w = np.asarray(mapping.weight, np.float64)
+        # zero-weight entries contribute nothing — also not a NaN (0·NaN = NaN) of another finger
+        out = np.sum(np.where(w > 0, g, 0.0) * w, axis=-1)
     if fill is None:
         fill = False if out.dtype == bool else (-1 if np.issubdtype(out.dtype, np.integer) else np.nan)
     out = np.where(mapping.valid, out, np.asarray(fill, dtype=out.dtype) if out.dtype != object else fill)

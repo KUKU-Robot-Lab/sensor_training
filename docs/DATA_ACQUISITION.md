@@ -45,6 +45,7 @@
 ```bash
 python -m robot_skin.acquisition.glove_logger --protocol d1_motion --subject S01 --dry-run   # 대본 출력
 python -m robot_skin.acquisition.glove_logger --protocol d1_motion --subject TEST --fake --time-scale 0.05 --out /tmp/t
+# (--out 없이 --fake 는 robot_skin/data/synthetic/… — configs/default.yaml paths.synthetic_root — 에 쓴다: 실제 raw 와 분리)
 ```
 
 ## 3. 장갑 착용과 워밍업
@@ -183,7 +184,7 @@ phase 이름이 두 번 기록되어도 된다. IMU 보정은 마지막 시도�
 ## 8. 명령어 요약
 
 ```bash
-# D1 (세션 1개). --out 생략 시 robot_skin/data/raw/motion/S01/<session_id>
+# D1 (세션 1개). --out 생략 시 <paths.raw_root>/motion/S01/<session_id> (기본 robot_skin/data/raw; --root 로 변경)
 python -m robot_skin.acquisition.glove_logger --protocol d1_motion --subject S01
 # D2 (에피소드마다 디렉터리). 과제 2개만, 8 에피소드
 python -m robot_skin.acquisition.glove_logger --protocol d2_task --subject S01 --task pour --task wipe --episodes 8
@@ -213,9 +214,17 @@ session_id = <dataset>-<subject>-<YYYYMMDD>-<HHMMSS>[-e<NNN>-<task>-<object>-r<r
 
 - 피험자 ID 는 가명(`S01`…; 로봇 `R01`…)만. 이름·생년월일 등은 `--notes` 에도 쓰지 않는다.
 - 세션 디렉터리는 **덮어쓰지 않는다** (비어 있지 않으면 레코더가 거부). 다시 찍으면 새 디렉터리.
-- `hand_pose.npz` 는 기록 후 `pose.vision_hand.save_hand_labels` 로 같은 디렉터리에 추가한다.
+- `hand_pose.npz` 는 기록 후 `pose.vision_hand.save_hand_labels(<session_dir>, …)` 로 같은 디렉터리에 추가한다.
+  이 함수가 `session.json` 의 `streams` 에 `hand_pose` 를 등록한다(`register_hand_labels`; 다른 도구로 만든
+  파일은 `register_hand_labels(<session_dir>/hand_pose.npz)`). 등록되지 않은 `hand_pose.npz` / `object_pose.npz` 도
+  전처리가 세션 디렉터리에서 읽는다(`preprocessing.notes` 에 기록). 이미 전처리한 세션이면 `stale` 로 보고되므로
+  `--force` 로 다시 만든다.
 - 이벤트 경계를 손으로 고쳐야 하면 `events.jsonl` 줄을 수정/추가하고(시간순 아니어도 됨)
-  `python -m robot_skin.acquisition.session <dir>` 로 후처리를 다시 돌린다.
+  `python -m robot_skin.acquisition.session <dir>` 로 후처리를 다시 돌린다. **`events.jsonl` 이 기준**이다:
+  후처리가 `session.json` 의 segments 를 이벤트에서 다시 만들고(phase 에서 나온 segment 만 바뀌고, D2 `task` 처럼
+  따로 추가한 segment 는 `meta.recorder.explicit_segments` 에서 유지), 전처리도 segments 를 이벤트에서 만든다
+  (`acquisition.recorder.session_segments`) — 고친 경계가 `contact_label` 과 baseline 구간까지 반영된다. 이미
+  전처리한 세션은 `stale` 로 보고되므로 `--force` 로 다시 만든다.
 
 ## 10. QC 게이트와 실패 시 조치
 
@@ -242,8 +251,10 @@ session_id = <dataset>-<subject>-<YYYYMMDD>-<HHMMSS>[-e<NNN>-<task>-<object>-r<r
 | `sync_taps_visible`, `sync_score` (warning), `sync_offset` (error) | 탭 3개 검출, 상관 ≥ 0.3, 오프셋 ≤ 0.5 s | 탭을 더 분명히, 카메라 자동노출 끄기, 손끝이 화면에 보이게. 안 되면 `--sync-from` |
 | `phases_closed` (warning) | 자동 종료된 phase 없음 | 중단된 세션 — 다시 찍는다 |
 
-FAIL 세션은 지우지 말고 그대로 두고(원인 분석용) 새 디렉터리로 다시 찍는다. 전처리 대상을 고를 때는
-`qc.json` 의 `passed` 로 거른다.
+FAIL 세션은 지우지 말고 그대로 두고(원인 분석용) 새 디렉터리로 다시 찍는다. 전처리(`python -m robot_skin
+preprocess`, `datasets.build`)는 기본으로 `qc.json` 이 `passed: false` 인 세션을 건너뛰고 `qc_failed` 로 보고한다
+(`qc.skip_failed: true`) — FAIL 세션과 재기록 세션이 둘 다 데이터셋·split 에 들어가지 않는다. 원인 분석용으로
+FAIL 세션을 억지로 전처리하려면 `--set qc.skip_failed=false`.
 
 ## 11. 권장 수집량 (시작점)
 

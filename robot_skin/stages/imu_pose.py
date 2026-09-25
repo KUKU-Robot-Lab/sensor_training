@@ -42,8 +42,8 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from . import (finite_json, fit_and_restore, load_stage_yaml, parse_overrides, resolve_stage_config,
-               seed_model_init, split_stage_episodes, stage_episodes, write_json_atomic)
+from . import (data_provenance, finite_json, fit_and_restore, load_stage_yaml, parse_overrides,
+               resolve_stage_config, seed_model_init, split_stage_episodes, stage_episodes, write_json_atomic)
 
 log = logging.getLogger("robot_skin.stages.imu_pose")
 
@@ -202,6 +202,7 @@ def run(cfg: Mapping[str, Any] | None = None) -> dict:
     cfg = resolve_config(cfg)
     out_dir = Path(cfg["out_dir"])
     d_cfg, f_cfg, m_cfg = cfg["data"], dict(cfg["features"]), dict(cfg["model"])
+    provenance = data_provenance(d_cfg)            # the splits file / processed root this run trains on
     window = int(m_cfg.pop("window"))
     train_sets, pred_sets = set(d_cfg["datasets"] or []), set(d_cfg["predict_datasets"] or [])
 
@@ -243,6 +244,7 @@ def run(cfg: Mapping[str, Any] | None = None) -> dict:
                               extra_state={"stage": STAGE, "model_config": model.config, "bundle_meta": bundle_meta})
     metrics: dict[str, Any] = {
         "stage": STAGE, "out_dir": str(out_dir), "model_path": str(out_dir / MODEL_NAME), "window": window,
+        "data_provenance": provenance,
         "n_episodes": {"loaded": len(eps), "train": len(split["train"]), "val": len(split["val"]),
                        "test": len(split["test"])},
         "n_samples": {"train": len(train_ds), "val": len(val_ds) if val_ds is not None else 0},

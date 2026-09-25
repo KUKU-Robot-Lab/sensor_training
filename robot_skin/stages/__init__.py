@@ -18,9 +18,10 @@ import warnings
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-__all__ = ["apply_stage_hardware", "load_stage_yaml", "resolve_stage_config", "check_stage_keys",
-           "finite_json", "write_json_atomic", "parse_overrides", "stage_episodes", "split_stage_episodes",
-           "warn_unshared_split", "warn_legacy_taxel_frame", "seed_model_init", "fit_and_restore"]
+__all__ = ["apply_stage_hardware", "hardware_overrides", "load_stage_yaml", "resolve_stage_config",
+           "check_stage_keys", "check_train_keys", "data_provenance", "finite_json", "write_json_atomic",
+           "parse_overrides", "stage_episodes", "split_stage_episodes", "warn_unshared_split",
+           "warn_legacy_taxel_frame", "seed_model_init", "restore_best_weights", "fit_and_restore"]
 
 log = logging.getLogger("robot_skin.stages")
 
@@ -53,11 +54,30 @@ def apply_stage_hardware(cfg: Mapping[str, Any], stage: str) -> dict:
     return out
 
 
+def check_train_keys(cfg: Mapping[str, Any], stage: str) -> None:
+    """Raise ``ValueError`` for ``train`` keys that are not :class:`robot_skin.train.TrainConfig`
+    fields (``--set train.max_step=30`` would otherwise only warn and train for the full budget).
+    The ``train`` section is open in the stage ``DEFAULTS`` (any TrainConfig field may be set)."""
+    tr = cfg.get("train")
+    if not isinstance(tr, Mapping):
+        return
+    import dataclasses
+
+    from ..train.engine import TrainConfig
+
+    names = {f.name for f in dataclasses.fields(TrainConfig)}
+    bad = sorted(set(tr) - names)
+    if bad:
+        raise ValueError(f"{stage}: unknown keys {bad} in section 'train' (not TrainConfig fields); "
+                         f"valid: {sorted(names)}")
+
+
 def check_stage_keys(cfg: Mapping[str, Any], defaults: Mapping[str, Any], stage: str,
                      *, open_sections: Sequence[str] = ("train",)) -> None:
     """Raise ``ValueError`` for keys unknown to ``defaults`` (top level and one level into every
     mapping section) — a typo in a stage YAML must not be silently ignored. ``open_sections``
-    (``train``: :class:`TrainConfig` warns about its own unknown keys) are not checked."""
+    (``train``) are not checked here; the stage config loaders check ``train`` against the
+    :class:`TrainConfig` fields (:func:`check_train_keys`)."""
     bad = sorted(set(cfg) - set(defaults))
     if bad:
         raise ValueError(f"{stage}: unknown config keys {bad}; valid: {sorted(defaults)}")
@@ -69,11 +89,63 @@ def check_stage_keys(cfg: Mapping[str, Any], defaults: Mapping[str, Any], stage:
             raise ValueError(f"{stage}: unknown keys {bad} in section {sec!r}; valid: {sorted(dv)}")
 
 
+def _profile_name(hw: Any) -> str | None:
+    """The name :func:`robot_skin.train.apply_hw_profile` records as ``cfg["hardware"]`` for ``hw``
+    (``auto`` → the detected profile, ``None`` when none matches)."""
+    from ..train.hardware import detect_hw_profile, load_hw_profile
+
+    if isinstance(hw, Mapping):
+        return str(hw.get("name", "custom"))
+    if hw == "auto":
+        return detect_hw_profile()
+    try:
+        return str(load_hw_profile(hw).get("name", "custom"))
+    except (FileNotFoundError, ValueError, OSError):
+        return str(hw)
+
+
+def hardware_overrides(cfg: Mapping[str, Any], overrides: Mapping[str, Any] | None) -> tuple[dict, dict]:
+    """Split ``overrides`` into its hardware keys (``hardware``, ``hardware_applied`` — applied *before*
+    the other overrides) and the rest. An explicit ``hardware`` override that names another profile than
+    the one ``cfg`` already has applied (a saved ``<runs>/<stage>/pipeline_config.yaml`` with
+    ``hardware_applied: true``) gets ``hardware_applied: false``: the new profile is applied over the
+    saved config — otherwise ``--hardware rtx4090`` would be recorded but the old profile's device /
+    precision / batch sizes kept. The same profile is not re-applied (the saved values stay)."""
+    ov = dict(overrides or {})
+    hw = {k: ov.pop(k) for k in ("hardware", "hardware_applied") if k in ov}
+    if (hw.get("hardware") and "hardware_applied" not in hw and cfg.get("hardware_applied")
+            and _profile_name(hw["hardware"]) != cfg.get("hardware")):
+        hw["hardware_applied"] = False
+    return hw, ov
+
+
+def data_provenance(data_cfg: Mapping[str, Any]) -> dict:
+    """What a stage trains on, for its ``metrics.json`` (``data_provenance``): the resolved
+    ``data.splits`` path and its sha256 (``None`` without a splits file — the stage split its own pool)
+    and the resolved ``data.processed_root``. ``python -m robot_skin pipeline`` compares them with its
+    own splits.json and processed root, so results written into a pipeline stage directory by another
+    run (e.g. a standalone ``train <stage>`` without ``data.splits``) are retrained, not reused."""
+    import hashlib
+
+    sp = data_cfg.get("splits")
+    sha = None
+    if sp:
+        try:
+            sha = hashlib.sha256(Path(sp).read_bytes()).hexdigest()
+        except OSError:
+            sha = None
+    root = data_cfg.get("processed_root")
+    return {"splits": str(Path(sp).resolve()) if sp else None, "splits_sha256": sha,
+            "processed_root": str(Path(root).resolve()) if root else None}
+
+
 def load_stage_yaml(defaults: Mapping[str, Any], stage: str, config_path: str | Path,
                     path: str | Path | None = None, overrides: Mapping[str, Any] | None = None) -> dict:
     """``defaults`` ⊕ YAML (``path`` or the stage's ``config_path`` if it exists) ⊕ hardware profile
     ⊕ ``overrides``. The profile (``hardware`` from the YAML or the overrides) is applied before the
-    other overrides, so ``--set train.batch_size=32`` beats the profile's suggestion."""
+    other overrides, so ``--set train.batch_size=32`` beats the profile's suggestion; a ``hardware``
+    override naming another profile than a saved config already applied re-applies it
+    (:func:`hardware_overrides`)."""
     import yaml
 
     p = Path(path) if path is not None else Path(config_path)
@@ -83,11 +155,11 @@ def load_stage_yaml(defaults: Mapping[str, Any], stage: str, config_path: str | 
         raise FileNotFoundError(f"stage config not found: {p}")
     else:
         cfg = copy.deepcopy(dict(defaults))
-    ov = dict(overrides or {})
-    hw = {k: ov.pop(k) for k in ("hardware", "hardware_applied") if k in ov}
+    hw, ov = hardware_overrides(cfg, overrides)
     cfg = apply_stage_hardware(_deep_merge(cfg, hw), stage)
     cfg = _deep_merge(cfg, ov)
     check_stage_keys(cfg, defaults, stage)
+    check_train_keys(cfg, stage)
     return cfg
 
 
@@ -96,6 +168,7 @@ def resolve_stage_config(cfg: Mapping[str, Any] | None, defaults: Mapping[str, A
     ``out_dir`` (``cfg.out_dir`` or ``train.out_dir``; both end up equal)."""
     out = _deep_merge(defaults, cfg or {})
     check_stage_keys(out, defaults, stage)
+    check_train_keys(out, stage)
     out = apply_stage_hardware(out, stage)
     out_dir = out.get("out_dir") or (out.get("train") or {}).get("out_dir") or f"robot_skin/runs/{stage}"
     out["out_dir"] = str(out_dir)
@@ -238,13 +311,34 @@ def seed_model_init(train_cfg: Mapping[str, Any]) -> int:
     return seed
 
 
+def restore_best_weights(trainer, model) -> str:
+    """Load the run's best checkpoint (EMA weights when enabled) into ``model`` — only when *this*
+    run recorded a best (``trainer.best_step``), so a ``ckpt_best.pt`` another run left in the same
+    ``out_dir`` is never exported as this run's model. Otherwise (no finite monitor value) the EMA
+    weights, else the last weights, with a warning. Returns ``"best" | "ema" | "last"``."""
+    from ..train import Trainer
+    from ..train.checkpoint import BEST_NAME
+
+    best = Path(trainer.out_dir) / BEST_NAME
+    if trainer.best_step is not None and best.is_file():
+        Trainer.load_model_weights(model, best, use_ema=True)
+        return "best"
+    if trainer.best_step is None:
+        log.warning("%s: no finite %r value was recorded — using the %s weights, not a best checkpoint",
+                    trainer.out_dir, trainer.cfg.monitor, "EMA" if trainer.ema is not None else "last")
+    if trainer.ema is not None:
+        trainer.ema.apply_to(model)
+        return "ema"
+    return "last"
+
+
 def fit_and_restore(model, loss_fn, train_cfg: Mapping[str, Any], train_ds, val_ds=None, *,
                     collate_fn=None, extra_state: Mapping[str, Any] | None = None):
     """Build a :class:`robot_skin.train.Trainer` (``val/*`` monitor → ``train/*`` without a
     validation set), ``fit()``, then load the best checkpoint's weights (EMA when enabled) into
-    ``model`` on every rank. Returns the trainer (``history``, ``step``, ``best_value`` …)."""
+    ``model`` on every rank (:func:`restore_best_weights`). Returns the trainer (``history``,
+    ``step``, ``best_value`` …)."""
     from ..train import TrainConfig, Trainer, barrier
-    from ..train.checkpoint import BEST_NAME
 
     t_cfg = dict(train_cfg)
     mon = str(t_cfg.get("monitor", "val/loss"))
@@ -254,10 +348,6 @@ def fit_and_restore(model, loss_fn, train_cfg: Mapping[str, Any], train_ds, val_
                       extra_state=dict(extra_state or {}))
     trainer.fit()
     barrier(trainer.dist)                                  # rank 0 has written ckpt_best.pt
-    best = Path(trainer.out_dir) / BEST_NAME
-    if best.is_file():
-        Trainer.load_model_weights(model, best, use_ema=True)
-    elif trainer.ema is not None:
-        trainer.ema.apply_to(model)
+    restore_best_weights(trainer, model)
     model.eval()
     return trainer

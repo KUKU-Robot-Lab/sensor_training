@@ -81,7 +81,11 @@ robot_skin  ──▶  common  ◀──  deformable_sats
 stage 들은 **파일과 episode 의 derived 배열로만** 연결된다. `python -m robot_skin pipeline` 이 순서
 (imu_pose → baseline → contact → pretrain → vtla), 공유 splits, 산출물 연결을 맡는다([`TRAINING.md`](TRAINING.md) §3).
 어떤 모델이 derived 배열을 썼는지는 episode 에 기록되지 않는다 — 파이프라인이 순서와 재실행 규칙(앞 stage 가 다시
-돌면 뒤 stage 도 다시)으로 일관성을 보장하고, `<runs>/pipeline.json` 에 실행 기록을 남긴다.
+돌면 뒤 stage 도 다시)으로 일관성을 보장하고, `<runs>/pipeline.json` 에 실행 기록을 남긴다. 규칙은 실행(invocation)을
+넘어서도 지켜진다: 각 stage 기록은 소비한 앞 stage run 의 지문(`metrics.json` + 주 산출물의 sha256)을 남기고, 다음
+실행에서 앞 stage 가 달라졌으면(`--stages baseline --force`, 같은 디렉터리에 쓴 단독 `train`) 뒤 stage 를 다시 학습한다.
+stage 는 학습에 쓴 splits.json(sha256)·processed root 를 `metrics.json` 의 `data_provenance` 에 남기고, 파이프라인은
+다른 데이터로 학습된 결과를 재사용하지 않는다.
 
 | stage | 학습 데이터 | 주 산출물 (`<out>/<stage>/`) | 에피소드에 쓰는 derived 배열 |
 |---|---|---|---|
@@ -104,8 +108,11 @@ stage 들은 **파일과 episode 의 derived 배열로만** 연결된다. `pytho
 | self-touch 라벨 | 캡슐 거리로 자동 (`self_touch_from_hand`) | 없음 (`contact` 의 `detector.bootstrap` 이 대신) |
 
 taxel 은 채널 번호가 아니라 **3D pose(위치·법선)** 로 토큰화되므로(3D-ViTac 방식) 두 손이 같은 촉각 인코더를
-쓸 수 있다. 레이아웃 간 대응이 필요하면 `transfer.align_layouts` / `map_taxel_values` 를 쓴다(손가락 그룹 안에서,
-캡슐 골격 좌표로 매칭).
+쓸 수 있다. 단, 두 손의 프레임은 다르다(글러브 `mano_wrist`: 손가락 −x, 손바닥 −y / 로봇 `urdf_root`: 합성 손은
+손가락 +z, 패드 +x). 인코더는 학습한 프레임의 pose 를 받아야 하므로, 번들이 학습 프레임을 기록하고
+(`tactile.taxel_frames`) 배포 때 `PolicyRunner` 가 로봇 pose 를 리타게터의 역변환으로 MANO 손목 프레임에 옮긴다
+(`transfer.RobotToManoTaxelFrame`: `R_hrᵀ R_bᵀ (p − t_b) / scale`; `control/README.md`). 레이아웃 간 대응이
+필요하면 `transfer.align_layouts` / `map_taxel_values` 를 쓴다(손가락 그룹 안에서, 캡슐 골격 좌표로 매칭).
 
 ## 5. 핵심 설계 결정
 
@@ -120,7 +127,7 @@ taxel 은 채널 번호가 아니라 **3D pose(위치·법선)** 로 토큰화�
 ### 5.2 taxel pose 는 손(로봇 base) 프레임
 
 글러브 taxel 위치·법선은 전처리에서 `global_orient = 0`, 손목 = 원점으로 계산한다
-(`meta.preprocessing.taxel_frame = mano_wrist`, 버전 `robot_skin.datasets.build/2`). 로봇은 URDF 루트 프레임이다.
+(`meta.preprocessing.taxel_frame = mano_wrist`, 버전 `robot_skin.datasets.build/2` 부터). 로봇은 URDF 루트 프레임이다.
 이유: 월드 프레임이면 합성 D2 에피소드에서 taxel 중심이 수십 cm 움직이고, 위치 특징이 "손이 방의 어디에 있나"를
 인코딩하게 된다. 그러면 로봇 base 프레임 자세와 맞지 않는다. 월드 좌표가 필요한 곳(손–물체 근접 veto)은
 `R(hand_global_orient)·p + hand_wrist_pos` 로 되돌린다(`contact.pseudo_label.taxel_world_positions`). 온라인
@@ -168,8 +175,9 @@ VTLA 에서 taxel 토큰은 Perceiver 식 쿼리 K 개로 압축된 뒤 `Contact
 (`contact = level ≥ WEAK`, `data.contact_rule`)이 하나도 없으면 K 개 토큰 전체를 0 으로 만든다. `soft`: 거기에
 `σ(w·접촉비율 + b)` 를 곱한다(무접촉 0 은 유지). 드리프트나 남은 아티팩트가 WEAK 문턱을 넘지 못하면 융합
 트랜스포머에 **아예 들어가지 못한다**(상수 modality embedding 만 남는다). 촉각 환각을 구조로 막는 장치다.
-주의: 기본 규칙은 SATURATED 도 접촉으로 센다 — 항상 포화인 죽은 채널이 있으면 게이트가 늘 열리므로 `taxel_pad`
-로 가리거나 `weak_or_strong` 을 쓴다.
+주의: 기본 규칙은 SATURATED 도 접촉으로 센다 — 항상 포화인 죽은 채널이 있으면 게이트가 늘 열리므로, 데이터셋이
+전처리가 기록한 죽은 채널(`meta.preprocessing.dead_taxels`)을 `taxel_pad` 로 가린다(`data.mask_dead_taxels`, 기본 켬;
+번들 `tactile.mask_dead_taxels` 를 따라 제어도 세션의 죽은 채널을 가린다). 다른 선택지는 `weak_or_strong`.
 
 ### 5.6 정준 행동 = 사람 손(MANO) + 리타게팅
 
@@ -216,7 +224,7 @@ pretrain 이 VTLA test 에피소드로 학습하거나, calibrator 가 baseline 
 | 논문 (REFERENCES.md 절) | robot_skin 이 가져온 것 | 코드 | robot_skin 과의 차이 |
 |---|---|---|---|
 | **VTLA** (Zhang et al., arXiv:2505.09577; §6) | vision + tactile + language → action 문제 정의와 이름, 삽입 과제, 선호 학습(DPO) | `vtla/`, `vtla/dpo.py`, `stages/vtla.py` | 행동을 토큰으로 분류하지 않고 연속 헤드(chunk 회귀 / flow matching)로 예측. 촉각 입력은 손 전체 기압 taxel 의 보정된 z·레벨을 pose 토큰으로 만들고 ContactGate 를 거친다. DPO 는 손실·우도 대용치만 있고 선호 쌍 수집은 스텁 |
-| **3D-ViTac** (Huang et al., arXiv:2410.24091; §4) | 촉각 값을 3D 공간 점으로 두어 공간 관계 보존 | `representation/tokenizer.py`, `representation/encoder.py` | 점구름 + diffusion policy 대신 taxel 하나를 `MLP(값) + MLP([Fourier(위치), 법선])` 토큰으로 만들고 transformer 로 인코딩. 손 프레임이라 글러브·로봇이 인코더를 공유 |
+| **3D-ViTac** (Huang et al., arXiv:2410.24091; §4) | 촉각 값을 3D 공간 점으로 두어 공간 관계 보존 | `representation/tokenizer.py`, `representation/encoder.py` | 점구름 + diffusion policy 대신 taxel 하나를 `MLP(값) + MLP([Fourier(위치), 법선])` 토큰으로 만들고 transformer 로 인코딩. 손 프레임이라 글러브·로봇이 인코더를 공유(배포 때 로봇 pose 를 학습 프레임인 MANO 손목 프레임으로 옮긴다: `transfer.RobotToManoTaxelFrame`) |
 | **ActionSense** (DelPreto et al., NeurIPS 2022 D&B; §1) | 웨어러블 다중 스트림 동시 기록: 스트림별 파일 + 매니페스트 + 이벤트 로그, 1인칭 `ego` + 고정 `third` 카메라 | `acquisition/` | 촉각 스킨 전용 프로토콜(D1 무접촉·self-touch 블록, D2 과제 카탈로그), 3-탭 싱크, 세션 QC 게이트를 더함 |
 | **OSMO** (Yin et al., arXiv:2512.08920; §1) | 사람과 로봇이 같은 촉각 표현을 쓰면 embodiment gap 이 준다; 사람 시연 → 로봇 기술 이전; wipe 과제 | `representation/`, `transfer/`, `action/retarget.py` | OSMO 는 3축(법선+전단) 센서, mk555 는 법선 1축. robot_skin 은 로봇 핸드에 다른 배치의 스킨이 붙는 경우를 pose 토큰과 `transfer.align_layouts` 로 다룬다 |
 | **ACT** (Zhao et al., arXiv:2304.13705; §5) | action chunking(H 스텝), temporal ensembling(w_i = exp(−k·i), i = 0 이 가장 오래된 예측), masked L1 | `action/chunking.py`, `vtla/heads.py` (`ChunkRegressionHead`), `control/runner.py` | 관측 → 청크를 한 번의 forward 로 결정적 회귀(학습 쿼리 H 개 + 디코더). 여러 해가 가능한 동작에는 flow head |
@@ -271,7 +279,7 @@ stage 별 `metrics.json` 키와 읽는 법은 [`TRAINING.md`](TRAINING.md) §12.
 | `q_source: hand_pose_imu` 온라인 경로 | IMU 자세로 학습한 baseline 을 온라인에서 쓰려면 IMU→자세 스트림이 필요한데 `CausalImuPoseStream` 이 없다(로봇 배포는 무관) | `CausalBaselineStream` 옆에 IMU 창 링버퍼 스트림 추가 |
 | `hand_mano` proprio 의 손목 | 손목 위치·회전은 카메라/월드 프레임 절대값이라 팔 없는 로봇에서는 관측 불가 | 손목 없는/상대 proprio 옵션 |
 | 로봇 스킨 stage 1 | 글러브로 학습한 stage-1 모델은 로봇 스킨에 맞지 않는다. deploy 는 시작 보정 + residual = ΔS 로 대신 | 로봇 D1(`robot_sweep`) 로 별도 baseline·contact 를 학습해 `stage1.*` 로 넘김 |
-| 파생 배열의 출처 | stage 간 연결이 episode 의 derived 배열이라, 어떤 모델이 썼는지 stage 가 검증하지 못한다(파이프라인이 순서·재실행으로 보장) | derived 옆에 출처 기록 |
+| 파생 배열의 출처 | stage 간 연결이 episode 의 derived 배열이라, 어떤 모델이 썼는지 stage 가 검증하지 못한다. 파이프라인이 순서·재실행 규칙과 run 지문(`pipeline.json` 의 `inputs`)으로 보장하지만, 같은 processed root 에 **다른 out_dir** 로 돈 단독 stage run 이 derived 를 덮어쓰는 것은 알아채지 못한다(TRAINING.md §3 주의) | derived 옆에 출처 기록 |
 | sim / RL | `TaxelDomainRandomizer` 만 구현. `TouchGridEnv`, `policy/train_rl.py` 는 스텁 | 물리 시뮬레이터 연동 |
 | MDF 비교 | 힘 정답이 없어 Yu et al. 과 같은 지표로 비교 불가 | 힘 센서 벤치 데이터 |
 

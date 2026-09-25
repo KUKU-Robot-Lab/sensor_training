@@ -8,7 +8,7 @@ semantics; also atomic on Windows/NTFS for same-volume replaces).
 
 File naming inside a run directory (``TrainConfig.out_dir``)::
 
-    ckpt_last.pt   latest state (resume point)       — find_last()
+    ckpt_last.pt   latest state (resume point)       — find_last() (else the newest other ckpt*.pt)
     ckpt_best.pt   best state by TrainConfig.monitor — find_best()
 
 Checkpoint dict keys written by :class:`robot_skin.train.engine.Trainer`: ``model, optimizer,
@@ -101,7 +101,9 @@ _STEP_RE = re.compile(r"(\d+)")
 
 
 def _candidates(out_dir: Path) -> Iterable[Path]:
-    for p in out_dir.glob("*.pt"):
+    """Trainer checkpoints only (``ckpt*.pt``): a run directory also holds the stage artefacts
+    (``policy_bundle.pt``, ``encoder_state.pt``, ``*_model.pt`` …), which are not resumable."""
+    for p in out_dir.glob("ckpt*.pt"):
         if p.name.startswith(".") or p.name == BEST_NAME:
             continue
         yield p
@@ -109,7 +111,8 @@ def _candidates(out_dir: Path) -> Iterable[Path]:
 
 def find_last(out_dir: str | Path) -> Path | None:
     """Resume point of a run directory: ``ckpt_last.pt`` if present, otherwise the most recent
-    other ``*.pt`` (by the largest number in its name, then mtime); ``None`` if nothing."""
+    other ``ckpt*.pt`` (by the largest number in its name, then mtime; ``ckpt_best.pt`` and stage
+    artefacts such as ``policy_bundle.pt`` never count); ``None`` if nothing."""
     out_dir = Path(out_dir)
     if not out_dir.is_dir():
         return None

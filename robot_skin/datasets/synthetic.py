@@ -1868,7 +1868,7 @@ def generate_session(out_dir: str | Path, *, kind: str = "glove", dataset: str =
                                             "note": "flat hand, palm down, during the 'calibration' segment"}
         t_h = _stream_times(_rng(seed, "clock", "hand_pose"), p.hand_pose_hz, D, p)
         go, fp, wp, conf = _hand_pose_stream(motion, t_h, _rng(seed, "hand_pose"), p)
-        save_hand_labels(out / "hand_pose.npz", t_h, go, fp, wp, conf)
+        save_hand_labels(out / "hand_pose.npz", t_h, go, fp, wp, conf, register=False)
         streams["hand_pose"] = StreamInfo("hand_pose.npz", p.hand_pose_hz,
                                           ["t", "global_orient", "finger_pose", "wrist_pos", "confidence"])
     else:

@@ -95,6 +95,44 @@ def test_stage_config_loading_hardware_and_validation(tmp_path):
                                                                                           "c": [3]}
 
 
+def test_train_key_typos_are_errors_in_every_stage():
+    """Regression: ``train`` is open in the stage DEFAULTS, so ``--set train.max_step=30`` only produced a
+    TrainConfig UserWarning and trained for the full budget; the docs promise that unknown keys are errors."""
+    from robot_skin.stages import pretrain as st_pre
+    from robot_skin.stages import vtla as st_vtla
+
+    for mod in (st_imu, st_baseline, st_contact, st_pre, st_vtla):
+        with pytest.raises(ValueError, match=r"unknown keys \['max_step'\] in section 'train'"):
+            mod.load_stage_config(overrides={"train": {"max_step": 30}})
+        with pytest.raises(ValueError, match="max_step"):
+            mod.resolve_config({"train": {"max_step": 30}})
+        assert mod.load_stage_config(overrides={"train": {"max_steps": 30}})["train"]["max_steps"] == 30
+
+
+def test_saved_config_reapplies_another_hardware_profile(tmp_path):
+    """Regression: a saved config (``<runs>/<stage>/pipeline_config.yaml``) carries ``hardware_applied: true``
+    and the old profile's train keys; loading it with ``--hardware rtx4090`` recorded ``hardware: rtx4090`` but
+    kept device=cpu / fp32 / compile false / the CPU batch sizes — a GPU run silently trained on the CPU."""
+    from robot_skin.stages import pretrain as st_pre
+    from robot_skin.stages import vtla as st_vtla
+
+    for mod in (st_baseline, st_pre, st_vtla):
+        saved = mod.load_stage_config(overrides={"hardware": "cpu", "train": {"lr": 0.5}})
+        p = tmp_path / f"{mod.STAGE}.yaml"
+        p.write_text(yaml.safe_dump(saved))
+        fresh = mod.load_stage_config(overrides={"hardware": "rtx4090"})
+        cfg = mod.load_stage_config(p, {"hardware": "rtx4090"})
+        keys = ("batch_size", "grad_accum", "precision", "compile", "device", "num_workers")
+        assert cfg["hardware"] == "rtx4090" and cfg["hardware_applied"] is True, mod.STAGE
+        assert {k: cfg["train"][k] for k in keys} == {k: fresh["train"][k] for k in keys}, mod.STAGE
+        assert cfg["train"]["lr"] == 0.5                                   # the saved non-profile values stay
+        again = mod.load_stage_config(p, {"hardware": "cpu", "train": {"batch_size": 3}})
+        assert again["train"]["batch_size"] == 3 and again["train"]["device"] == "cpu"
+        same = mod.load_stage_config(p, {"hardware": "cpu"})                # same profile: not re-applied
+        assert same["train"] == saved["train"]
+        assert mod.resolve_config(cfg)["train"]["device"] == "auto"         # run() does not re-apply it
+
+
 # ───────────────────────────────────────────────────────────── pipeline
 
 def test_imu_pose_stage(processed, pipeline):
@@ -162,6 +200,7 @@ def test_contact_stage_outputs_and_metrics(processed, pipeline):
               "val/hyst_recall", "val/prob_gt_auroc", "pseudo/n_contact", "pseudo/gt_recall", "calibrator"):
         assert k in m, k
     assert m["calibration_split"] == "val" and m["contact_prob_source"] == "detector"
+    assert set(m["no_contact_z_std"]) == {"train", "val"} and all(v > 0 for v in m["no_contact_z_std"].values())
     assert m["val/z_auroc"] > 0.9 and m["val/prob_auroc"] > 0.9
     assert m["val/prob_hallucination_taxel"] < 0.1
     assert m["pseudo/n_episodes"] == 1 and m["pseudo/n_contact"] > 0
@@ -282,6 +321,54 @@ def test_stage_runs_are_reproducible(processed, pipeline):
         m = st_baseline.run({**cfg, "out_dir": str(root / "runs" / f"repro{i}")})
         out.append((m["final_train_loss"], m["val/mae_resid"]))
     assert out[0] == out[1]
+
+
+def test_baseline_crossfit_writes_out_of_fold_train_residuals(processed, tmp_path):
+    """Regression (stacking leakage): the contact detector / pretraining learn from the train split's
+    residuals, i.e. the baseline's own training episodes. With cross-fitting those derived arrays come
+    from a fold model that never saw the episode; other episodes keep the shipped model's prediction."""
+    from pathlib import Path
+
+    from robot_skin.baseline import load_baseline_model, predict_episode
+    from robot_skin.baseline.temporal import TemporalBaselinePredictor
+    from robot_skin.train import Trainer
+
+    root, _ = processed
+    proc = tmp_path / "processed"
+    shutil.copytree(root / "processed", proc)             # the module's shared derived arrays stay untouched
+    runs = tmp_path / "runs"
+    m = st_baseline.run({"data": {"processed_root": str(proc), "val_frac": 0.0},
+                         "model": {"window": 16, "hidden": 16, "head_hidden": 16, "n_layers": 3},
+                         "crossfit": {"folds": 2}, "train": {**TRAIN, "max_steps": 30}, "out_dir": str(runs)})
+    cf = m["crossfit"]
+    assert cf["folds"] == 2 and cf["by"] == "episode" and sorted(map(len, cf["episodes"])) == [1, 1]
+    assert cf["out_of_fold"]["n_no_contact"] == cf["in_sample"]["n_no_contact"] > 0
+    model = load_baseline_model(m["model_path"])
+    assert model.bundle_meta["crossfit"]["folds"] == 2
+    fold_of = {Path(p).name: k for k, part in enumerate(cf["episodes"]) for p in part}
+    eps = {d.name: Episode.load(d) for d in list_episodes(proc)}
+    assert sorted(fold_of) == sorted(n for n, e in eps.items() if e.meta.dataset == "motion")
+    for name, ep in eps.items():
+        full, _ = predict_episode(model, ep)
+        pred = np.asarray(ep.derived(D_BASELINE_PRED))
+        np.testing.assert_allclose(ep.derived(D_RESIDUAL), np.asarray(ep["delta_pct"]) - pred, atol=1e-5)
+        if name in fold_of:                                  # out-of-fold: the model trained without it
+            fm = TemporalBaselinePredictor.from_config(model.config)
+            Trainer.load_model_weights(fm, runs / "crossfit" / f"fold{fold_of[name]}" / "ckpt_best.pt").eval()
+            np.testing.assert_allclose(pred, predict_episode(fm, ep)[0], atol=1e-5)
+            assert np.abs(pred - full).max() > 1e-3
+        else:                                                # D2 task episode: the shipped model
+            np.testing.assert_allclose(pred, full, atol=1e-5)
+    # one train group → skipped, noted (residuals stay in-sample)
+    m1 = st_baseline.run({"data": {"processed_root": str(proc), "val_frac": 0.5, "split_seed": 0},
+                          "model": {"window": 8, "hidden": 8, "head_hidden": 8, "n_layers": 2},
+                          "predict": {"write_derived": False},
+                          "train": {**TRAIN, "max_steps": 3, "warmup_steps": 0}, "out_dir": str(tmp_path / "runs1")})
+    assert m1["crossfit"]["folds"] == 0 and "write_derived" in m1["crossfit"]["note"]    # nothing to protect
+    m2 = st_baseline.run({"data": {"processed_root": str(proc), "val_frac": 0.5, "split_seed": 0},
+                          "model": {"window": 8, "hidden": 8, "head_hidden": 8, "n_layers": 2},
+                          "train": {**TRAIN, "max_steps": 3, "warmup_steps": 0}, "out_dir": str(tmp_path / "runs2")})
+    assert m2["crossfit"]["folds"] == 0 and "in-sample" in m2["crossfit"]["note"]            # one train episode
 
 
 def test_detection_metrics_hand_values():

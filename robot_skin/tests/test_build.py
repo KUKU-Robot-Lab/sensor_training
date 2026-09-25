@@ -1,7 +1,9 @@
 """datasets.build: raw synthetic sessions (datasets.synthetic) → Episodes, checked against the
 generator's ground truth (gt_synthetic.npz)."""
 import json
+import os
 import shutil
+from datetime import datetime, timezone
 
 import numpy as np
 import pytest
@@ -245,7 +247,8 @@ def test_glove_d2_taxel_poses_stay_in_the_hand_frame(tmp_path):
     g = load_ground_truth(sdir)
     pre = ep.meta.preprocessing
     assert pre["taxel_frame"] == "mano_wrist" and pre["taxel_pose_source"] == "hand_pose"
-    assert pre["version"] == B.PREPROCESS_VERSION == "robot_skin.datasets.build/2"
+    assert pre["version"] == B.PREPROCESS_VERSION
+    assert int(B.PREPROCESS_VERSION.rsplit("/", 1)[1]) >= 2                  # hand-frame taxel poses since build/2
     centroid = np.asarray(ep[E.K_TAXEL_POS], dtype=np.float64).mean(1)
     wrist = np.asarray(ep[E.K_HAND_WRIST], dtype=np.float64)
     assert np.ptp(wrist, axis=0).max() > 0.25                        # the hand moves through the room …
@@ -396,6 +399,37 @@ def test_imu_calibration_from_phase_when_manifest_lacks_it(tmp_path):
     assert info["calibration_source"] == "phase:imu_calibration" and info["quality"]["ok"]
     assert rel_err(ep) < 1.0
     assert "imu_offsets" not in SessionManifest.load(sdir).calibration          # raw session untouched
+
+
+def test_imu_vec_frame_world_is_calibrated_with_g_and_recorded(tmp_path):
+    """``imu.vec_frame: world`` (the raw gyro/acc are world-frame vectors): calibration applies the
+    world alignment G⁻¹ instead of the per-site mounting offsets, the choice is recorded, and the
+    IMU features refuse the other frame (it would mix frames)."""
+    from robot_skin.datasets.motion import episode_imu_features
+    from robot_skin.pose.imu_model import imu_calibration_from_dict
+
+    sdir = tmp_path / "s"
+    generate_session(sdir, kind="glove", dataset="motion", duration_s=2.5, seed=4, cameras=())
+    ep_s = B.preprocess_session(sdir, None)
+    ep_w = B.preprocess_session(sdir, None, {"imu": {"vec_frame": "world"}})
+    assert ep_s.meta.preprocessing["imu"]["vec_frame"] == "sensor"
+    assert ep_w.meta.preprocessing["imu"]["vec_frame"] == "world" and ep_w.meta.preprocessing["imu"]["calibrated"]
+    man = SessionManifest.load(sdir)
+    off, G = imu_calibration_from_dict(man.calibration, list(ep_s.meta.imu_sites))
+    R_off = quat_to_matrix(torch.as_tensor(off)).numpy()                        # [S,3,3]
+    RG = quat_to_matrix(torch.as_tensor(G)).numpy()
+    for k in (E.K_IMU_GYRO, E.K_IMU_ACC):
+        raw = np.einsum("sij,tsj->tsi", R_off, np.asarray(ep_s[k], np.float64))   # undo R_offᵀ (linear: commutes
+        np.testing.assert_allclose(np.asarray(ep_w[k]), raw @ RG, atol=2e-4)       # with resampling) → Gᵀ v
+    np.testing.assert_array_equal(np.asarray(ep_w[E.K_IMU_QUAT]), np.asarray(ep_s[E.K_IMU_QUAT]))
+    assert episode_imu_features(ep_w, vec_frame="world").shape[0] == ep_w.T
+    with pytest.raises(ValueError, match="vec_frame"):
+        episode_imu_features(ep_w)                                              # default sensor ≠ stored world
+    with pytest.raises(ValueError, match="vec_frame"):
+        episode_imu_features(ep_s, vec_frame="world")
+    episode_imu_features(ep_w, vec_frame="sensor", gyro=False, acc=False)       # orientation only: no vectors
+    with pytest.raises(ValueError, match="vec_frame"):
+        B.preprocess_session(sdir, None, {"imu": {"vec_frame": "body"}})
 
 
 def test_joint_velocity_modes():
@@ -553,3 +587,201 @@ def test_acquisition_fake_d2_session(tmp_path):
     assert (np.asarray(ep[E.K_CONTACT_LABEL])[ep.phase_mask("sync_start")] != 0).all()
     assert ep.meta.task["instruction"] == man.task["instruction"] and ep.meta.task["template"] == man.task["template"]
     assert np.isfinite(np.asarray(ep[E.K_DELTA])).all() and ep.has(E.K_HAND_VALID)
+
+
+# ───────────────────────────────────────────── review fixes (data dimension)
+
+def test_offline_hand_and_object_pose_files_not_in_the_manifest_are_used(tmp_path):
+    """Regression: a real recording's session.json has no hand_pose / object_pose stream (offline vision /
+    mocap products made later). A hand_pose.npz added to the session dir must still give q, hand-pose
+    validity, self-touch labels and hand-frame taxel poses, flag the episode stale, and the documented
+    save_hand_labels(<session_dir>) registers the stream."""
+    sdir = tmp_path / "raw" / "s"
+    generate_session(sdir, kind="glove", dataset="motion", duration_s=6.0, seed=13, cameras=())
+    hl = load_hand_labels(sdir)
+    m = SessionManifest.load(sdir)
+    m.streams.pop("hand_pose")                                  # what the real glove recorder writes
+    m.save(sdir)
+    (sdir / "hand_pose.npz").unlink()
+    out = tmp_path / "proc"
+    assert [r["status"] for r in B.build_all(sdir, out)] == ["built"]
+    labels = (hl["t"], hl["global_orient"], hl["finger_pose"], hl["wrist_pos"], hl["confidence"])
+    np.savez(sdir / "hand_pose.npz", **dict(zip(("t", "global_orient", "finger_pose", "wrist_pos", "confidence"),
+                                                 labels)))  # written by another tool (vision pass)
+    assert B.build_all(sdir, out)[0].get("stale")               # the raw file set changed
+    ep = B.preprocess_session(sdir, None)
+    pre = ep.meta.preprocessing
+    assert ep.has(E.K_Q) and ep.has(E.K_HAND_VALID) and ep.has(E.K_SELF_TOUCH)
+    assert pre["q_source"] == "hand_pose" and pre["taxel_pose_source"] == "hand_pose"
+    assert pre["contact_label"]["n_contact"] > 0
+    assert any("not registered" in n for n in pre["notes"]) and not any("no hand_pose" in n for n in pre["notes"])
+    # the documented call registers it in session.json (then no note)
+    save_hand_labels(sdir, *labels)
+    info = SessionManifest.load(sdir).streams["hand_pose"]
+    assert info.file == "hand_pose.npz" and "finger_pose[15,3]" in info.fields
+    ep2 = B.preprocess_session(sdir, None)
+    assert not any("not registered" in n for n in ep2.meta.preprocessing["notes"])
+    np.testing.assert_array_equal(ep2[E.K_Q], ep[E.K_Q])
+    # a recorder session keeps an unregistered file of an earlier take on overwrite: not used
+    m = SessionManifest.load(sdir)
+    m.streams.pop("hand_pose")
+    m.meta["recorder"] = {"started_utc": "2026-01-02T10:00:00+00:00"}
+    m.save(sdir)
+    old = datetime(2026, 1, 2, 9, 0, tzinfo=timezone.utc).timestamp()       # labels of the earlier take
+    os.utime(sdir / "hand_pose.npz", (old, old))
+    e_old = B.preprocess_session(sdir, None)
+    assert not e_old.has(E.K_Q) and any("predates the recording" in n for n in e_old.meta.preprocessing["notes"])
+    # object_pose.npz (D2, offline tracker) likewise
+    tdir = tmp_path / "task"
+    generate_session(tdir, kind="glove", dataset="task", duration_s=4.0, seed=2, cameras=(), task_id="pour")
+    m = SessionManifest.load(tdir)
+    m.streams.pop("object_pose")
+    m.save(tdir)
+    et = B.preprocess_session(tdir, None, {"baseline": {"duration_s": 0.2}})
+    assert et.has(E.K_OBJECT_POS) and et.has(E.K_OBJECT_QUAT)
+    np.testing.assert_allclose(et[E.K_OBJECT_POS], _gt_at(load_ground_truth(tdir), "object_pos", et.t), atol=0.01)
+
+
+def test_joint_state_names_that_miss_the_urdf(robot_motion, tmp_path):
+    """Regression: driver joint names that match none of the URDF joints (a namespace prefix) made q ≡ 0
+    silently; a partial mismatch is recorded (notes + zero_filled_joints)."""
+    sdir = tmp_path / "s"
+    shutil.copytree(robot_motion[0], sdir)
+    js = dict(np.load(sdir / "joint_state.npz"))
+    names = [str(n) for n in js["names"]]
+    np.savez(sdir / "joint_state.npz", **{**js, "names": np.array(["rh_" + n for n in names])})
+    with pytest.raises(ValueError, match="match none of the URDF"):
+        B.preprocess_session(sdir, None, {"baseline": {"duration_s": 0.3}})
+    part = ["rh_" + n if i in (0, 3) else n for i, n in enumerate(names)]
+    np.savez(sdir / "joint_state.npz", **{**js, "names": np.array(part)})
+    ep = B.preprocess_session(sdir, None, {"baseline": {"duration_s": 0.3}})
+    pre = ep.meta.preprocessing
+    assert sorted(pre["zero_filled_joints"]) == sorted([names[0], names[3]])
+    assert any(f"lacks 2/{len(names)} URDF joints" in n for n in pre["notes"])
+    q = np.asarray(ep[E.K_Q])
+    for j in pre["zero_filled_joints"]:
+        assert (q[:, ep.meta.joint_names.index(j)] == 0).all()
+    assert np.abs(q).max() > 0.1
+
+
+def test_stream_gaps_and_uncovered_frames_are_not_measurements(tmp_path):
+    """Regression: a pressure sample gap was bridged by interpolation and used as no-contact data; joint
+    samples missing before the joint stream starts (clock.span: pressure) or inside a gap were edge-held /
+    bridged yet counted as measured q / qd."""
+    from robot_skin.datasets.motion import BaselineWindowDataset, _window_all
+    from robot_skin.datasets.stats import default_mask, q_valid_mask, qd_valid_mask
+
+    sdir = tmp_path / "s"
+    generate_session(sdir, kind="robot", dataset="motion", duration_s=4.0, seed=5, cameras=())
+    z = dict(np.load(sdir / "pressure.npz"))
+    keep = ~((z["t"] > 2.0) & (z["t"] < 2.3))                           # 0.3 s of dropped pressure samples
+    np.savez(sdir / "pressure.npz", t=z["t"][keep], raw=z["raw"][keep])
+    js = dict(np.load(sdir / "joint_state.npz"))
+    keep = (js["t"] >= 1.0) & ~((js["t"] > 2.6) & (js["t"] < 2.9))     # starts late + a gap
+    np.savez(sdir / "joint_state.npz", **{k: (v[keep] if v.shape[:1] == js["t"].shape else v) for k, v in js.items()})
+    ep = B.preprocess_session(sdir, None, {"clock": {"span": "pressure"}, "baseline": {"duration_s": 0.3}})
+    t, pre = ep.t, ep.meta.preprocessing
+    sat = np.asarray(ep[E.K_SATURATED])
+    assert sat[(t > 2.01) & (t < 2.29)].all() and not sat[(t > 2.4) & (t < 2.5)].all()
+    jv = np.asarray(ep[E.K_JOINT_VALID])
+    assert not jv[t < 0.99].any() and not jv[(t > 2.61) & (t < 2.89)].any() and jv[(t > 1.1) & (t < 2.5)].all()
+    assert pre["invalid_frames"]["pressure"] > 0 and pre["invalid_frames"]["joint_state"] == int((~jv).sum())
+    assert any("outside its time span" in n for n in pre["notes"]) and any("sample gaps" in n for n in pre["notes"])
+    np.testing.assert_array_equal(q_valid_mask(ep), jv)
+    qdv = qd_valid_mask(ep)
+    assert not (qdv & ~jv).any() and not qdv[(t >= 1.0) & (t < 1.02)].any()      # eroded by the qd filter
+    np.testing.assert_array_equal(default_mask(ep, E.K_Q), jv)
+    ds = BaselineWindowDataset([ep], window=16, stride=1)
+    ti = ds.index[:, 1]
+    assert _window_all(qdv, 16)[ti].all() and not (sat[ti].all(1)).any()
+    assert not np.isin(ti, np.flatnonzero((t > 2.01) & (t < 2.29))).any()    # no target from the bridged ramp
+
+
+def test_imu_gap_marks_imu_valid_and_imu_windows_skip_it(tmp_path):
+    from robot_skin.datasets.motion import ImuPoseWindowDataset
+    from robot_skin.datasets.stats import IMU_FEATURES, default_mask
+
+    sdir = tmp_path / "s"
+    generate_session(sdir, kind="glove", dataset="motion", duration_s=3.0, seed=1, cameras=())
+    ref = B.preprocess_session(sdir, None)
+    assert np.asarray(ref[E.K_IMU_VALID]).all() and ref.meta.preprocessing["invalid_frames"]["imu"] == 0
+    z = dict(np.load(sdir / "imu.npz"))
+    keep = ~((z["t"] > 1.5) & (z["t"] < 1.8))
+    np.savez(sdir / "imu.npz", **{k: (v[keep] if v.shape[:1] == z["t"].shape else v) for k, v in z.items()})
+    ep = B.preprocess_session(sdir, None)
+    t, iv = ep.t, np.asarray(ep[E.K_IMU_VALID])
+    assert not iv[(t > 1.52) & (t < 1.78)].any() and iv[(t < 1.4) | (t > 1.9)].all()
+    np.testing.assert_array_equal(default_mask(ep, IMU_FEATURES), iv)
+    W = 16
+    n_ref = len(ImuPoseWindowDataset([ref], window=W))
+    ds = ImuPoseWindowDataset([ep], window=W)
+    ti = ds.index[:, 1]
+    bad = np.flatnonzero(~iv)
+    assert len(ds) < n_ref and not np.isin(ti, np.concatenate([bad + k for k in range(W)])).any()
+
+
+def test_build_all_skips_qc_failed_sessions_by_default(tmp_path, capsys):
+    """Regression: DATA_ACQUISITION §10 keeps FAIL sessions in place and re-records into a new dir; the
+    default build must not put the failed take into the dataset next to its re-take."""
+    raw, out = tmp_path / "raw", tmp_path / "proc"
+    generate_session(raw / "a", kind="robot", dataset="motion", duration_s=2.5, seed=1, cameras=(), session_id="a")
+    (raw / "a" / "qc.json").write_text(json.dumps({"passed": False}))
+    assert B.load_preprocess_config()["qc"]["skip_failed"] is True
+    assert [r["status"] for r in B.build_all(raw, out)] == ["qc_failed"] and not E.list_episodes(out)
+    assert B.main(["--raw", str(raw), "--out", str(out), "-q", "--set", "qc.skip_failed=false"]) == 0
+    assert [p.name for p in E.list_episodes(out)] == ["a"]
+
+
+def test_fingerprint_sees_timestamps_and_events_rewritten_in_place(tmp_path):
+    """Regression: the source fingerprint hashed only file sizes, so re-applied clock models (same sizes)
+    or an edited event time left an old episode reported as up to date."""
+    from robot_skin.acquisition.sync import ClockModel, apply_clock_models
+
+    sdir, out = tmp_path / "raw" / "s", tmp_path / "proc"
+    generate_session(sdir, kind="robot", dataset="motion", duration_s=2.5, seed=1, cameras=("ego",), session_id="s")
+    cfg = {"cameras": {"copy_frames": "none"}}
+    apply_clock_models(sdir, {"camera_ego": ClockModel(1.0, -0.02), "joint_state": ClockModel(1.0, 0.001)})
+    assert [r["status"] for r in B.build_all(sdir, out, cfg)] == ["built"]
+    assert not B.build_all(sdir, out, cfg)[0].get("stale")
+    sizes = {p.name: p.stat().st_size for p in sdir.rglob("*") if p.is_file()}
+    apply_clock_models(sdir, {"camera_ego": ClockModel(1.0, -0.05), "joint_state": ClockModel(1.0, 0.002)})
+    assert {p.name: p.stat().st_size for p in sdir.rglob("*") if p.is_file()} == sizes     # same sizes
+    assert B.build_all(sdir, out, cfg)[0].get("stale")
+    assert [r["status"] for r in B.build_all(sdir, out, cfg, force=True)] == ["built"]
+    ev = (sdir / "events.jsonl").read_text()
+    lines = ev.splitlines(keepends=True)
+    k = max(n for n, ln in enumerate(lines) if json.loads(ln)["type"] == "phase_end")   # last block's end
+    old = json.dumps(json.loads(lines[k])["t"])
+    dec = len(old.split(".")[1]) if "." in old else 0
+    new = f"{float(old) - 0.1:.{dec}f}"                                               # operator boundary fix
+    assert len(new) == len(old) and new != old
+    lines[k] = lines[k].replace(f'"t": {old}', f'"t": {new}', 1)
+    (sdir / "events.jsonl").write_text("".join(lines))
+    assert len((sdir / "events.jsonl").read_text()) == len(ev)                            # same size
+    assert B.build_all(sdir, out, cfg)[0].get("stale")
+
+
+def test_imu_offsets_without_site_names_follow_the_imu_file_order(tmp_path):
+    """Regression: DATA_FORMAT §1.8 stores imu_offsets in IMU (file) site order; without imu_sites they
+    were applied to the layout-ordered columns — wrong mounting corrections when imu.npz is not in layout
+    order."""
+    sdir = tmp_path / "s"
+    generate_session(sdir, kind="glove", dataset="motion", duration_s=2.5, seed=9, cameras=())
+    ref = B.preprocess_session(sdir, None)
+    perm = [6, 5, 4, 3, 2, 1, 0]                                           # board enumerates in reverse
+    z = dict(np.load(sdir / "imu.npz"))
+    for k in ("quat", "gyro", "acc"):
+        z[k] = z[k][:, perm]
+    z["sites"] = z["sites"][perm]
+    np.savez(sdir / "imu.npz", **z)
+    m = SessionManifest.load(sdir)
+    c = m.calibration
+    c["imu_offsets"] = [c["imu_offsets"][c["imu_sites"].index(str(s))] for s in z["sites"]]   # file order
+    del c["imu_sites"]
+    m.save(sdir)
+    ep = B.preprocess_session(sdir, None)
+    assert ep.meta.imu_sites == ref.meta.imu_sites and ep.meta.preprocessing["imu"]["calibrated"]
+    a, b = np.asarray(ref[E.K_IMU_QUAT], np.float64), np.asarray(ep[E.K_IMU_QUAT], np.float64)
+    assert np.degrees(2 * np.arccos(np.clip(np.abs((a * b).sum(-1)), 0, 1))).max() < 0.1   # float32 noise (was ≤ 20°)
+    np.testing.assert_allclose(ep[E.K_IMU_GYRO], ref[E.K_IMU_GYRO], atol=1e-5)
+    assert any("imu.npz site order" in n for n in ep.meta.preprocessing["notes"])

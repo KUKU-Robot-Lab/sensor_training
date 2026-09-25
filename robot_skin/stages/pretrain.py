@@ -4,7 +4,10 @@ Pipeline position: after ``contact`` (which writes the derived ``residual_z`` / 
 of every processed episode), before ``vtla`` (which may initialise — and optionally freeze — its
 tactile branch from the encoder saved here). Self-supervised: uses every D1 motion + D2 task
 episode with those derived arrays, no labels. Method: MAE (He et al., CVPR 2022,
-arXiv:2111.06377); see :mod:`robot_skin.representation.pretrain`.
+arXiv:2111.06377); see :mod:`robot_skin.representation.pretrain`. The D1 train episodes are the
+baseline's own training data: their ``residual_z`` is out-of-fold when the baseline stage
+cross-fits (``crossfit.folds`` ≥ 2, default), so the encoder sees the residual statistics of unseen
+data, as at deployment.
 
 ``run(cfg) -> metrics`` (config: ``robot_skin/configs/stages/pretrain.yaml``; missing keys fall
 back to :data:`DEFAULTS`):
@@ -156,12 +159,16 @@ def apply_hardware(cfg: Mapping[str, Any]) -> dict:
 def load_stage_config(path: str | Path | None = None,
                       overrides: Mapping[str, Any] | None = None) -> dict:
     """:data:`DEFAULTS` ⊕ YAML (default ``configs/stages/pretrain.yaml``) ⊕ hardware profile ⊕
-    ``overrides``.
+    ``overrides``; unknown keys raise ``ValueError`` (:func:`robot_skin.stages.check_stage_keys`).
 
     The profile (``hardware`` from the YAML or the overrides) is applied *before* the other
     overrides, so e.g. ``--set train.batch_size=32`` beats the profile's ``suggest.pretrain``;
-    the result has ``hardware_applied: true`` and :func:`run` does not re-apply it.
+    the result has ``hardware_applied: true`` and :func:`run` does not re-apply it (a ``hardware``
+    override naming another profile than a saved config already applied re-applies it —
+    :func:`robot_skin.stages.hardware_overrides`).
     """
+    from . import check_stage_keys, check_train_keys, hardware_overrides
+
     p = Path(path) if path is not None else CONFIG_PATH
     if p.is_file():
         cfg = deep_merge(DEFAULTS, yaml.safe_load(p.read_text()) or {})
@@ -169,15 +176,23 @@ def load_stage_config(path: str | Path | None = None,
         raise FileNotFoundError(f"stage config not found: {p}")
     else:
         cfg = copy.deepcopy(DEFAULTS)
-    ov = dict(overrides or {})
-    hw_keys = {k: ov.pop(k) for k in ("hardware", "hardware_applied") if k in ov}
+    hw_keys, ov = hardware_overrides(cfg, overrides)
     cfg = apply_hardware(deep_merge(cfg, hw_keys))
-    return deep_merge(cfg, ov)
+    cfg = deep_merge(cfg, ov)
+    check_stage_keys(cfg, DEFAULTS, STAGE)
+    check_train_keys(cfg, STAGE)
+    return cfg
 
 
 def resolve_config(cfg: Mapping[str, Any] | None) -> dict:
-    """Merge ``cfg`` over :data:`DEFAULTS`, apply the hardware profile once, fix ``out_dir``."""
-    out = apply_hardware(deep_merge(DEFAULTS, cfg or {}))
+    """Merge ``cfg`` over :data:`DEFAULTS`, validate keys, apply the hardware profile once, fix
+    ``out_dir``."""
+    from . import check_stage_keys, check_train_keys
+
+    out = deep_merge(DEFAULTS, cfg or {})
+    check_stage_keys(out, DEFAULTS, STAGE)
+    check_train_keys(out, STAGE)
+    out = apply_hardware(out)
     out_dir = out.get("out_dir") or out["train"].get("out_dir") or DEFAULTS["train"]["out_dir"]
     out["out_dir"] = str(out_dir)
     out["train"]["out_dir"] = str(out_dir)
@@ -338,11 +353,13 @@ def _finite(obj: Any) -> Any:
 def run(cfg: Mapping[str, Any] | None = None) -> dict:
     """Train the masked-taxel pretrainer; returns (and writes) the metrics dict."""
     from ..train import TrainConfig, Trainer, barrier
-    from ..train.checkpoint import BEST_NAME
+
+    from . import data_provenance
 
     cfg = resolve_config(cfg)
     out_dir = Path(cfg["out_dir"])
     d_cfg, p_cfg = cfg["data"], dict(cfg["pretrain"])
+    provenance = data_provenance(d_cfg)            # the splits file / processed root this run trains on
     spec = TactileFeatureSpec.from_dict(cfg["features"])
     if spec.dim < 1:
         raise ValueError("features.obs_mode 'none' has no tactile values to pretrain on")
@@ -374,6 +391,9 @@ def run(cfg: Mapping[str, Any] | None = None) -> dict:
     weights = _class_weights(p_cfg.pop("level_class_weights", "balanced"), train_ds, p_cfg)
     p_cfg.pop("class_weight_power", None)
     p_cfg.pop("class_weight_max", None)
+    from . import seed_model_init
+
+    seed_model_init(cfg["train"])                 # reproducible initial weights (train.seed)
     encoder = TaxelEncoder(spec.dim, **cfg["model"], feature_spec=spec)
     model = MaskedTaxelPretrainer(encoder, spec.dim, level_class_weights=weights, **p_cfg)
 
@@ -392,6 +412,7 @@ def run(cfg: Mapping[str, Any] | None = None) -> dict:
         "stage": STAGE,
         "out_dir": str(out_dir),
         "encoder_path": str(out_dir / ENCODER_STATE_NAME),
+        "data_provenance": provenance,
         "n_episodes": {"found": len(dirs), "train": len(split["train"]), "val": len(split["val"]),
                        "skipped": len(skipped)},
         "n_samples": {"train": len(train_ds), "val": len(val_ds) if val_ds is not None else 0},
@@ -405,11 +426,9 @@ def run(cfg: Mapping[str, Any] | None = None) -> dict:
     }
     if trainer.dist.is_main:
         # export the best checkpoint's weights (EMA when enabled), not the last step's
-        best = out_dir / BEST_NAME
-        if best.is_file():
-            Trainer.load_model_weights(model, best, use_ema=True)
-        elif trainer.ema is not None:
-            trainer.ema.apply_to(model)
+        from . import restore_best_weights
+
+        restore_best_weights(trainer, model)
         e_cfg = cfg.get("eval") or {}
         eval_ds, prefix = (val_ds, "val/") if val_ds is not None else (train_ds, "train_eval/")
         res = evaluate_reconstruction(model, eval_ds, batch_size=int(e_cfg.get("batch_size", 512)),

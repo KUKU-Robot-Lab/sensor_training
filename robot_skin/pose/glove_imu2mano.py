@@ -113,8 +113,12 @@ class GloveImu2ManoPoseProvider:
             offsets = np.tile([1.0, 0.0, 0.0, 0.0], (q.shape[1], 1))
         if offsets is not None:
             q = apply_imu_offsets(q, offsets, world=world)
-            gyro = None if gyro is None else apply_imu_offsets_to_vectors(np.asarray(gyro, dtype=np.float64), offsets)
-            acc = None if acc is None else apply_imu_offsets_to_vectors(np.asarray(acc, dtype=np.float64), offsets)
+            # world-frame vectors (vec_frame="world") take G⁻¹, not the per-site mounting offsets
+            vkw = {"vec_frame": vec_frame, "world": world}
+            gyro = None if gyro is None else apply_imu_offsets_to_vectors(np.asarray(gyro, dtype=np.float64), offsets,
+                                                                          **vkw)
+            acc = None if acc is None else apply_imu_offsets_to_vectors(np.asarray(acc, dtype=np.float64), offsets,
+                                                                        **vkw)
         pred = predict_finger_pose_sequence(model, q, gyro, acc, window=window, wrist_index=wi,
                                             vec_frame=vec_frame, batch_size=batch_size, device=device)
         self.finger_pose = pred["finger_pose"].astype(np.float64)

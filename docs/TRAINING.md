@@ -38,7 +38,8 @@ python -m robot_skin preprocess --raw <dir> --out <dir> --force   # 다른 경�
 
 전처리 설정은 `robot_skin/configs/stages/preprocess.yaml` (`--set KEY=V` 로 덮어쓰기, 모르는 키는 오류). 이미 만든
 episode 는 건너뛰고, 설정·버전·raw 파일 구성이 바뀌었으면 `stale` 로 보고한다. `--force` 는 episode 의 `derived/`
-(stage 1 결과)까지 지운다 — 그 뒤에는 stage 1 부터 다시 돌려야 한다.
+(stage 1 결과)까지 지운다 — 그 뒤에는 stage 1 부터 다시 돌려야 한다. 수집 QC 에 실패한 세션(`qc.json` 의
+`passed: false`)은 기본으로 건너뛰고 `qc_failed` 로 보고한다(`--set qc.skip_failed=false` 로 포함).
 
 ### 1.3 하드웨어 없이 전체 경로 확인 (합성 데이터)
 
@@ -76,8 +77,8 @@ python -m robot_skin deploy --set bundle=$R/runs/vtla --set duration_s=2 --set o
 
 | 파일 | 내용 |
 |---|---|
-| `robot_skin/configs/default.yaml` | 최상위 기본값만: `paths`(raw / processed / runs / synthetic 루트), 기본 `hardware`, stage → 설정 파일 매핑(`stages:`), `pipeline.stages`·`pipeline.splits`, `synthetic` |
-| `robot_skin/configs/stages/<stage>.yaml` | 각 stage 의 모든 키(= 모듈의 `DEFAULTS`, 테스트로 동기화). **모르는 키는 오류** — 오타가 조용히 무시되지 않는다 |
+| `robot_skin/configs/default.yaml` | 최상위 기본값만: `paths`(raw / processed / runs / synthetic 루트), 기본 `hardware`, stage → 설정 파일 매핑(`stages:`, 파일 이름만 쓰면 항상 `configs/stages/<이름>` — 작업 디렉터리의 같은 이름 파일이 아니다), `pipeline.stages`·`pipeline.splits`, `synthetic`. 모르는 키는 오류 |
+| `robot_skin/configs/stages/<stage>.yaml` | 각 stage 의 모든 키(= 모듈의 `DEFAULTS`, 테스트로 동기화). **모르는 키는 오류** — 오타가 조용히 무시되지 않는다(`train:` 은 `TrainConfig` 필드면 무엇이든 받고, 그 밖의 키는 오류: `--set train.max_step=30` 은 학습 전에 멈춘다) |
 | `robot_skin/configs/hardware/<name>.yaml` | 장치·정밀도·compile·worker 수, stage 별 배치 제안(`suggest.<stage>`), 환경 변수(`env`) |
 
 적용 순서(뒤가 이긴다): **stage YAML `train:` < 프로파일 `suggest.<stage>` < 프로파일 `train:` < `--set`**.
@@ -85,10 +86,21 @@ python -m robot_skin deploy --set bundle=$R/runs/vtla --set duration_s=2 --set o
 `--set train.lr_mult='{vision_encoder: 0.1}'`. 어떤 프로파일을 쓰나: `train` 은 `--hardware` > `--set hardware=…` >
 `default.yaml` `hardware` > stage YAML `hardware`. `pipeline` 은 `--set [<stage>.]hardware=…` > `--hardware` >
 `default.yaml` `hardware` 라서 stage 마다 다른 프로파일을 줄 수 있다(예: `--hardware rtx4090 --set
-vtla.hardware=rtx5090`). 프로파일의 `env`(예: `PYTORCH_CUDA_ALLOC_CONF`)는 첫 CUDA 호출 전에 export 된다.
+vtla.hardware=rtx5090`). 프로파일의 `env`(예: `PYTORCH_CUDA_ALLOC_CONF`)는 첫 CUDA 호출 전에 export 된다 —
+`pipeline` 은 선택된 **모든** stage 의 프로파일 `env` 를 첫 stage 전(분산 초기화 전)에 한 번에 export 한다. CUDA
+할당자·NCCL 변수는 한 프로세스 안에서 stage 마다 바꿀 수 없으므로 두 stage 의 프로파일이 같은 변수에 다른 값을 주면
+오류로 멈춘다(셸에서 직접 export 한 값은 항상 이긴다 — 그렇게 풀거나 stage 를 따로 실행). stage 별 실제 값은
+`pipeline.json` 의 `env` 에 남는다. 저장된 설정(예: `<out>/<stage>/pipeline_config.yaml`, `hardware_applied: true`)을
+`--config` 로 다시 쓰면서 **다른** 프로파일을 주면 그 프로파일을 저장된 값 위에 다시 적용한다(같은 프로파일이면 저장된
+값을 그대로 쓴다).
 
 `train <stage>` 의 데이터·출력 경로는 **stage YAML 기준**이다(기본 `data.processed_root: robot_skin/data/processed`,
 `train.out_dir: robot_skin/runs/<stage>`) — `default.yaml` `paths` 를 읽지 않는다. 다른 경로는 `--set` 으로 준다.
+나머지 명령은 `default.yaml` `paths` 를 쓴다: `record`(`--root` 가 없으면 `raw_root`, `--fake` 는 `synthetic_root`),
+`preprocess`(`--raw`/`--out` 이 없고 preprocess 설정도 `raw_root`/`out_root` 를 바꾸지 않았으면 `raw_root` →
+`processed_root`), `synth`(`synthetic_root`), `splits`·`pipeline`(`processed_root`, `runs_root`). 기본 `train.out_dir` 은
+파이프라인의 `<runs_root>/<stage>` 와 같은 디렉터리라, 단독 `train` 은 파이프라인 결과를 덮어쓴다 — 항상
+`--set data.splits=<runs>/splits.json` 을 주고(§4), 아니면 `--set out_dir=…` 로 다른 곳에 쓴다.
 
 ---
 
@@ -103,20 +115,41 @@ python -m robot_skin pipeline --stages vtla --force       # 한 stage 만 다시
 - **splits**: `<out>/splits.json` 을 처음 한 번 만든다(`datasets.splits.make_splits`, 기본 subject 단위, val 0.15 /
   test 0.15, `default.yaml` `pipeline.splits`; `--split-by`, `--val-frac`, `--test-frac`, `--split-seed` 로 변경).
   경로는 processed root 기준 상대 경로라 데이터를 옮겨도 쓸 수 있다. 같은 파일이 **모든 stage 의 `data.splits`** 로
-  들어간다. 기존 파일을 쓰려면 `--splits <file>`, 다시 나누려면 파일을 지우고 `--force`.
+  들어간다. 기존 파일을 쓰려면 `--splits <file>`, 다시 나누려면 파일을 지우고 `--force`. split 옵션은 파일을 **만들 때만**
+  쓰인다 — 이미 있는 파일(또는 `--splits` 파일)의 `meta` 와 다른 `--split-by`/`--val-frac`/`--test-frac`/`--split-seed`
+  를 주면 조용히 무시하지 않고 오류로 멈춘다.
 - **순서와 연결**: imu_pose → baseline → contact → pretrain → vtla (`--stages` 로 부분집합; 순서는 항상 이대로).
   각 stage 는 `out_dir = <out>/<stage>`, `data.processed_root = --processed` 로 돈다. baseline → contact,
   contact → pretrain/vtla 는 episode 의 derived 배열로 이어지고, vtla 에는 `tactile.calibrator`
   (`<out>/contact/calibrator.json`), `tactile.baseline_model`, `tactile.pretrained`(`<out>/pretrain/encoder_state.pt`),
   `data.tactile_source: derived` 가 자동으로 들어간다(부트스트랩 촉각 대체 경로를 쓰지 않는다).
+  `--stages` 없이(기본 목록) 돌 때 IMU 와 손 라벨이 있는 episode 가 하나도 없으면(로봇 세션, `--no-imu` 글러브) imu_pose 는
+  경고와 함께 `no_data` 로 건너뛴다 — 뒤 stage 는 기본 `data.q_source: q` 라 필요 없다. `q_source: hand_pose_imu` 를 쓰는
+  stage 가 있거나 `--stages imu_pose` 로 직접 고르면 건너뛰지 않는다(데이터가 없으면 imu_pose 가 오류로 멈춘다).
 - **`--set` 라우팅**: `--set KEY=V` 는 그 키를 가진 선택된 stage **모두**에, `--set <stage>.KEY=V` 는 그 stage
   에만 간다(stage 지정이 이긴다). 어느 stage 에도 없는 키는 오류.
 - **`--config`**: `STAGE=YAML` 또는 `<stage>.yaml` 파일들이 있는 디렉터리(반복 가능).
-- **재개**: `metrics.json` 과 주 산출물이 있고, 같은 processed root 와 같은 splits.json(sha256)으로 학습됐고, 그
-  stage 의 derived 배열이 episode 에 남아 있으면 건너뛴다. 한 stage 가 다시 돌면 뒤 stage 도 모두 다시 돈다.
+- **재개**: `metrics.json` 과 주 산출물이 있고, 같은 processed root 와 같은 splits.json(sha256)으로 학습됐고(파이프라인
+  기록과 stage 가 `metrics.json` 에 남기는 `data_provenance` 가 모두 맞아야 한다), 그 stage 의 derived 배열이 episode 에
+  남아 있으면 건너뛴다. **한 stage 가 다시 돌면 뒤 stage 도 모두 다시 돈다 — 실행(invocation)을 넘어서도**: 각 stage 의
+  기록은 소비한 앞 stage run 의 지문(`inputs`: `metrics.json` + 주 산출물의 sha256)을 남기고, 다음 실행에서 앞 stage 의
+  현재 지문과 다르면 다시 학습한다. 그래서 `pipeline --stages baseline --force` 뒤의 `pipeline` 은 contact·pretrain·vtla
+  를 다시 돌린다(그 사이에 번들의 `tactile.baseline_model` 은 새 모델, 내장 보정기는 옛 residual 에 맞춘 것이 된다).
+  파이프라인 디렉터리에 다른 run 이 쓴 결과(예: `data.splits` 없이 돈 단독 `train baseline`)는 `data_provenance` 가
+  파이프라인의 splits/processed root 와 다르면 다시 학습하고, 같으면 그대로 쓰되 뒤 stage 를 다시 돌린다.
   `--force` 는 선택된 stage 를 모두 다시 돌린다. 설정만 바꿔서는 재실행되지 않는다 — `--force` 를 준다.
-- **기록**: `<out>/<stage>/pipeline_config.yaml`(실제로 쓴 설정 전체), `<out>/pipeline.json`(상태, splits 경로·
-  sha256, upstream stage, 자동 연결된 키, 소요 시간). 기록 안의 경로는 절대 경로다 — processed root 경로가 다른
+  `--set train.resume=auto` 는 **중단된 시도**를 같은 데이터(같은 splits sha256·processed root·앞 stage run —
+  `<out>/<stage>/pipeline_attempt.json`)로 이어 갈 때만 쓰인다. 끝난 stage 를 다시 학습하거나(`--force`, splits·
+  processed root 변경, derived 소실, 앞 stage 재학습) 앞 stage 가 이번 실행에서 다시 돌았으면 경고하고 처음부터
+  학습한다 — 예전 run 의 체크포인트를 "이어서" 하면 한 step 도 돌지 않고 옛 split 으로 학습된 모델이 새 결과로
+  기록되기 때문이다.
+- **요약 출력**: 이번 실행에서 고른 stage 의 상태(`ran`/`skipped`/`no_data`)만 보이고, 고르지 않은 stage 는
+  `not selected` 로 — 앞 stage 가 바뀌어 낡았으면 `OUT OF DATE (…)` 로 — 표시한다(다음 `pipeline` 이 다시 학습한다).
+  `--stages vtla` 처럼 뒤 stage 만 고를 때 소비하는 stage 가 낡았으면 경고한다.
+- **기록**: `<out>/<stage>/pipeline_config.yaml`(실제로 쓴 설정 전체 — `out_dir`·`train.out_dir` 모두 실제 경로),
+  `<out>/<stage>/pipeline_attempt.json`(시작한 시도의 splits sha256·processed root·앞 stage 지문), `<out>/pipeline.json`
+  (상태, splits 경로·sha256, upstream stage, 소비한 앞 stage 지문 `inputs`, 자기 지문 `fingerprint`, 자동 연결된 키,
+  프로파일 `env`, 소요 시간, `last_invocation`). 기록 안의 경로는 절대 경로다 — processed root 경로가 다른
   머신에서 같은 runs 디렉터리로 재개하면 "다른 processed root" 로 보고 다시 학습한다.
 
 주의 — **processed root 하나에는 stage-1 결과 한 벌**: stage 1 은 예측을 episode 의 `derived/` 에 쓴다. 같은
@@ -129,6 +162,8 @@ root 를 복사해서 하거나, 스윕처럼 결과만 필요하면 `predict.wr
 
 모든 stage 는 `run(cfg) -> metrics` 이고, `<out_dir>/metrics.json`(엄격한 JSON)과 학습 run 파일(`config.json`,
 `env.json`, `metrics.jsonl`, `history.json`, `ckpt_last.pt`, `ckpt_best.pt`, 끝나면 `summary.json`)을 쓴다.
+재개가 아닌 새 run 이 이전 run 의 파일이 있는 `out_dir` 에서 시작하면 그 파일들(`ckpt_*.pt`, `metrics.jsonl`,
+`history.json`)을 `previous/` 로 옮긴다 — 다른 run 의 `ckpt_best.pt` 가 이번 모델로 내보내지지 않게.
 단독 실행에서는 항상 파이프라인과 같은 `splits.json` 을 준다 — 없으면 stage 마다 따로 나누고 경고한다.
 
 ```bash
@@ -160,12 +195,22 @@ python -m robot_skin train vtla     --hardware rtx5090 --set data.splits=$S --se
 - 모델: `baseline.TemporalBaselinePredictor` (인과 TCN, 창 32, 평균 + log 분산). **관측 ΔS 는 입력이 아니다.**
 - 산출물: `baseline_model.pt`(정규화 버퍼·`bundle_meta.qd` 포함, 온라인 재현용), `joint_stats.json`; 모든
   `predict_datasets` episode 에 derived `baseline_pred`, `baseline_logvar`, `residual`.
+- **교차 적합(cross-fitting, `crossfit.folds: 3` 기본)**: train episode 를 fold 로 나눠(피험자/episode 단위,
+  `crossfit.by: auto` = splits.json 의 그룹) fold 마다 그 fold 를 뺀 모델을 하나 더 학습하고, **train episode 의
+  derived 배열은 그 episode 를 보지 않은 모델의 예측(out-of-fold)** 으로 쓴다. contact 검출기와 pretrain 이 train
+  split 의 residual 로 학습하는데, 배포 모델의 in-sample residual 은 처음 보는 데이터보다 20–50 % 작아서 검출기가
+  배포 때 만나지 않는 좁은 무접촉 z 를 배우게 된다(stacking leakage). val/test/D2 는 배포 모델의 예측 그대로다.
+  학습 시간은 (fold 수 + 1) 배. train 그룹이 2개 미만이거나 `predict.write_derived: false`(스윕 trial)면 건너뛰고
+  `metrics.crossfit.note` 에 남긴다;
+  `crossfit.folds: 0` 으로 끌 수 있다(그러면 contact 의 `no_contact_z_std.train` 이 val 보다 좁게 나온다).
 - 옵션: `data.q_source: q | hand_pose_imu`, `data.kind: glove | robot` (레이아웃 하나당 모델 하나 — 섞인 데이터면 지정).
 
 ### 4.3 `contact` — 보정 z, 레벨, 검출기, D2 pseudo 라벨
 
 - 입력: baseline 의 derived `residual`/`baseline_logvar`. 보정은 D1 **val** split 의 무접촉 프레임
-  (`calibration.split`), 검출기는 D1 라벨(self-touch 1, 무접촉 0).
+  (`calibration.split`), 검출기는 D1 **train** split 라벨(self-touch 1, 무접촉 0) — 그 residual 은 baseline 의
+  교차 적합(out-of-fold) 값이어야 한다(§4.2). `no_contact_z_std` 가 split 별 무접촉 z 폭을 보여 주고, train 이
+  보정 split 보다 뚜렷이 좁으면 `notes` 에 남는다.
 - 산출물: `calibrator.json`(σ·c·g·임계값·FSM 설정), `contact_detector.pt`; 모든 episode 에 derived `residual_z`,
   `contact_level`, `contact_prob`, D2 에 `contact_label_pseudo`. 전처리 `contact_label` 은 수정하지 않는다.
 - 옵션: `detector.bootstrap: auto` — train split 에 self-touch 라벨이 없으면(로봇 D1) 접촉 허용 phase 의 STRONG 을
@@ -213,7 +258,9 @@ python -m robot_skin train vtla     --hardware rtx5090 --set data.splits=$S --se
 | `cpu` | — | — | fp32 | false | 0 | 8 × 1 (디버그용) |
 
 GPU 프로파일끼리는 stage 별 **유효 배치(batch_size × grad_accum × GPU 수)** 가 같도록 맞춰져 있어(테스트로 강제)
-머신을 바꿔도 learning rate 를 다시 맞출 필요가 없다. `--hardware auto` 는 GPU 이름으로 프로파일을 고른다.
+머신을 바꿔도 learning rate 를 다시 맞출 필요가 없다. `--hardware auto` 는 GPU 이름의 모델 토큰(RTX 5090/4090/
+3090, A100)으로 프로파일을 고른다. 노트북 변형(Laptop/Mobile/Max-Q)이나 메모리가 프로파일 `gpu.memory_gb` 의 90 %
+미만인 GPU(A100 40 GB, 이름만 비슷한 `RTX A1000`)는 프로파일 없이 stage 기본값을 쓴다(경고) — `--hardware` 로 직접 준다.
 `cpu` 프로파일의 배치는 디버그용이라 GPU 유효 배치와 다르다.
 
 ### 5.2 RTX 5090 (Blackwell, sm_120)
@@ -248,7 +295,8 @@ GPU 프로파일끼리는 stage 별 **유효 배치(batch_size × grad_accum × 
 ```bash
 python -m robot_skin pipeline --hardware rtx5090
 python -m robot_skin train vtla --hardware rtx5090 --set data.splits=robot_skin/runs/splits.json
-python -m robot_skin train vtla --hardware auto --set train.device=cuda:1      # 두 번째 GPU
+python -m robot_skin train vtla --hardware auto --set data.splits=robot_skin/runs/splits.json \
+    --set train.device=cuda:1                                                 # 두 번째 GPU
 ```
 
 `CUDA_VISIBLE_DEVICES=1 python -m robot_skin ...` 도 같다. 로그는 `metrics.jsonl` 과 `history.json` 이다.
@@ -317,6 +365,9 @@ torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 --master_addr=$MASTER --mas
 - 모든 노드가 torch/CUDA/NCCL 버전, 코드, 데이터 경로가 같아야 한다. master port 가 tailnet ACL 에서 열려 있어야 한다.
 - GPU 종류가 다르면 느린 쪽에 맞춰진다. `grad_accum` 을 키우면 all-reduce 횟수가 줄어 통신 비중이 작아진다.
 - 느린 링크에서는 초기화·첫 collective 가 오래 걸릴 수 있다(`init_distributed` 기본 timeout 1800 s).
+- **재개**(`--set train.resume=auto`)는 모든 노드가 같은 체크포인트를 볼 때만 된다. 체크포인트는 rank 0 만 쓰므로
+  공유 `out_dir` 을 쓰거나 node 0 의 `ckpt_last.pt` 를 다른 노드의 같은 경로로 복사한다. rank 마다 재개 지점이 다르면
+  Trainer 가 모든 rank 에서 `RuntimeError` 로 멈춘다.
 
 전체 절차는 [`robot_skin/train/README.md`](../robot_skin/train/README.md) §5.
 
@@ -351,10 +402,18 @@ vtla 가 `tactile_source: derived` 로 돌고 `pipeline.json` 에 세 참조가 
   optimizer·scheduler·scaler·EMA·RNG·epoch 중간 위치까지 복원한다. Ctrl-C 에도 `ckpt_last.pt` 를 남긴다. 긴 원격
   학습은 `--set train.ckpt_every_steps=500` 처럼 중간 저장을 켠다. dropout·worker 안 augmentation 이 있으면 epoch
   중간 재개는 비트 단위로 같지 않고, DDP 재개는 rank 별 RNG 를 새로 seed 한다. `max_steps`/`max_epochs` 를 늘려서
-  재개할 수 있다.
+  재개할 수 있다. `lr`(× `lr_mult`)·`weight_decay`·`betas`·`eps` 도 현재 설정 값이 적용된다(바뀌었으면 경고,
+  optimizer moment 는 유지) — 낮춘 `lr` 로 이어 가기가 된다. 학습 데이터 크기가 체크포인트와 다르면 경고한다.
+  early stopping 으로 끝난 run 은 다시 띄워도 학습하지 않는다(`early_stop_patience` 나 budget 을 늘리면 이어 간다).
+  재개 대상은 `ckpt_last.pt`(없으면 가장 최근 `ckpt*.pt`)뿐이다 — stage 산출물만 남아 있으면 새로 시작한다.
   ```bash
-  python -m robot_skin train baseline --set train.resume=auto --set train.max_steps=20000
+  python -m robot_skin train baseline --set data.splits=robot_skin/runs/splits.json \
+      --set train.resume=auto --set train.max_steps=20000
   ```
+  기본 `train.out_dir` 은 파이프라인의 `robot_skin/runs/baseline` 이라 이 명령은 파이프라인 run 을 이어서 덮어쓴다 —
+  그래서 파이프라인과 같은 `data.splits` 를 꼭 준다. 다음 `pipeline` 은 baseline 을 그대로 쓰고 뒤 stage(contact·pretrain·
+  vtla)를 다시 학습한다. `data.splits` 를 빼면 stage 가 자기 풀을 따로 나눠 파이프라인의 val/test episode 로 학습하므로,
+  다음 `pipeline` 이 `data_provenance` 로 알아채고 baseline 부터 다시 학습한다.
 - **파이프라인**: 끝난 stage 를 건너뛰는 규칙은 §3. 중간 stage 가 실패하면 고친 뒤 같은 명령을 다시 실행한다.
 - **추론용 로딩**: `Trainer.load_model_weights(model, path, use_ema=True)` (DDP/compile 접두사 자동 제거).
 
@@ -377,13 +436,17 @@ python -m robot_skin sweep --fn robot_skin.stages.baseline:run --base robot_skin
 python -m robot_skin sweep ... --shard 0/2      # 머신 A      (--shard 1/2 는 머신 B, 같은 space·seed)
 ```
 
-- trial 마다 `<out>/trial_XXX/` 가 `train.out_dir` 로 들어가고, 끝날 때마다 `<out>/results.jsonl` 에 한 줄 추가된다.
+- trial 마다 `<out>/trial_XXX/` 가 `train.out_dir`(base 에 최상위 `out_dir` 이 있으면 — 예: `pipeline_config.yaml` — 그것도)
+  로 들어가고, 끝날 때마다 `<out>/results.jsonl` 에 한 줄 추가된다.
   다시 실행하면 성공한 trial 은 건너뛴다. 결과 합치기: `robot_skin.train.load_results(dir_a, dir_b)`.
 - **`--metric`** 은 `run(cfg)` 가 돌려주는 metrics 의 키(점 경로 가능)다. stage 마다 키가 다르다: **`best.value`** 는
   모든 stage 에 있는 monitor 값(기본 `val/loss`, 최소화)이다. 그 밖에 imu_pose `val/rot_deg`, baseline `val/nll` ·
   `val/mae_resid`, contact `val/z_auroc`(`--direction max`), pretrain `val/loss`, vtla `val/l1`. 최상위 `val/loss` 는
   **pretrain 에만** 있다 — 다른 stage 에 `--metric val/loss` 를 주면 모든 trial 이 `failed` 로 기록된다.
 - stage 1 trial 은 `predict.write_derived: [false]` 로 episode 의 derived 배열을 보존한다.
+- `--hardware`(없으면 base YAML 의 `hardware`)는 trial 마다 stage 의 `load_stage_config` 와 같은 순서로 적용된다:
+  프로파일 → trial override. 그래서 `train.batch_size`·`precision`·`grad_accum`·`compile` 을 스윕해도 프로파일이
+  덮어쓰지 않는다. `hardware` 자체를 축으로 스윕할 수도 있다.
 - `optuna` 가 설치돼 있으면 `robot_skin.train.run_optuna(...)` 로 TPE/pruning, 여러 머신이 한 study 를 공유할 수 있다.
 
 (이 VM 에서 합성 데이터로 `train.lr` 축 하나(2 trial, `train.max_steps: [20]`, `data.processed_root`·`data.splits` 는
@@ -400,11 +463,11 @@ splits.json 의 split 이다 — **튜닝·조기 종료에 쓴 val 이 아니�
 | stage | 핵심 키 | 읽는 법 |
 |---|---|---|
 | `imu_pose` | `{val,test}/rot_deg`, `tip_mm`, 기준 `rot_deg_flat`, `tip_mm_flat` | 평평한 손(학습 전 출력)보다 얼마나 나은가 |
-| `baseline` | `{val,test,task}/mae_raw`, `mae_resid`, `resid_reduction` (= 1 − mae_resid/mae_raw), `rmse_*`, `nll`, `coverage_2sigma`, `z_std`, `z_robust_std`, `sep_auroc_before/after`, `sep_dprime_before/after`; 합성 `gt_artefact_*` | 무접촉 ΔS 를 얼마나 지웠나. `coverage_2sigma` ≈ 0.95, `z_std` ≈ 1 이면 분산이 보정된 것. `sep_*_after` > `_before` 면 차감이 접촉과 움직임을 더 잘 가른다. `task/` = D2 무접촉 프레임(학습에 없던 자세) |
-| `contact` | `{val,test}/{z,prob,hyst}_{hallucination_taxel, hallucination_frame, recall, precision, f1, auroc}`, 합성 `…_gt_auroc`, `…_gt_hallucination`, `…_gt_recall`; `pseudo/{n_contact, n_no_contact, n_unknown, gt_precision, gt_recall, …}`; `calibrator`, `detector_bootstrap` | `z` = 보정 규칙, `prob` = 검출기(0.5 문턱), `hyst` = 히스테리시스 후. 무접촉 환각률이 낮고 self-touch recall 이 높아야 한다. val 은 보정·조기 종료에 쓰여 낙관적이다 |
+| `baseline` | `{val,test,task}/mae_raw`, `mae_resid`, `resid_reduction` (= 1 − mae_resid/mae_raw), `rmse_*`, `nll`, `coverage_2sigma`, `z_std`, `z_robust_std`, `sep_auroc_before/after`, `sep_dprime_before/after`; 합성 `gt_artefact_*`; `crossfit {folds, by, in_sample, out_of_fold, note?}` | 무접촉 ΔS 를 얼마나 지웠나. `coverage_2sigma` ≈ 0.95, `z_std` ≈ 1 이면 분산이 보정된 것. `sep_*_after` > `_before` 면 차감이 접촉과 움직임을 더 잘 가른다. `task/` = D2 무접촉 프레임(학습에 없던 자세). `crossfit.in_sample` vs `out_of_fold` 의 `mae_resid` 차이 = train residual 을 교차 적합하지 않았다면 다음 stage 가 봤을 낙관 편향 |
+| `contact` | `{val,test}/{z,prob,hyst}_{hallucination_taxel, hallucination_frame, recall, precision, f1, auroc}`, 합성 `…_gt_auroc`, `…_gt_hallucination`, `…_gt_recall`; `pseudo/{n_contact, n_no_contact, n_unknown, gt_precision, gt_recall, …}`; `calibrator`, `detector_bootstrap`, `no_contact_z_std {train, val, test}` | `z` = 보정 규칙, `prob` = 검출기(0.5 문턱), `hyst` = 히스테리시스 후. 무접촉 환각률이 낮고 self-touch recall 이 높아야 한다. val 은 보정·조기 종료에 쓰여 낙관적이다 |
 | `pretrain` | `val/loss`, `z_huber` vs `z_huber_zero`, `z_mae` vs `z_mae_zero`, `level_acc` vs `level_acc_majority`, `level_bal_acc`, `recall_{none,weak,strong,saturated}`, `contact_{precision,recall,f1}` | 가린 taxel 재구성이 "0 예측"·"다수 클래스"보다 나은가 |
 | `vtla` | `{val,test}/l1` (정규화 단위), `l1_per_step[H]`, `l1_by_task`, `l1_raw/{wrist_pos, wrist_rot6d, finger_aa}` (원 단위, 상대 행동), `n_samples`, `n_valid_steps`; `tactile_source`, `head` | 오프라인 청크 오차만이다. `tactile_source` 는 `derived` 여야 한다. 성공률은 deploy/실기로 본다 |
-| `deploy` | `loop_hz`, `loop_hz_wall`, `latency_p50_ms`/`p95_ms`, `tick_p50_ms`/`p95_ms`, `overruns`, `budget_ms`, `safety_counts`, `estop`, `contact_frac`, `retarget_ms`, `benchmark`, `notes` | [`DEPLOYMENT.md`](DEPLOYMENT.md) §6, §8 |
+| `deploy` | `loop_hz`, `loop_hz_wall`, `latency_p50_ms`/`p95_ms`, `tick_p50_ms`/`p95_ms`, `overruns`, `catchup_ticks`, `budget_ms`, `safety_counts`, `estop`, `contact_frac`, `retarget_ms`, `benchmark`, `notes` | [`DEPLOYMENT.md`](DEPLOYMENT.md) §6, §8 |
 
 ## 13. frozen 비전 인코더 특징 캐시
 
@@ -434,8 +497,11 @@ python -m robot_skin train vtla --set data.splits=robot_skin/runs/splits.json \
 | `data.splits is not set — splitting this stage's own episode pool` 경고 | `data.splits` 를 주지 않았다 — 파이프라인과 같은 splits.json 을 `--set data.splits=…` 로 준다 |
 | `… entries without a usable episode, … usable episodes not listed (ignored)` 경고 | splits.json 이 이 processed root 에 없는 episode 를 가리키거나(다른 processed root, 지운 episode), splits.json 을 만든 뒤 추가된 episode 가 목록에 없다(학습에서 빠진다) — 새 데이터를 넣었으면 splits 를 다시 만들고 `--force`. 이 stage 풀 밖의 **존재하는** episode(다른 dataset)는 INFO 로만 기록된다 |
 | stage 가 `taxel_frame` 경고 | build/1 로 만든 글러브 episode(월드 프레임 taxel) — `python -m robot_skin preprocess --force` 후 stage 1 부터 |
+| imu_pose 가 `stores sensor-frame gyro/acc … vec_frame='world'` 오류 | `features.vec_frame` 이 전처리 `imu.vec_frame`(에피소드 `preprocessing.imu.vec_frame`)과 다르다 — 둘을 맞춘다. 월드 프레임 벡터를 내는 장치면 `preprocess --set imu.vec_frame=world --force` 후 `features.vec_frame: world` |
+| deploy 경고 `… pose tokens are out of distribution` | 번들 촉각 인코더의 학습 taxel 프레임(`tactile.taxel_frames`)과 스킨 프레임이 다른데 옮길 리타게터가 없다 — `PolicyRunner(taxel_frame=…)` 로 사상 함수를 준다 (`control/README.md`) |
 | vtla 가 "bootstrap" 경고, deploy 가 번들 거부 | contact stage 의 derived 가 없다 — contact 를 먼저 돌리고 `data.tactile_source=derived` |
-| `--set` 키 오류 | stage YAML 에 없는 키(오타). `python -m robot_skin pipeline` 에서는 `<stage>.<key>` 로 한 stage 에만 |
+| `--set` 키 오류 | stage YAML 에 없는 키(오타; `train.*` 은 `TrainConfig` 필드가 아닌 키). `python -m robot_skin pipeline` 에서는 `<stage>.<key>` 로 한 stage 에만 |
+| `pipeline: … splits.json exists and was made with …` | 이미 있는 splits.json 과 다른 split 옵션 — split 은 처음 한 번만 만든다. 다시 나누려면 파일을 지우고 `--force`, 아니면 다른 `--out` |
 | 스윕 trial 이 모두 `failed` | `--metric` 키가 그 stage metrics 에 없음(§11) — `results.jsonl` 의 `error` 확인 |
 | `no kernel image is available` (RTX 5090) | sm_120 없는 torch → cu128 wheel (§5.2) |
-| 파이프라인이 끝난 stage 를 다시 학습 | processed root 경로 또는 splits.json 이 바뀌었거나 derived 배열이 사라짐(`preprocess --force`) — §3 |
+| 파이프라인이 끝난 stage 를 다시 학습 | processed root 경로 또는 splits.json 이 바뀌었거나, derived 배열이 사라졌거나(`preprocess --force`), 앞 stage 가 다른 실행에서 다시 학습됐거나, 결과를 다른 run(다른 splits 의 단독 `train`)이 썼다 — 경고에 이유가 나온다, §3 |

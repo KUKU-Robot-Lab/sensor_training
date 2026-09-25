@@ -76,7 +76,9 @@ python -m robot_skin.train.hardware          # 이 머신의 GPU/torch/arch list
 ```
 
 적용 우선순위: **stage YAML `train:` < 프로파일 `suggest.<stage>` < 프로파일 `train:` < CLI override**.
-`hardware: auto` 는 GPU 이름으로 프로파일을 고른다(5090/4090/3090/A100, GPU 없으면 cpu).
+`hardware: auto` 는 GPU 이름의 모델 토큰으로 프로파일을 고른다(RTX 5090/4090/3090, A100; GPU 없으면 cpu).
+노트북 변형(Laptop/Mobile/Max-Q)이나 메모리가 프로파일 `gpu.memory_gb` 의 90 % 미만인 GPU(A100 40 GB, `RTX A1000`
+같은 이름만 비슷한 카드)는 프로파일 없이 stage 기본값을 쓴다(경고) — 큰 프로파일의 배치로 바로 OOM 나지 않게.
 
 | 프로파일 | GPU (cc) | 메모리 | precision | compile | workers | vtla batch × accum |
 |---|---|---|---|---|---|---|
@@ -147,7 +149,7 @@ python -m robot_skin.train.hardware                     # 경고가 없어야 �
 ```bash
 # 2-GPU 한 대: 유효 배치를 유지하려면 grad_accum 을 GPU 수로 나눈다 (5090 vtla: 64×2×1 → 64×1×2)
 torchrun --standalone --nproc_per_node=2 -m robot_skin train vtla \
-    --config robot_skin/configs/stages/vtla.yaml --hardware rtx5090
+    --config robot_skin/configs/stages/vtla.yaml --hardware rtx5090 --set data.splits=robot_skin/runs/splits.json
 ```
 (`python -m robot_skin train <stage>` CLI 는 top-level `robot_skin/__main__.py` 가 제공한다.
 직접 스크립트를 쓸 때도 `Trainer` 가 torchrun 환경변수를 읽어 알아서 DDP 로 동작한다.)
@@ -222,10 +224,10 @@ MASTER=$(tailscale ip -4 <node0-hostname>)        # node 0 의 100.x.y.z
 
 # node 0
 torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr=$MASTER --master_port=29500 \
-    -m robot_skin train vtla --hardware auto
+    -m robot_skin train vtla --hardware auto --set data.splits=robot_skin/runs/splits.json
 # node 1
 torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 --master_addr=$MASTER --master_port=29500 \
-    -m robot_skin train vtla --hardware auto
+    -m robot_skin train vtla --hardware auto --set data.splits=robot_skin/runs/splits.json
 ```
 * `NCCL_SOCKET_IFNAME=tailscale0` 이 없으면 NCCL 이 LAN/도커 인터페이스를 골라 연결이 안 되거나 멈춘다.
 * **대역폭이 낮다고 가정**하라. `tailscale ping <host>` 가 `via DERP` 로 나오면(직접 연결 실패, 릴레이 경유)
@@ -233,6 +235,10 @@ torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 --master_addr=$MASTER --mas
 * GPU 종류가 다르면 느린 쪽 속도로 맞춰진다 → 이 경우 이득이 거의 없다. 같은 GPU 가 여러 대 있는
   한 머신 안의 DDP(4절)가 훨씬 효율적이다.
 * `init_distributed(timeout_s=1800)` — 느린 링크에서 초기화/첫 collective 가 오래 걸릴 수 있다.
+* **재개(`train.resume=auto`)에는 모든 노드가 같은 체크포인트를 봐야 한다.** 체크포인트는 rank 0 만 쓰므로 노드마다
+  로컬 `runs/` 이면 다른 노드에는 없다 → 공유 `out_dir` 을 쓰거나 node 0 의 `ckpt_last.pt` 를 다른 노드의 같은
+  경로로 복사한다. rank 마다 재개 지점(체크포인트 유무, step/epoch)이 다르면 `Trainer.resume()` 이 모든 rank 에서
+  `RuntimeError` 로 멈춘다(예전에는 replica 가 서로 다른 가중치로 조용히 갈라지거나 collective 가 멈췄다).
 
 ---
 
@@ -248,6 +254,8 @@ history.json   epoch 별 row (train/*, val/*, callback 지표, lr, time_s)
 ckpt_last.pt   재개 지점 (ckpt_every_epochs / ckpt_every_steps / 종료·중단 시)
 ckpt_best.pt   monitor 기준 최고 (EMA 사용 시 EMA 가중치로 평가한 값 기준)
 summary.json   fit 완료 표시 (finished, stopped_early, best, step, epoch, time)
+previous/      재개가 아닌 새 run 이 이전 run 의 파일이 있는 out_dir 에서 시작하면, 이전 run 의
+               ckpt_last/ckpt_best/metrics.jsonl/history.json 을 여기로 옮긴다 (한 벌만 유지)
 ```
 
 체크포인트 키: `model, optimizer, scheduler, scaler, ema, step, epoch, config, extra`
@@ -258,8 +266,20 @@ summary.json   fit 완료 표시 (finished, stopped_early, best, step, epoch, ti
   (단일 프로세스에서 테스트로 검증). Ctrl-C 시에도 `ckpt_last.pt` 를 저장한다(마지막 optimizer step
   기준). 단, epoch 중간 재개에서 dropout 같은 확률적 layer 나 worker 안의 random augmentation 은 난수
   흐름이 달라져 bit 단위로 같지는 않다. DDP 재개는 rank 별 RNG 를 새로 seed 한다.
-* 재개 시 LR schedule 은 *현재* config 로 계산된다(재개하면서 `max_epochs` 를 늘리는 것이 가능).
-  `batch_size`/`grad_accum`/`seed` 를 바꾸면 경고한다.
+* 재개 시 LR schedule 은 *현재* config 로 계산된다(재개하면서 `max_epochs` 를 늘리는 것이 가능). Trainer 가 만든
+  optimizer 면 최고 LR(`lr` × `lr_mult`)·`weight_decay`·`betas`·`eps` 도 현재 config 값을 다시 적용하고(바뀌었으면
+  경고, moment 는 유지) 복원된 step 의 LR 을 그 값으로 다시 계산한다 — 낮춘 `lr` 로 이어 가기가 된다. `optimizer=`
+  로 직접 넘긴 optimizer 는 체크포인트 값을 그대로 쓴다. `batch_size`/`grad_accum`/`seed` 를 바꾸거나 학습 데이터
+  크기가 체크포인트와 다르면(다른 split·processed root) 경고한다. `extra_state` 를 넘기면 그 값이 유지된다(넘기지
+  않았을 때만 체크포인트의 `extra` 를 복원).
+* early stopping 으로 끝난 run 은 `resume: auto` 로 다시 띄워도 학습하지 않는다(`stopped_early` 가 체크포인트에
+  있다). `early_stop_patience` 를 늘리거나 끄거나, budget(`max_epochs`/`max_steps`)을 늘리면 이어서 학습한다.
+* `resume: auto` 는 `ckpt_last.pt`, 없으면 가장 최근 `ckpt*.pt` 만 찾는다 — 같은 디렉터리의 stage 산출물
+  (`policy_bundle.pt`, `encoder_state.pt`, `*_model.pt`)은 재개 대상이 아니다(없으면 새로 시작).
+* 재개가 아닌 새 run 은 이전 run 의 파일을 `previous/` 로 옮기고 시작한다. stage 들은 *이번* run 이 best 를 기록했을
+  때만 `ckpt_best.pt` 를 내보내고, 유한한 monitor 값이 한 번도 없으면 EMA(없으면 마지막) 가중치를 쓴다(경고).
+* 파이프라인(`python -m robot_skin pipeline`)은 끝난 stage 를 다시 학습할 때(`--force`, 다른 splits 등) `resume` 을
+  무시하고 처음부터 학습한다 — `docs/TRAINING.md` §3.
 * 추론 로딩: `Trainer.load_model_weights(model, path, use_ema=True)` — DDP/compile 접두사(`module.`,
   `_orig_mod.`)는 자동 제거.
 
@@ -281,14 +301,20 @@ space:
 ```
 
 * `run_sweep(train_fn, base_cfg, overrides, out_dir)` — trial 마다 `out_dir/trial_XXX` 를
-  `train.out_dir` 에 넣고, 끝날 때마다 `results.jsonl` 에 한 줄 추가. 다시 실행하면 성공한 trial 은
-  건너뛴다. `train_fn` 은 float 또는 dict(stage `run(cfg)` 의 metrics) 를 반환, `--metric` 으로 키 지정.
+  `train.out_dir` 에 넣고(base 에 최상위 `out_dir` 이 있으면 — stage 는 그쪽을 먼저 본다, 예: 파이프라인의
+  `pipeline_config.yaml` — 그것도 바꾼다), 끝날 때마다 `results.jsonl` 에 한 줄 추가. 다시 실행하면 성공한 trial 은
+  건너뛴다. `run_optuna`·`suggest_from_space`·`trial_config` 도 `robot_skin.train` 에서 바로 import 된다. `train_fn` 은 float 또는 dict(stage `run(cfg)` 의 metrics) 를 반환, `--metric` 으로 키 지정.
 * stage metrics 의 키는 stage 마다 다르다. `best.value`(monitor 값, 기본 `val/loss`)는 모든 stage 에 있고, 최상위
   `val/loss` 는 pretrain 에만 있다 — vtla 는 `val/l1`, baseline `val/nll`, imu_pose `val/rot_deg`, contact
   `val/z_auroc`(`--direction max`). 목록은 `docs/TRAINING.md` §11–12.
 * stage 1(imu_pose/baseline/contact) trial 은 space 에 `predict.write_derived: [false]` 를 넣어 episode 의
   derived 배열(다음 stage 입력)을 덮어쓰지 않게 한다.
 * 실패한 trial(없는 `--metric` 키 포함)은 `status: failed` + 에러로 기록되고 정렬에서 맨 뒤.
+* 하드웨어 프로파일(`--hardware`, 없으면 base YAML 의 `hardware`, space 의 `hardware` 축도 가능)은 trial 마다
+  `trial_config` 로 stage 의 `load_stage_config` 와 같은 순서로 적용된다: 프로파일 → trial override, 그리고
+  `hardware_applied: true`. 그래서 `train.batch_size`·`precision`·`grad_accum`·`compile` 을 스윕하면 그 값으로
+  학습한다(stage 의 `run()` 이 프로파일을 다시 덮어쓰지 않는다). `suggest.<stage>` 는 base 의 `stage` 키(없으면
+  `--fn` 모듈의 `STAGE`)로 고른다.
 
 ---
 
@@ -302,7 +328,11 @@ CPU 전용·결정적. 검증 항목: 회귀 수렴, grad accumulation 동치(ac
 포함), 재개 = 무중단 학습(epoch 경계 및 epoch 중간), best-by-monitor, EMA 평가, 조기 종료, 중첩 배치
 device 이동, `TrainConfig.from_dict`, precision 규칙(capability mock), weight-decay 그룹, warmup+cosine 값,
 fp16 GradScaler 경로(CPU fp16 autocast 로 대체 실행) 및 재개, torchrun env 없을 때 no-op,
-**실제 2-프로세스 gloo DDP**(2 rank × batch 8 × accum 2 ≡ 1 프로세스 × batch 32, 샤딩된 검증 지표 정확),
-프로파일 유효성/유효 배치 일치, sm_120 arch 검사, 스윕 grid/random/샤딩/`--hardware`.
+**실제 2-프로세스 gloo DDP**(2 rank × batch 8 × accum 2 ≡ 1 프로세스 × batch 32, 샤딩된 검증 지표 정확;
+IterableDataset 의 마지막 짧은 accumulation 그룹도 rank 평균 gradient; 노드 로컬 `out_dir` 재개는 모든 rank 에서
+오류, 공유 `out_dir` 재개는 동일), 재개 시 현재 lr/weight decay 적용·early stop 된 run 재개는 no-op·다른 학습 데이터
+경고·stage 산출물 무시, 새 run 의 `previous/` 이동, run 마다 TF32 설정, 프로파일 유효성/유효 배치 일치, GPU 이름 매칭
+(`RTX A1000` ≠ A100, 노트북·메모리 부족 → 없음), sm_120 arch 검사, 스윕 grid/random/샤딩/`--hardware`(스윕한
+batch/precision 이 실제 stage `resolve_config` 뒤에도 유지).
 NCCL·CUDA 전용 경로(fused AdamW, CUDA 에서의 `torch.compile`, 노드 간 DDP)는 GPU 머신에서
 `python -m robot_skin.train.hardware` 와 `torchrun --standalone --nproc_per_node=1` smoke run 으로 확인한다.

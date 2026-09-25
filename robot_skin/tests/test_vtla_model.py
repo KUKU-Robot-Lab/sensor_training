@@ -502,3 +502,91 @@ def test_preference_loss_disables_dropout_and_shares_encoding(head):
     rr = 0.5 * (lp["actions_rejected"] - lr["actions_rejected"])
     assert torch.allclose(out["reward_chosen"], rc.mean(), atol=1e-5)
     assert torch.allclose(out["loss"], -F.logsigmoid(rc - rr).mean(), atol=1e-5)
+
+
+# ─────────────────────────────────────────────────────────── device generators (control passes one)
+
+_REAL_GENERATOR = torch.Generator
+
+
+class _AccelGenerator:
+    """Stand-in for a CUDA ``torch.Generator`` on this CPU-only box: reports ``device`` cuda and draws
+    from a wrapped CPU generator (same stream as ``torch.Generator().manual_seed(seed)``)."""
+
+    def __init__(self, seed=0):
+        self._g = _REAL_GENERATOR().manual_seed(int(seed))
+        self.device = torch.device("cuda")
+
+    def manual_seed(self, seed):
+        self._g.manual_seed(int(seed))
+        return self
+
+
+@pytest.fixture
+def accel_rng(monkeypatch):
+    """``torch.rand`` / ``torch.randn`` enforce ATen's ``check_generator`` rule for
+    :class:`_AccelGenerator`: a generator only fills tensors of its own device type (a CUDA
+    generator raises "Expected a 'cpu' device type for generator but found 'cuda'" for a CPU
+    tensor). The accelerator's memory is emulated on the CPU. Returns the generator class."""
+    real = {name: getattr(torch, name) for name in ("rand", "randn")}
+
+    def patched(name):
+        def draw(*args, generator=None, device=None, **kw):
+            if not isinstance(generator, _AccelGenerator):
+                return real[name](*args, generator=generator, device=device, **kw)
+            want = torch.device(device if device is not None else "cpu")
+            if want.type != generator.device.type:
+                raise RuntimeError(f"Expected a '{want.type}' device type for generator but found "
+                                   f"'{generator.device.type}'")
+            return real[name](*args, generator=generator._g, **kw)
+        return draw
+
+    for name in real:
+        monkeypatch.setattr(torch, name, patched(name))
+    return _AccelGenerator
+
+
+def test_flow_head_draws_on_the_generator_device(accel_rng):
+    """VTLA-1: the flow head draws ε / τ on the *generator's* device (then moves them to the memory's),
+    so control's ``torch.Generator(device=policy_device)`` works for a CUDA policy. Before, the draws
+    had no ``device=`` → a CPU tensor → RuntimeError for a CUDA generator."""
+    with pytest.raises(RuntimeError, match="device type for generator"):
+        torch.randn((2, 3), generator=accel_rng(0))                  # the emulated ATen rule bites
+    torch.manual_seed(0)
+    head = FlowMatchingHead(32, A, H, depth=1, heads=4, n_steps=2)
+    torch.nn.init.normal_(head.out.weight, std=0.5)                   # memory-dependent velocity
+    mem = torch.randn(B, 6, 32)
+    acts = torch.randn(B, H, A)
+    cpu = lambda s: torch.Generator().manual_seed(s)                  # noqa: E731
+    # the given generator is used (same stream as the CPU generator of the same seed), not ignored
+    assert torch.equal(head.sample(mem, generator=accel_rng(3)), head.sample(mem, generator=cpu(3)))
+    assert torch.equal(head.sample_tau(B, generator=accel_rng(1)), head.sample_tau(B, generator=cpu(1)))
+    assert torch.equal(head.loss(mem, None, acts, generator=accel_rng(2))["action_loss"],
+                       head.loss(mem, None, acts, generator=cpu(2))["action_loss"])
+    assert torch.equal(head.per_sample_error(mem, None, acts, generator=accel_rng(4)),
+                       head.per_sample_error(mem, None, acts, generator=cpu(4)))
+
+
+def test_flow_policy_predict_dpo_and_benchmark_take_a_device_generator(accel_rng, monkeypatch):
+    """VTLA-1 through the callers: ``VTLAPolicy.predict`` (ControlLoop warm-up / policy ticks),
+    ``preference_loss`` and ``control.benchmark_policy`` (which builds
+    ``torch.Generator(device=policy_device)`` itself) run a flow policy with a device generator."""
+    from robot_skin.control import benchmark_policy
+
+    torch.manual_seed(0)
+    policy = VTLAPolicy(tiny_cfg(head="flow", vision=None, text=None))
+    torch.nn.init.normal_(policy.head.out.weight, std=0.5)
+    batch = make_batch(cams=(), actions=False)
+    cpu = lambda s: torch.Generator().manual_seed(s)                  # noqa: E731
+    assert torch.equal(policy.predict(batch, generator=accel_rng(5)), policy.predict(batch, generator=cpu(5)))
+    batch["actions_chosen"] = torch.randn(B, H, A)
+    batch["actions_rejected"] = torch.randn(B, H, A)
+    ref = make_reference_policy(policy)
+    with torch.no_grad():
+        policy.head.out.bias.add_(0.3)                                # policy ≠ reference
+    out = preference_loss(policy, ref, batch, n_draws=2, generator=accel_rng(0))
+    assert torch.equal(out["loss"], preference_loss(policy, ref, batch, n_draws=2, generator=cpu(0))["loss"])
+    monkeypatch.setattr(torch, "Generator",
+                        lambda device=None: accel_rng() if device is not None else _REAL_GENERATOR())
+    res = benchmark_policy(policy, batch, n=2, warmup=1)
+    assert res["n"] == 2 and res["head"] == "flow"
