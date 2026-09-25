@@ -101,8 +101,8 @@ DEFAULTS: dict[str, Any] = {
     "model": {
         "d_model": 128, "fusion_depth": 2, "fusion_heads": 4, "ff_mult": 4, "dropout": 0.1,
         "n_readout": 1,
-        "tactile_encoder": {"d_model": 64, "depth": 2, "heads": 4, "n_fourier": 8,
-                            "fourier_scale": 0.05, "ff_mult": 4, "dropout": 0.0},
+        "tactile_encoder": {"d_model": 64, "depth": 2, "heads": 4, "n_fourier": 6,
+                            "fourier_scale": 0.3, "ff_mult": 4, "dropout": 0.0},
         "n_tactile_tokens": 4, "tactile_heads": 4, "tactile_gate": "hard",
         "head": "chunk", "head_depth": 2, "head_heads": None,
         "flow_steps": 10, "flow_tau": "uniform", "flow_tau_beta_b": 1.5,
@@ -301,22 +301,40 @@ def _match(entry: str, eps: Sequence[Episode], bases: Sequence[Path]) -> Episode
     return None
 
 
-def split_episodes(eps: Sequence[Episode], data_cfg: Mapping[str, Any]) -> dict[str, list[Episode]]:
+def _is_episode_dir(entry: str, bases: Sequence[Path]) -> bool:
+    """A splits entry that names an episode directory on disk (absolute or relative to one of
+    ``bases``) — an episode outside this stage's pool, not a broken entry."""
+    from ..datasets.episode import EPISODE_JSON
+
+    cand = [Path(entry)] + ([b / entry for b in bases] if not Path(entry).is_absolute() else [])
+    return any((c / EPISODE_JSON).is_file() for c in cand)
+
+
+def split_episodes(eps: Sequence[Episode], data_cfg: Mapping[str, Any], *,
+                   stage: str | None = STAGE) -> dict[str, list[Episode]]:
     """``{"train", "val", "test"}`` lists of episodes: from ``data.splits`` (splits.json) or
     :func:`robot_skin.datasets.splits.make_splits` (``split_by``: a ``GROUP_KEYS`` field;
-    ``episode`` = ``episode_id``)."""
+    ``episode`` = ``episode_id``) — the latter logged as a warning
+    (:func:`robot_skin.stages.warn_unshared_split`): it is not shared with the other stages. With a
+    splits file, unresolvable entries and unlisted usable episodes are warned about; entries naming
+    an existing episode directory outside this pool (e.g. D1 motion) are only logged."""
     splits_path = data_cfg.get("splits")
     if splits_path:
         spec = json.loads(Path(splits_path).read_text())
         spec = spec.get("splits", spec) if isinstance(spec, Mapping) else spec
         bases = [Path(data_cfg.get("processed_root") or "."), Path(splits_path).parent]
         out: dict[str, list[Episode]] = {k: [] for k in _SPLITS}
-        unmatched = 0
+        unmatched = outside = 0
         for name in _SPLITS:
             for entry in spec.get(name, []) or []:
                 ep = _match(str(entry), eps, bases)
                 if ep is None:
-                    unmatched += 1
+                    # a shared splits.json lists every dataset's episodes (e.g. D1 motion): an existing
+                    # episode dir outside this stage's pool is expected, an unresolvable entry is not
+                    if _is_episode_dir(str(entry), bases):
+                        outside += 1
+                    else:
+                        unmatched += 1
                 elif all(ep is not e for part in out.values() for e in part):
                     out[name].append(ep)
         listed = {id(e) for part in out.values() for e in part}
@@ -324,6 +342,9 @@ def split_episodes(eps: Sequence[Episode], data_cfg: Mapping[str, Any]) -> dict[
         if unmatched or n_unlisted:
             warnings.warn(f"splits {splits_path}: {unmatched} entries without a usable episode, "
                           f"{n_unlisted} usable episodes not listed (ignored)", stacklevel=2)
+        if outside:
+            log.info("%s: splits %s lists %d episodes outside this stage's pool (other datasets / not usable here)",
+                     stage or STAGE, splits_path, outside)
         return out
     from ..datasets.splits import make_splits
 
@@ -331,6 +352,11 @@ def split_episodes(eps: Sequence[Episode], data_cfg: Mapping[str, Any]) -> dict[
     by = "episode_id" if by == "episode" else by
     if any(e.root is None for e in eps):
         raise ValueError("automatic splits need on-disk episodes")
+    from . import warn_unshared_split
+
+    warn_unshared_split(stage, data_cfg, f"make_splits by {by}, val_frac={data_cfg.get('val_frac', 0.15)}, "
+                        f"test_frac={data_cfg.get('test_frac', 0.15)}, split_seed={data_cfg.get('split_seed', 0)}, "
+                        f"{len(eps)} episodes")
     parts = make_splits([e.root for e in eps], by=by, val_frac=float(data_cfg.get("val_frac", 0.15)),
                         test_frac=float(data_cfg.get("test_frac", 0.15)),
                         seed=int(data_cfg.get("split_seed", 0)))
@@ -510,6 +536,9 @@ def run(cfg: Mapping[str, Any] | None = None) -> dict:
     eps, skipped = load_usable_episodes(dirs, cfg, spec)
     for s in skipped:
         log.warning("vtla: skipping %s (%s)", s["episode"], s["reason"])
+    from . import warn_legacy_taxel_frame
+
+    warn_legacy_taxel_frame(eps, STAGE)
     if not eps:
         raise ValueError(f"no usable episodes ({len(dirs)} found under {d_cfg.get('processed_root')!r}, "
                          f"{len(skipped)} skipped: {skipped[:3]})")

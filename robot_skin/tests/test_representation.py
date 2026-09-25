@@ -25,6 +25,42 @@ def test_tokenizer_shapes_and_pose_sensitivity():
     assert tok(torch.randn(1, 16, 4), torch.zeros(1, 16, 3), torch.zeros(1, 16, 3)).shape == (1, 16, 32)
 
 
+def test_fourier_pose_defaults_are_consistent_and_above_pose_noise():
+    """Position Fourier features default to a 0.3 m lowest period × 6 octaves (finest ≈ 9 mm) in the
+    tokenizer, the encoder, the VTLA tactile encoder and both stage configs (the only place stage
+    hyper-parameters live — configs/default.yaml holds no copy that could drift). With the
+    old 0.05 m × 8 octaves a 1 mm pose error moved the features ≈ 70 % as far as a 2 cm taxel offset
+    (top octaves = pose noise); with the new defaults ≈ 17 %."""
+    import yaml
+
+    from robot_skin.config import load_config
+    from robot_skin.representation.tokenizer import fourier_features
+    from robot_skin.stages import pretrain as st_pre
+    from robot_skin.stages import vtla as st_vtla
+    from robot_skin.vtla.model import VTLAConfig, VTLAPolicy
+
+    tok = TaxelTokenizer(value_dim=2)
+    assert (tok.n_fourier, tok.fourier_scale) == (6, 0.3)
+    cfg = TaxelEncoder(6).config
+    assert (cfg["n_fourier"], cfg["fourier_scale"]) == (6, 0.3)
+    for d in (st_pre.DEFAULTS["model"], st_vtla.DEFAULTS["model"]["tactile_encoder"],
+              yaml.safe_load(st_pre.CONFIG_PATH.read_text())["model"],
+              yaml.safe_load(st_vtla.CONFIG_PATH.read_text())["model"]["tactile_encoder"]):
+        assert (d["n_fourier"], d["fourier_scale"]) == (6, 0.3)
+    assert "representation" not in load_config()
+    pol = VTLAPolicy(VTLAConfig(cameras=(), vision=None, text=None, proprio_dim=4, action_dim=3, horizon=2))
+    assert pol.tactile_encoder.config["fourier_scale"] == 0.3 and pol.tactile_encoder.config["n_fourier"] == 6
+    # 1 mm pose error vs the feature distance of two taxels 2 cm apart (glove pad spacing)
+    g = torch.Generator().manual_seed(0)
+    p = torch.rand(256, 3, generator=g, dtype=torch.float64) * 0.15 - 0.1
+    e = torch.nn.functional.normalize(torch.randn(256, 3, generator=g, dtype=torch.float64), dim=-1)
+
+    def ratio(n, scale):
+        f = lambda x: fourier_features(x, n, scale)  # noqa: E731
+        return float(((f(p + 0.001 * e) - f(p)).norm(dim=-1) / (f(p + 0.02 * e) - f(p)).norm(dim=-1)).median())
+    assert ratio(6, 0.3) < 0.25 and ratio(8, 0.05) > 0.5
+
+
 def test_mask_replaces_value_only():
     torch.manual_seed(0)
     tok = TaxelTokenizer(value_dim=2, d_model=16, n_taxels=5)

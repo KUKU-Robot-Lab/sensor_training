@@ -136,7 +136,7 @@ instruction/success 의 `name` 에 task_id 를 쓰는 옛 관례가 있을 수 �
 
 | type | name | value |
 |---|---|---|
-| `phase_start` / `phase_end` | 단계 id (`baseline_start`, `imu_calibration`, `sync_start`, `pinch_index`, `reach`, `grasp` …) | start 의 value: `contact` ∈ `none\|self\|object\|any`, `labels` (segment 라벨), 수집기는 `kind` (`static\|calibration\|sync\|motion\|self_touch\|task_phase`), `block`, `speed`, `motion`, `finger`/`axis`, `nominal_s` 추가 |
+| `phase_start` / `phase_end` | 단계 id (`baseline_start`, `imu_calibration`, `sync_start`, `pinch_index`, `reach`, `grasp` …) | start 의 value: `contact` ∈ `none\|self\|object\|any`, `labels` (segment 라벨), 수집기는 `kind` (`static\|calibration\|sync\|motion\|self_touch\|task_phase`), `block`, `speed`, `motion`, `finger`/`axis`/`grasp` (for_each 값), `nominal_s` 추가 |
 | `marker` | 자유 | 자유 |
 | `instruction` | `instruction` | 지시문 문자열 |
 | `success` | `success` | bool \| null |
@@ -152,7 +152,24 @@ pressure 타임스탬프 위, layout 순서의 정답: `artefact_pct` (무접촉
 `press_pct`, `drift_pct`, `noise_pct`, `delta_true_pct`, bool `contact` / `self_touch` / `object_contact` /
 `saturated`, `penetration_m`, `baseline_raw [N]`, `baseline_raw_all [C]`, `channels`, `taxel_pos`, 관절각
 `joint_angle` + artefact 파라미터, 참 자세(`hand_*` 또는 `q`, `object_pos`). `datasets.synthetic.load_ground_truth`.
+정답 `taxel_pos` 는 `object_pos` 와 같은 프레임이다 — glove 는 **world** (참 `global_orient`·`wrist_pos` 적용),
+robot 은 손 base(URDF 루트) (`meta.synthetic.gt_taxel_frame` = `world` | `hand_base`). processed Episode 의
+`taxel_pos`(손 프레임, §2)와 비교하려면 glove 는 `R(hand_global_orient)ᵀ · (taxel_pos − hand_wrist_pos)`.
+`meta.synthetic.glove_seed`: 장갑(스킨) 물리 파라미터(artefact 이득·부호·지연, 누름 모델, baseline, 잡음 수준)를
+뽑은 시드 — 같은 값의 세션들은 **같은 장갑**으로 기록된 것이다 (`generate_dataset` 기본 `shared_glove=True`);
+`null` 이면 세션마다 다른 스킨.
 전처리는 이 파일을 스트림으로 읽지 않고, 있으면 ΔS 를 대조하고(§2.6) 선택적으로 `gt_*` 배열로 옮긴다.
+
+### 1.11 배포 세션 (`control.runner.DeploymentLogger`)
+
+로봇 배포(`stages.deploy`, `control.PolicyRunner`)도 같은 raw 형식으로 기록된다 (acquisition `Recorder` 기반):
+`kind: robot`, `dataset: other` (기본값 — VTLA 의 `task` 학습에 섞이지 않게), `layout: layout.yaml` (세션 기준
+상대 경로, 세션 안에 사본), `meta.urdf: robot.urdf`, `meta.deployment` (번들 경로, 제어·정책 주기, 지표, 안전
+요약). phase: `baseline`, `calibration` (둘 다 `contact: none` → `no_contact` segment), `rollout` (`contact: any`
+→ `task` segment); instruction / success 이벤트와 안전 marker. 스트림: `pressure.npz`(raw 채널 순서),
+`joint_state.npz` (q, 드라이버가 재는 경우에만 qd, names; 새 샘플 시각마다 1행), `camera_<name>/`.
+`deploy_log.npz` 는 틱 단위 sidecar(목표·명령·레벨·정책 틱)이지 스트림이 아니다 — `gt_synthetic.npz` 처럼
+`datasets.build` 가 무시하며, 배포 세션은 일반 로봇 세션처럼 재전처리된다 (성공/실패 rollout 재사용).
 
 ## 2. processed Episode
 
@@ -217,7 +234,10 @@ layout: `datasets.build.load_episode_layout(ep)`.
 
 `derived/` (이후 stage 가 `Episode.set_derived` 로 씀): `baseline_pred`, `baseline_logvar` (ΔS %, `[T, N]`),
 `residual = delta_pct − baseline_pred`, `residual_z` (보정된 z, **누름 양수**), `contact_prob`,
-`contact_level` (int8 `ContactLevel`), `hand_finger_pose_imu` (`[T, 15, 3]`). 비전 특징 캐시
+`contact_level` (int8 `ContactLevel`), `hand_finger_pose_imu` (`[T, 15, 3]`), `contact_label_pseudo` (int8 −1/0/1
+`[T, N]`, contact stage 의 D2 pseudo 라벨 = `episode.D_CONTACT_LABEL_PSEUDO`; `contact_label` 배열은 그대로 둔다 —
+`datasets.motion` 데이터셋은 `label_key="contact_label_pseudo"` 로 이 derived 배열을 직접 학습에 쓴다). 쓰기는
+원자적(임시 파일 + `os.replace`)이라 memmap 으로 읽는 중인 프로세스가 잘린 배열을 보지 않는다. 비전 특징 캐시
 `derived/vision_<key>_<camera>.npy` 는 프레임 단위(`[F, P, D]`)라 `vision.load_cached` 로만 읽는다.
 
 ### 2.3 마스터 시계와 보간

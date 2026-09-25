@@ -52,7 +52,8 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from . import (finite_json, fit_and_restore, load_stage_yaml, parse_overrides, resolve_stage_config,
-               seed_model_init, split_stage_episodes, stage_episodes, write_json_atomic)
+               seed_model_init, split_stage_episodes, stage_episodes, warn_legacy_taxel_frame,
+               write_json_atomic)
 
 log = logging.getLogger("robot_skin.stages.baseline")
 
@@ -279,6 +280,7 @@ def run(cfg: Mapping[str, Any] | None = None) -> dict:
     train_sets, pred_sets = set(d_cfg["datasets"] or []), set(d_cfg["predict_datasets"] or [])
 
     eps, skipped = stage_episodes(d_cfg)
+    warn_legacy_taxel_frame(eps, STAGE)
     usable = []
     for ep in eps:
         why = _usable(ep, q_source)
@@ -293,7 +295,7 @@ def run(cfg: Mapping[str, Any] | None = None) -> dict:
         raise ValueError("baseline: training episodes of different kinds / taxel counts "
                          f"{sorted({(e.meta.kind, e.meta.n_taxels) for e in pool})} — one model per layout: "
                          "set data.kind (glove | robot) or select episodes with data.episodes")
-    split = split_stage_episodes(pool, d_cfg)
+    split = split_stage_episodes(pool, d_cfg, stage=STAGE)
     if not split["train"]:
         raise ValueError(f"baseline: no usable training episodes in datasets {sorted(train_sets)} under "
                          f"{d_cfg.get('processed_root')!r} ({len(eps)} loaded, {len(skipped)} skipped)")

@@ -1,8 +1,11 @@
 # D1 "motion" protocol — free hand motion WITHOUT objects: vision (ego + third) + 7 glove IMUs +
-# tactile taxels. One session = one pass through all blocks (~5 min of blocks + operator pauses).
+# tactile taxels. One session = one pass through all blocks (~5.5 min of blocks + operator pauses).
 #
 # Purpose of the data
-#   - no_contact blocks  → motion-induced tactile baseline predictor (ΔS artefact vs hand motion)
+#   - no_contact blocks  → motion-induced tactile baseline predictor (ΔS artefact vs hand motion);
+#                          air_grasp_* = D2 grasp hand shapes held in the air, so the baseline has seen
+#                          grasp-like poses without contact (otherwise it under-predicts their artefact
+#                          out of distribution and D2 grasps read as false contact)
 #   - self_touch blocks  → contact-detector calibration with "free" labels (hand geometry)
 #   - everything         → IMU → MANO hand-pose model (labels: offline vision, hand_pose.npz)
 #   - imu_calibration    → per-session IMU mounting offsets (manifest.calibration)
@@ -26,8 +29,9 @@ dataset: motion
 kind: glove
 description: >-
   D1 free-motion session: static baselines, flat-hand IMU calibration, per-finger flexion,
-  whole-hand open/close (slow/fast), wrist rotations, random free motion and a self-touch set
-  (thumb pinches, fist, finger crossing, finger-to-palm), bracketed by 3-tap sync at start and end.
+  whole-hand open/close (slow/fast), wrist rotations, random free motion, contact-free "air grasps"
+  (D2 grasp shapes held without an object, slow/fast) and a self-touch set (thumb pinches, fist,
+  finger crossing, finger-to-palm), bracketed by 3-tap sync at start and end.
 cameras: [ego, third]
 rates: {pressure: 200.0, imu: 100.0, camera: 30.0, hand_pose: 30.0}
 timing:
@@ -117,6 +121,32 @@ blocks:
     speed: mixed
     prompt: "{duration_s}초 동안 자유롭게 손가락·손목을 섞어 움직인다 (빠름/느림 섞기, 손가락 벌리기 포함). 아무것도, 자기 손끼리도 닿지 않게."
     prompt_en: "Move fingers and wrist freely for {duration_s} s, mixing speeds and spreads; no contact at all."
+
+  # "air grasps": the hand shapes of the D2 grasps (d2_task.yaml grasp types), formed around an
+  # IMAGINARY object and held — nothing touches the glove, not even the own hand (fingertips stay
+  # ≥ 1 cm apart). Without these the baseline predictor never sees grasp-like finger poses without
+  # contact and under-predicts their motion artefact on D2 (false contacts).
+  - id: air_grasp_slow
+    kind: motion
+    motion: air_grasp
+    for_each: {grasp: [power, precision, lateral, tripod]}
+    cycle_s: 4.0
+    repetitions: 3
+    contact: none
+    speed: slow
+    prompt: "물체 없이 공중에서 {grasp_ko} 손모양을 천천히 만들어 약 1초 유지한 뒤 편다 ({cycle_s}초 주기 × {repetitions}회). 가상의 물체를 쥐듯 하되 손끝·손바닥이 아무것에도, 자기 손에도 닿지 않게 (손끝 사이 1 cm 이상)."
+    prompt_en: "Without any object, slowly form the {grasp} grasp shape in the air around an imaginary object, hold ~1 s and open ({cycle_s} s per cycle, {repetitions} times); nothing, not even the own hand, touches the glove (fingertips >= 1 cm apart)."
+
+  - id: air_grasp_fast
+    kind: motion
+    motion: air_grasp
+    for_each: {grasp: [power, precision, lateral, tripod]}
+    cycle_s: 1.5
+    repetitions: 4
+    contact: none
+    speed: fast
+    prompt: "같은 {grasp_ko} 손모양을 빠르게 만들었다 편다 ({cycle_s}초 주기 × {repetitions}회). 손끝끼리·손바닥에 닿지 않게."
+    prompt_en: "Form and release the {grasp} grasp shape quickly in the air ({cycle_s} s per cycle, {repetitions} times); no self-contact."
 
   - id: pinch
     kind: self_touch

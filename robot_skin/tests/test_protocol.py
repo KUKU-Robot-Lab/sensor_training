@@ -87,6 +87,19 @@ def test_d1_blocks_cover_the_required_motions():
     assert by["sync_start"].motion["tap_times"] == pytest.approx([1.0, 1.6, 2.8])
     ev = by["pinch_index"].event_value()
     assert ev["contact"] == "self" and ev["labels"] == ["self_touch"] and ev["finger"] == "index"
+    # contact-free "air grasps": the D2 grasp shapes held without an object, slow and fast
+    grasps = ("power", "precision", "lateral", "tripod")
+    for speed in ("slow", "fast"):
+        for g in grasps:
+            st = by[f"air_grasp_{speed}_{g}"]
+            assert st.kind == "motion" and st.speed == speed and st.contact == "none"
+            assert st.labels == ("no_contact",) and st.motion["type"] == "air_grasp" and st.motion["grasp"] == g
+            assert "{" not in st.prompt and "{" not in st.prompt_en and g in st.prompt_en
+            assert st.event_value()["grasp"] == g and st.event_value()["labels"] == ["no_contact"]
+    assert "파워 그립" in by["air_grasp_slow_power"].prompt and "세 손가락" in by["air_grasp_fast_tripod"].prompt
+    assert by["air_grasp_slow_power"].duration_s == pytest.approx(12.0)
+    assert by["air_grasp_fast_lateral"].duration_s == pytest.approx(6.0)
+    assert ids.index("free_motion") < ids.index("air_grasp_slow_power") < ids.index("pinch_index")
 
 
 def _broken(mutate, name="d1_motion"):

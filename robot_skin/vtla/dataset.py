@@ -48,7 +48,7 @@ from common.signal import press_intensity
 from ..action.chunking import action_chunk, action_chunks, policy_stride, policy_tick_indices
 from ..action.space import REL_MODES, ActionNormalizer, ActionSpec, actions_from_episode, make_relative
 from ..contact.ordinal import ContactLevel
-from ..datasets.episode import (D_LEVEL, D_RESIDUAL_Z, K_CONTACT_LABEL, K_DELTA, K_PHASE,
+from ..datasets.episode import (D_CONTACT_LABEL_PSEUDO, D_LEVEL, D_RESIDUAL_Z, K_CONTACT_LABEL, K_DELTA, K_PHASE,
                                 K_SATURATED, K_TAXEL_NRM, K_TAXEL_POS, Episode, cam_idx_key)
 from ..representation.encoder import TactileFeatureSpec
 
@@ -79,8 +79,8 @@ BOOTSTRAP_DEFAULTS: dict[str, float] = {
     "fallback_s": 0.5,
 }
 _GT_CONTACT = "gt_contact"                   # optional synthetic ground truth (datasets.build GT_KEYS)
-#: = ``robot_skin.contact.pseudo_label.D_CONTACT_LABEL_PSEUDO`` (derived, written by the contact stage)
-PSEUDO_LABEL_KEY = "contact_label_pseudo"
+#: = ``robot_skin.datasets.episode.D_CONTACT_LABEL_PSEUDO`` (derived, written by the contact stage)
+PSEUDO_LABEL_KEY = D_CONTACT_LABEL_PSEUDO
 
 
 # ─────────────────────────────────────────────────────────────── tactile arrays

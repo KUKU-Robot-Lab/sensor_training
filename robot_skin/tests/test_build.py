@@ -232,6 +232,33 @@ def test_glove_phases_cameras_and_files(glove_motion):
         B.preprocess_session(sdir, ep.root.parent.parent)
 
 
+def test_glove_d2_taxel_poses_stay_in_the_hand_frame(tmp_path):
+    """Regression (Episode contract K_TAXEL_POS: hand frame): while the wrist travels tens of cm
+    through a D2 task, the stored glove taxel centroid moves only a few cm (finger motion); the
+    world poses needed for hand–object proximity are R(hand_global_orient)·taxel_pos + hand_wrist_pos."""
+    from robot_skin.contact.pseudo_label import taxel_world_positions
+
+    sdir = tmp_path / "task"
+    generate_session(sdir, kind="glove", dataset="task", duration_s=4.0, seed=2, cameras=(),
+                     task_id="grasp_lift_place")
+    ep = B.preprocess_session(sdir, None, {"baseline": {"duration_s": 0.2}, "synthetic_gt": {"check": False}})
+    g = load_ground_truth(sdir)
+    pre = ep.meta.preprocessing
+    assert pre["taxel_frame"] == "mano_wrist" and pre["taxel_pose_source"] == "hand_pose"
+    assert pre["version"] == B.PREPROCESS_VERSION == "robot_skin.datasets.build/2"
+    centroid = np.asarray(ep[E.K_TAXEL_POS], dtype=np.float64).mean(1)
+    wrist = np.asarray(ep[E.K_HAND_WRIST], dtype=np.float64)
+    assert np.ptp(wrist, axis=0).max() > 0.25                        # the hand moves through the room …
+    assert np.ptp(centroid, axis=0).max() < 0.04                     # … its taxels stay put in the hand frame
+    assert np.linalg.norm(centroid - np.median(centroid, 0), axis=1).max() < 0.04
+    # self-touch is frame-invariant; world poses are recovered from the hand pose (label noise ≈ mm)
+    world, valid = taxel_world_positions(ep)
+    assert valid.mean() > 0.9
+    err = np.linalg.norm(world - _gt_at(g, "taxel_pos", ep.t), axis=-1)[valid]
+    assert np.median(err) < 0.005 and np.percentile(err, 95) < 0.012
+    assert SessionManifest.load(sdir).meta["synthetic"]["gt_taxel_frame"] == "world"   # gt taxel_pos: world
+
+
 def test_glove_task_meta_object_and_labels(tmp_path):
     sdir = tmp_path / "task"
     man = generate_session(sdir, kind="glove", dataset="task", duration_s=4.0, seed=2, cameras=(), task_id="pour")

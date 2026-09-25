@@ -377,3 +377,30 @@ def test_qc_checks_only_layout_channels(fake_d1, tmp_path):
         _edit_npz(d / "pressure.npz", raw=f)
     r = _corrupt(src, tmp_path / "dead", dead)
     assert "pressure_channels_alive" in _failed(r) and r["streams"]["pressure"]["stuck_channels"] == [3]
+
+
+def test_session_relative_layout_resolves_in_qc_and_calibration(fake_d1, tmp_path, monkeypatch):
+    """``manifest.layout`` may name a session-local YAML (relative path, moved dataset): QC and the IMU
+    calibration resolve it like preprocessing (``datasets.build.resolve_layout``), not from the CWD."""
+    import yaml
+
+    from common.layouts import load_layout
+
+    lay = load_layout("glove_template").to_dict(units="mm")
+    lay["name"] = "glove_local"
+    for tx, ch in zip(lay["taxels"], [4, 2, 0, 8, 6, 1, 3, 5, 7]):            # permuted within 0..8
+        tx["channel"] = ch
+
+    def local_layout(d):
+        (d / "layout.yaml").write_text(yaml.safe_dump(lay))
+        m = SessionManifest.load(d)
+        m.layout = "layout.yaml"
+        m.save(d)
+        _edit_npz(d / "pressure.npz", raw=lambda a: np.c_[a["raw"], np.zeros((a["raw"].shape[0], 7))])
+    monkeypatch.chdir(tmp_path)                                  # "layout.yaml" does not exist in the CWD
+    r = _corrupt(fake_d1["dir"], tmp_path / "moved" / "S", local_layout)
+    st = r["streams"]["pressure"]
+    assert r["passed"] and st["checked_channels"] == list(range(9)) and st["stuck_channels"] == [], format_report(r)
+    cal = calibrate_session_imu(tmp_path / "moved" / "S", save=False)
+    np.testing.assert_allclose(cal["imu_offsets"], SessionManifest.load(fake_d1["dir"]).calibration["imu_offsets"],
+                               atol=1e-9)

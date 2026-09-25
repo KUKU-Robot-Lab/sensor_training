@@ -66,6 +66,11 @@ KO_NAMES = {
     "thumb": "엄지", "index": "검지", "middle": "중지", "ring": "약지", "pinky": "새끼",
     "pronation_supination": "회내/회외(손바닥 뒤집기)", "flexion_extension": "굴곡/신전(손목 위아래)",
     "radial_ulnar": "요측/척측 편위(손목 좌우)",
+    # D2 grasp types (air_grasp blocks)
+    "power": "파워 그립(원통형 물체를 손 전체로 감싸 쥐는)",
+    "precision": "정밀 집기(엄지·검지 끝으로 작은 물체를 집는)",
+    "lateral": "옆 집기(열쇠를 쥐듯 엄지 끝을 검지 옆면 쪽으로 — 닿기 전까지만)",
+    "tripod": "세 손가락 집기(엄지·검지·중지 끝으로 공을 집는)",
 }
 
 _ID = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -160,7 +165,7 @@ class Step:
             v["speed"] = self.speed
         if self.motion.get("type"):
             v["motion"] = str(self.motion["type"])
-        for k in ("finger", "axis"):
+        for k in ("finger", "axis", "grasp"):
             if k in self.motion:
                 v[k] = self.motion[k]
         return v

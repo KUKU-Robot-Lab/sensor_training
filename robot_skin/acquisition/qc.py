@@ -142,12 +142,14 @@ def rest_spans(phases: Sequence[Mapping]) -> list[tuple[float, float]] | None:
                   if p["value"].get("kind") == "static" and "no_contact" in _labels_of(p["value"]))
 
 
-def _layout_channels(layout: str) -> np.ndarray | None:
-    """Sorted raw channel indices used by the session's layout (``None`` if it cannot be loaded)."""
+def _layout_channels(d: Path, m: SessionManifest) -> np.ndarray | None:
+    """Sorted raw channel indices used by the session's layout (``None`` if it cannot be loaded).
+    ``manifest.layout`` is resolved like preprocessing does (``datasets.build.resolve_layout``:
+    session-relative path, session-local copy, absolute path or built-in name)."""
     try:
-        from common.layouts import load_layout
-        ch = np.unique(np.asarray(load_layout(layout).channels, dtype=np.int64))
-    except Exception:                               # unknown / moved layout file: check all channels
+        from robot_skin.datasets.build import resolve_layout
+        ch = np.unique(np.asarray(resolve_layout(d, m)[0].channels, dtype=np.int64))
+    except Exception:                               # unknown / missing layout file: check all channels
         return None
     return ch if ch.size else None
 
@@ -160,7 +162,7 @@ def _pressure_qc(d: Path, m: SessionManifest, name: str, th: Mapping, C: _Checks
     out: dict[str, Any] = {"n_channels": C_board}
     # only the channels the layout maps to taxels are checked: a board may have unconnected
     # channels (constant or on a rail) that must not fail the session
-    used = _layout_channels(m.layout)
+    used = _layout_channels(d, m)
     if used is not None:
         C.add("pressure_channels_layout", int(used.max()) < C_board, value=C_board, limit=int(used.max()) + 1,
               stream=name, message=f"layout {m.layout!r} maps taxels to channels up to {int(used.max())}")

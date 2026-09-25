@@ -145,6 +145,41 @@ def test_contact_windows_need_residual_z():
         M.ContactWindowDataset([bad])
 
 
+def test_label_key_falls_back_to_derived_pseudo_labels(tmp_path):
+    """``label_key`` names an episode array or, when absent, a derived one: the contact stage's
+    ``contact_label_pseudo`` (``episode.D_CONTACT_LABEL_PSEUDO``) trains without in-memory views."""
+    assert E.D_CONTACT_LABEL_PSEUDO == "contact_label_pseudo"
+    ep = _toy("pseudo")
+    pseudo = np.full((T, N), -1, np.int8)
+    pseudo[:, 2] = 0                                   # taxel 2: unknown in contact_label, 0 in the pseudo labels
+    pseudo[25:35, 2] = 1
+    z = np.tile(np.arange(T, dtype=np.float32)[:, None], (1, N))
+    ep.set_derived(E.D_RESIDUAL_Z, z, save=False)
+    ep.set_derived(E.D_CONTACT_LABEL_PSEUDO, pseudo, save=False)
+    ds = M.BaselineWindowDataset([ep], window=4, label_key=E.D_CONTACT_LABEL_PSEUDO)
+    assert len(ds) == T - 10 and _at(ds, 3)["valid"].tolist() == [False, False, True]
+    cw = M.ContactWindowDataset([ep], window=5, label_key=E.D_CONTACT_LABEL_PSEUDO)
+    assert len(cw) == T
+    s = _at(cw, 30)
+    assert s["label"].tolist() == [0.0, 0.0, 1.0] and s["label_mask"].tolist() == [False, False, True]
+    # on disk: the derived .npy is found lazily; the preprocessing array still wins when present
+    ep.save(tmp_path / "ep")
+    disk = E.Episode.load(tmp_path / "ep")
+    assert not disk.has(E.D_CONTACT_LABEL_PSEUDO) and disk.has_derived(E.D_CONTACT_LABEL_PSEUDO)
+    cw2 = M.ContactWindowDataset([disk], window=5, label_key=E.D_CONTACT_LABEL_PSEUDO)
+    np.testing.assert_array_equal(_at(cw2, 30)["label"], s["label"])
+    assert _at(M.ContactWindowDataset([disk], window=5), 30)["label_mask"].tolist() == [True, True, False]
+    # neither an array nor a derived array; wrong shape
+    with pytest.raises(ValueError, match="lacks 'no_such_labels'"):
+        M.ContactWindowDataset([ep], label_key="no_such_labels")
+    with pytest.raises(ValueError, match="lacks 'no_such_labels'"):
+        M.BaselineWindowDataset([ep], label_key="no_such_labels")
+    bad = _toy("bad_labels")
+    bad.set_derived("labels_2", pseudo[:, :2], save=False)
+    with pytest.raises(ValueError, match="labels 'labels_2' have shape"):
+        M.BaselineWindowDataset([bad], label_key="labels_2")
+
+
 def test_datasets_reject_mixed_episodes():
     """Episodes whose q columns, taxel count or IMU sites differ cannot share a dataset (a silent
     column permutation would corrupt training)."""

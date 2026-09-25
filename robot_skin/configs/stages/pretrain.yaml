@@ -37,8 +37,9 @@ model:                          # representation.TaxelEncoder
   heads: 4
   ff_mult: 4
   dropout: 0.0
-  n_fourier: 8
-  fourier_scale: 0.05           # m, base period of the position Fourier features
+  n_fourier: 6                  # octaves; finest period = fourier_scale / 2**(n_fourier-1) ≈ 9 mm
+  fourier_scale: 0.3            # m, base (lowest-octave) period of the position Fourier features —
+                                # ≥ hand size, and no octave finer than mm-level pose-label noise
   n_taxels: null                # per-index id embedding (single-layout only; breaks glove/robot sharing)
 
 pretrain:                       # representation.MaskedTaxelPretrainer

@@ -1,4 +1,5 @@
 import json
+import logging
 import warnings
 
 import numpy as np
@@ -451,6 +452,46 @@ def test_stage_splits_file_and_subject_split(tmp_path):
                                     "splits": str(root / "splits.json")})
     assert [e.meta.episode_id for e in sp["train"]] == ["m0", "m1"]
     assert [e.meta.episode_id for e in sp["val"]] == ["t0"] and sp["test"][0].meta.episode_id == "m2"
+
+
+def test_stage_split_without_splits_json_warns_it_is_not_shared(tmp_path, caplog):
+    """Every stage accepts ``data.splits``; without it the stage splits its own pool and logs that
+    this split is not shared with the other stages (named per stage)."""
+    from robot_skin.stages import split_stage_episodes
+
+    root = tmp_path / "processed"
+    _write_root(root)
+    eps, _ = stage.load_usable_episodes(stage.discover_episodes({"processed_root": str(root)}))
+    with caplog.at_level(logging.WARNING, logger="robot_skin.stages"):
+        stage.split_episodes(eps, {"val_frac": 0.5})
+        split_stage_episodes(eps, {"val_frac": 0.5}, stage="baseline")
+    msgs = [r.getMessage() for r in caplog.records if "data.splits is not set" in r.getMessage()]
+    assert len(msgs) == 2 and msgs[0].startswith("pretrain:") and msgs[1].startswith("baseline:")
+    assert "NOT shared" in msgs[0] and "val_frac=0.5" in msgs[0]
+    caplog.clear()
+    (root / "splits.json").write_text(json.dumps({"train": ["motion/m0", "motion/m1"], "val": ["task/t0"],
+                                                  "test": ["motion/m2"]}))
+    with caplog.at_level(logging.WARNING, logger="robot_skin.stages"):
+        sp = split_stage_episodes(eps, {"splits": str(root / "splits.json"), "processed_root": str(root)},
+                                  stage="contact")
+    assert not [r for r in caplog.records if "data.splits is not set" in r.getMessage()]
+    assert [e.meta.episode_id for e in sp["val"]] == ["t0"]
+
+
+def test_legacy_world_frame_glove_episodes_are_flagged(caplog):
+    """Glove episodes without ``meta.preprocessing.taxel_frame`` (datasets.build < /2: world-frame
+    taxel poses) are named in one warning by the stages that consume taxel poses."""
+    from robot_skin.stages import warn_legacy_taxel_frame
+
+    old, new = make_episode("old", T=10), make_episode("new", T=10)
+    new.meta.preprocessing = {"taxel_frame": "mano_wrist"}
+    robot = make_episode("robot", T=10)
+    robot.meta.kind = "robot"
+    with caplog.at_level(logging.WARNING, logger="robot_skin.stages"):
+        assert warn_legacy_taxel_frame([old, new, robot], "baseline") == ["old"]
+        assert warn_legacy_taxel_frame([new, robot], "vtla") == []
+    msgs = [r.getMessage() for r in caplog.records]
+    assert len(msgs) == 1 and msgs[0].startswith("baseline: 1 glove episode(s)") and "--force" in msgs[0]
 
 
 def test_stage_cli(tmp_path, capsys):

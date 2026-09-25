@@ -21,7 +21,8 @@ Kinematics (ground truth, evaluated at every stream's own timestamps)
   .flexion_pose``; MANO: Romero et al., SIGGRAPH Asia 2017), global orientation and wrist
   position. D1 follows the protocol blocks of ``acquisition/protocols/d1_motion.yaml``
   (``imu_calibration`` flat hand = calibration + no_contact, ``baseline_start``, slow/fast
-  open–close sweeps, wrist rotation, free motion, thumb–finger pinches, fist, ``baseline_end``);
+  open–close sweeps, wrist rotation, free motion, thumb–finger pinches, fist, contact-free
+  ``air_grasp`` holds of the D2 grasp shapes, ``baseline_end``);
   D2 runs baseline (flat hand, then the relaxed start pose) → reach (travelling above the object,
   descending onto it) → grasp → manipulate → release (fingers open, palm lifts off) → retreat →
   baseline_end around a spherical object; on failure (``task.success = False``) the object slips
@@ -76,7 +77,13 @@ timestamp jitter.
 Ground truth for later stages: ``gt_synthetic.npz`` (:func:`load_ground_truth`) holds, at the
 pressure timestamps and in layout order, the no-contact artefact ``artefact_pct``, the press term,
 drift, contact masks, penetration, saturation, true baselines and the artefact parameters, so a
-test can check that a baseline stage recovers the artefact.
+test can check that a baseline stage recovers the artefact. Its ``taxel_pos`` is in the world frame
+(glove) / hand base frame (robot), not the hand frame of processed episodes.
+
+One glove, many sessions: the physical skin parameters (artefact gains / signs / lags, press model,
+baselines, noise levels) come from ``glove_seed`` when given — :func:`generate_dataset` shares one
+glove across all its sessions by default (``shared_glove=True``), as a real dataset recorded with one
+glove does; a lone :func:`generate_session` without ``glove_seed`` gets its own skin.
 
 Everything is deterministic in ``seed`` (numpy ``SeedSequence`` streams per component; torch is
 used only for deterministic CPU kinematics).
@@ -136,18 +143,23 @@ REACH_LIFT_M = 0.05                    # glove D2 reach: travel height above the
 
 #: D1 blocks between the static start and end, cycled to fill the session:
 #: (name, generator, contact expectation, nominal duration s, info). Names follow the step ids of
-#: ``acquisition/protocols/d1_motion.yaml``. Robot sessions skip ``wrist`` blocks and pinches the
-#: synthetic thumb cannot reach (ring, pinky).
+#: ``acquisition/protocols/d1_motion.yaml``. Robot sessions skip ``wrist`` / ``air_grasp`` blocks and
+#: pinches the synthetic thumb cannot reach (ring, pinky). ``air_grasp`` blocks hold the D2 grasp
+#: shapes (power / precision) in the air, no contact, so a baseline sees grasp-like poses without
+#: contact; they come after the first four blocks, so sessions ≤ 6 s keep their earlier plan (glove
+#: sessions longer than ≈ 6.4 s contain ``air_grasp_slow_power``).
 MOTION_BLOCKS: tuple[tuple[str, str, str, float, dict], ...] = (
     ("open_close_slow", "sweep", "none", 1.2, {"speed": "slow"}),
     ("pinch_index", "pinch", "self", 1.0, {"finger": "index"}),
     ("open_close_fast", "sweep", "none", 0.8, {"speed": "fast"}),
     ("pinch_middle", "pinch", "self", 1.0, {"finger": "middle"}),
+    ("air_grasp_slow_power", "air_grasp", "none", 1.2, {"speed": "slow", "grasp": "power"}),
     ("wrist_rotation", "wrist", "none", 1.2, {}),
     ("pinch_ring", "pinch", "self", 1.0, {"finger": "ring"}),
     ("free_motion", "free", "none", 1.5, {}),
     ("fist", "fist", "self", 1.0, {}),
     ("pinch_pinky", "pinch", "self", 1.0, {"finger": "pinky"}),
+    ("air_grasp_fast_precision", "air_grasp", "none", 0.8, {"speed": "fast", "grasp": "precision"}),
 )
 #: segment labels implied by a contact expectation (= ``acquisition.protocol.DEFAULT_CONTACT_LABELS``).
 CONTACT_LABELS: dict[str, tuple[str, ...]] = {"none": ("no_contact",), "self": ("self_touch",), "object": ()}
@@ -412,8 +424,9 @@ def plan_motion_session(duration_s: float = 6.0, kind: str = "glove") -> list[Bl
     if kind not in DEFAULT_LAYOUTS:
         raise ValueError(f"kind must be 'glove' or 'robot', got {kind!r}")
     D = _check_duration(duration_s, "motion")
+    robot_skip = ("wrist", "air_grasp")        # no wrist; no human grasp shapes on the synthetic robot hand
     cycle = [b for b in MOTION_BLOCKS
-             if kind == "glove" or (b[1] != "wrist" and b[4].get("finger") not in ("ring", "pinky"))]
+             if kind == "glove" or (b[1] not in robot_skip and b[4].get("finger") not in ("ring", "pinky"))]
     s = float(np.clip(0.18 * D, 0.8, 5.0))
     e = float(np.clip(0.12 * D, 0.5, 5.0))
     rest = D - s - e
@@ -866,6 +879,15 @@ class _GloveMotion:
         if b.gen in ("pinch", "fist"):
             n = max(1, int(round(b.dur / 1.0)))
             return {"n": n, "cmax": rng.uniform(1.0, 1.05, n), "squeeze": rng.uniform(0.01, 0.04, n)}
+        if b.gen == "air_grasp":
+            # the D2 grasp synthesis around an imaginary sphere, pads stopping `gap` short of its surface
+            per = (0.6 if b.info.get("speed") == "fast" else 1.2) / self.speed
+            R = rng.uniform(0.028, 0.036)
+            gap = rng.uniform(0.004, 0.008, 5)
+            flex_o, abd_o = _glove_open_pose(self.flex_n)
+            g = _glove_grasp(self.sk, b.info.get("grasp", "power"), R, flex_o, abd_o, -gap)
+            return {"n": max(1, int(round(b.dur / per))), "flex_open": flex_o, "abd_open": abd_o,
+                    "flex_g": g["flex"], "abd_g": g["abd"]}
         if b.gen == "static_end":
             return {"ph": rng.uniform(0, 2 * np.pi, 15)}
         return {}
@@ -971,6 +993,20 @@ class _GloveMotion:
         c = self._closure(b, tau)
         abd_key = np.array([0.35, 0.0, 0.0, 0.0, 0.0])
         return self._out(len(tau), self.flex_n + c * (key - self.flex_n), self.abd_n + c * (abd_key - self.abd_n))
+
+    def _g_air_grasp(self, b: Block, tau):
+        """Grasp shape held in the air (no object, no self-touch), per cycle: rest → open pre-shape →
+        the D2 grasp shape (``_glove_grasp``, pads a few mm short of an imaginary object) held →
+        open → rest (protocol ``air_grasp_*`` blocks)."""
+        q = self.bp[self._bi[id(b)]]
+        per = b.dur / q["n"]
+        k = np.minimum((tau // per).astype(int), q["n"] - 1)
+        x = ((tau - k * per) / per)[:, None]
+        pre = _mj(x / 0.25) * (1.0 - _mj((x - 0.85) / 0.15))
+        cl = _mj((x - 0.2) / 0.25) - _mj((x - 0.65) / 0.2)
+        flex = self.flex_n + pre * (q["flex_open"] - self.flex_n) + cl * (q["flex_g"] - q["flex_open"])
+        abd = self.abd_n + pre * (q["abd_open"] - self.abd_n) + cl * (q["abd_g"] - q["abd_open"])
+        return self._out(len(tau), flex, abd)
 
     # ── D2 (task) ─────────────────────────────────────────────────────────
     def _init_task(self, rng: np.random.Generator) -> None:
@@ -1416,20 +1452,28 @@ def _artefact_weights(layout: Layout, kind: str) -> tuple[np.ndarray, list[str]]
 
 
 def _tactile(layout: Layout, kind: str, t: np.ndarray, theta: np.ndarray, pen: np.ndarray, contact: np.ndarray,
-             rng: np.random.Generator, p: SynthParams, n_channels: int) -> dict[str, np.ndarray]:
-    """Motion artefact (angle + velocity through a first-order lag) + press + drift + noise → raw."""
+             rng: np.random.Generator, p: SynthParams, n_channels: int,
+             glove_rng: np.random.Generator | None = None) -> dict[str, np.ndarray]:
+    """Motion artefact (angle + velocity through a first-order lag) + press + drift + noise → raw.
+
+    The physical skin parameters — artefact gains / signs / lags, press gain / ceiling / lag, true
+    baselines and noise levels — are drawn from ``glove_rng`` (one physical glove / robot skin shared
+    by every session generated with the same ``glove_seed``); the session-specific drift, noise
+    realisation and dropouts from ``rng``. ``glove_rng=None`` draws everything from ``rng`` in the
+    same order (a different skin per session, the legacy behaviour)."""
     N = layout.n
     W, jnames = _artefact_weights(layout, kind)
-    sign = rng.choice([-1.0, 1.0], N)
-    g = sign * rng.uniform(*p.artefact_gain, N)
-    h = rng.choice([-1.0, 1.0], N) * rng.uniform(*p.artefact_vel_gain, N)
-    c = rng.uniform(-p.artefact_quad, p.artefact_quad, N)
-    tau = rng.uniform(*p.artefact_tau_s, N)
-    k_press = rng.uniform(*p.press_gain, N)
-    P_max = rng.uniform(*p.press_max_pct, N)
-    tau_press = rng.uniform(*p.press_tau_s, N)
-    base = rng.uniform(*p.baseline_raw, n_channels)
-    noise_sd = rng.uniform(*p.noise_pct, n_channels)
+    gr = rng if glove_rng is None else glove_rng
+    sign = gr.choice([-1.0, 1.0], N)
+    g = sign * gr.uniform(*p.artefact_gain, N)
+    h = gr.choice([-1.0, 1.0], N) * gr.uniform(*p.artefact_vel_gain, N)
+    c = gr.uniform(-p.artefact_quad, p.artefact_quad, N)
+    tau = gr.uniform(*p.artefact_tau_s, N)
+    k_press = gr.uniform(*p.press_gain, N)
+    P_max = gr.uniform(*p.press_max_pct, N)
+    tau_press = gr.uniform(*p.press_tau_s, N)
+    base = gr.uniform(*p.baseline_raw, n_channels)
+    noise_sd = gr.uniform(*p.noise_pct, n_channels)
     D = max(float(t[-1]), 1e-6)
     d_lin = rng.uniform(-p.drift_pct, p.drift_pct, n_channels)
     d_wave = rng.uniform(0.0, p.drift_wave_pct, n_channels)
@@ -1723,7 +1767,7 @@ def generate_session(out_dir: str | Path, *, kind: str = "glove", dataset: str =
                      image_hw: tuple[int, int] = (24, 32), layout: str | Path | Layout | None = None,
                      subject: str = "s0", task_id: str | None = None, session_id: str | None = None,
                      n_channels: int | None = None, params: SynthParams | Mapping | None = None,
-                     overwrite: bool = False) -> SessionManifest:
+                     glove_seed: int | None = None, overwrite: bool = False) -> SessionManifest:
     """Write one complete synthetic raw session into ``out_dir`` (the session directory) and return
     its manifest.
 
@@ -1734,9 +1778,14 @@ def generate_session(out_dir: str | Path, *, kind: str = "glove", dataset: str =
     (written to ``layout.yaml``; the manifest then references that file by absolute path;
     ``meta.synthetic.layout_file`` names it session-relative). ``n_channels``: raw ADC channels C
     (default ``max(layout.channels) + 1``). ``params``: :class:`SynthParams` or a dict of overrides.
+    ``glove_seed``: draw the physical skin parameters (per-taxel artefact gains / signs / lags, press
+    gain / ceiling / lag, true baselines and noise levels) from this seed instead of ``seed``, so
+    sessions sharing a ``glove_seed`` (and layout / ``n_channels`` / ``params``) are recorded with the
+    **same glove** (robot: the same skin) — what a baseline model must generalise across. ``None``
+    (default): a fresh skin per session. Drift, noise realisation and dropouts stay per session.
     ``session_id`` defaults to ``syn_<kind>_<dataset>_<subject>_<seed>``. An existing session in
     ``out_dir`` raises ``FileExistsError`` unless ``overwrite`` (then its files are removed first).
-    Deterministic in ``seed`` (except ``created_utc``).
+    Deterministic in ``seed`` and ``glove_seed`` (except ``created_utc``).
     """
     if kind not in DEFAULT_LAYOUTS:
         raise ValueError(f"kind must be 'glove' or 'robot', got {kind!r}")
@@ -1744,6 +1793,8 @@ def generate_session(out_dir: str | Path, *, kind: str = "glove", dataset: str =
         raise ValueError(f"dataset must be 'motion' or 'task', got {dataset!r}")
     if int(seed) < 0:
         raise ValueError("seed must be ≥ 0")
+    if glove_seed is not None and (isinstance(glove_seed, bool) or int(glove_seed) < 0):
+        raise ValueError(f"glove_seed must be None or an int ≥ 0, got {glove_seed!r}")
     hw = tuple(int(v) for v in image_hw)
     if len(hw) != 2 or min(hw) < 4:
         raise ValueError(f"image_hw must be (H, W) with H, W ≥ 4, got {image_hw}")
@@ -1794,12 +1845,16 @@ def generate_session(out_dir: str | Path, *, kind: str = "glove", dataset: str =
     contact = geo["self"] | obj_contact
     pen = geo["pen_self"] + pen_obj
     theta = st["flex"] if kind == "glove" else st["q"]
-    tac = _tactile(L, kind, t_p, theta, pen, contact, _rng(seed, "tactile"), p, C)
+    glove_rng = None if glove_seed is None else _rng(int(glove_seed), "glove", kind)
+    tac = _tactile(L, kind, t_p, theta, pen, contact, _rng(seed, "tactile"), p, C, glove_rng)
     np.savez(out / "pressure.npz", t=t_p, raw=tac["raw"])
     streams = {"pressure": StreamInfo("pressure.npz", p.pressure_hz, ["t", "raw"])}
 
     meta_syn: dict[str, Any] = {"style": style, "gt_file": GT_FILE, "channels_used": L.channels,
-                                "n_channels": C, "blocks": [asdict(b) for b in blocks]}
+                                "n_channels": C, "blocks": [asdict(b) for b in blocks],
+                                "glove_seed": None if glove_seed is None else int(glove_seed),
+                                # frame of gt_synthetic.npz taxel_pos (≠ the processed Episode's hand frame)
+                                "gt_taxel_frame": "world" if kind == "glove" else "hand_base"}
     calib: dict = {}
     # ── IMU + hand labels (glove) / joint state (robot) ───────────────────
     if kind == "glove":
@@ -1905,12 +1960,17 @@ def generate_session(out_dir: str | Path, *, kind: str = "glove", dataset: str =
 
 
 def generate_dataset(root: str | Path, *, n_motion: int = 2, n_task: int = 2, kind: str = "glove",
-                     subjects: Sequence[str] = ("s0", "s1"), seed: int = 0, **kw) -> list[Path]:
+                     subjects: Sequence[str] = ("s0", "s1"), seed: int = 0, shared_glove: bool = True,
+                     **kw) -> list[Path]:
     """Generate ``n_motion`` D1 and ``n_task`` D2 sessions under ``root/<dataset>/<subject>/<session_id>``.
 
     Sessions are spread round-robin over ``subjects``; tasks cycle through :data:`SYNTH_TASKS`
-    (unless ``task_id`` is given in ``kw``); each session gets a distinct derived seed. Extra ``kw``
-    go to :func:`generate_session`. Returns the session directories (motion first).
+    (unless ``task_id`` is given in ``kw``); each session gets a distinct derived seed (its own
+    motion, clocks, noise). ``shared_glove`` (default): every session is recorded with **one**
+    physical glove / robot skin — :func:`generate_session` ``glove_seed = seed`` (an explicit
+    ``glove_seed`` in ``kw`` wins) — like a real dataset, so a baseline trained on some sessions can
+    be evaluated on held-out ones; ``False``: a different skin per session. Extra ``kw`` go to
+    :func:`generate_session`. Returns the session directories (motion first).
     """
     if not subjects:
         raise ValueError("need at least one subject")
@@ -1920,6 +1980,8 @@ def generate_dataset(root: str | Path, *, n_motion: int = 2, n_task: int = 2, ki
     if int(n_motion) < 0 or int(n_task) < 0:
         raise ValueError(f"n_motion / n_task must be ≥ 0, got {n_motion}, {n_task}")
     root = Path(root)
+    if shared_glove:
+        kw.setdefault("glove_seed", int(seed))
     tasks = sorted(SYNTH_TASKS)
     out: list[Path] = []
     k = 0
@@ -1947,6 +2009,12 @@ def load_ground_truth(session_dir: str | Path) -> dict[str, np.ndarray]:
     ``saturated`` (raw on an ADC rail) bool, ``penetration_m``, ``baseline_raw``, ``taxel_pos``, ``joint_angle`` (the
     artefact model input θ) and the artefact parameters (``artefact_weights``, ``angle_gain``,
     ``vel_gain``, ``quad_gain``, ``tau_s`` …), plus the true pose (glove: ``hand_global_orient``,
-    ``hand_finger_pose``, ``hand_wrist_pos``; robot: ``q``) and, for tasks, ``object_pos``."""
+    ``hand_finger_pose``, ``hand_wrist_pos``; robot: ``q``) and, for tasks, ``object_pos``.
+
+    Frames: ground-truth ``taxel_pos`` is in the frame of ``object_pos`` — the **world** frame for
+    gloves (true ``global_orient`` / ``wrist_pos`` applied) and the hand base (URDF root) for robots
+    (``meta.synthetic.gt_taxel_frame``). The processed Episode's ``taxel_pos`` is in the hand frame
+    instead (``datasets.build``); map glove ground truth there with ``R(hand_global_orient)ᵀ ·
+    (taxel_pos − hand_wrist_pos)``."""
     with np.load(Path(session_dir) / GT_FILE) as z:
         return {k: z[k] for k in z.files}

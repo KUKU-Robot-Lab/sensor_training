@@ -4,6 +4,13 @@ token_i = LN( value_mlp(v_i) + pose_mlp([fourier(pos_i), nrm_i]) (+ id_emb_i) )
 
 Pose (not channel index) carries the geometry, so the same tokenizer can serve a glove and a
 robot hand with different taxel counts; the optional id embedding is for single-layout models.
+
+Position features are Fourier features (Tancik et al., NeurIPS 2020, arXiv:2006.10739) at octave
+frequencies: the lowest octave has period ``fourier_scale`` and the finest ``fourier_scale /
+2**(n_fourier−1)``. Defaults ``fourier_scale = 0.3`` m, ``n_fourier = 6`` (finest period ≈ 9 mm):
+the lowest octave spans a whole hand (≈ 0.2 m in the hand frame) without wrapping, and no octave is
+finer than the mm-level error of vision / IMU pose labels (with 0.05 m × 8 octaves the finest
+period was 0.4 mm, so the top octaves were pure pose noise).
 ``mask[B,N]`` swaps the value part for a learned ``[MASK]`` vector (masked pretraining) while
 keeping the pose part, so the model knows *where* it has to fill in.
 """
@@ -16,15 +23,16 @@ import torch.nn as nn
 
 
 def fourier_features(pos: torch.Tensor, n_freq: int, scale: float) -> torch.Tensor:
-    """``[...,3]`` → ``[..., 3*2*n_freq]`` sin/cos at octave frequencies (period ``scale``)."""
+    """``[...,3]`` → ``[..., 3*2*n_freq]`` sin/cos at octave frequencies (lowest period ``scale``,
+    halving per octave; Tancik et al., arXiv:2006.10739)."""
     freqs = (2.0 ** torch.arange(n_freq, device=pos.device, dtype=pos.dtype)) * (2 * math.pi / scale)
     x = pos.unsqueeze(-1) * freqs  # [...,3,F]
     return torch.cat([x.sin(), x.cos()], dim=-1).flatten(-2)
 
 
 class TaxelTokenizer(nn.Module):
-    def __init__(self, value_dim: int, d_model: int = 64, *, n_fourier: int = 8,
-                 fourier_scale: float = 0.05, n_taxels: int | None = None) -> None:
+    def __init__(self, value_dim: int, d_model: int = 64, *, n_fourier: int = 6,
+                 fourier_scale: float = 0.3, n_taxels: int | None = None) -> None:
         super().__init__()
         self.n_fourier, self.fourier_scale = n_fourier, fourier_scale
         self.value_mlp = nn.Sequential(nn.Linear(value_dim, d_model), nn.GELU(), nn.Linear(d_model, d_model))

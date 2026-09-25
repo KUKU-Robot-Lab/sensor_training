@@ -124,7 +124,16 @@ def calibrate_session_imu(session_dir: str | Path, *, phase: str | None = "imu_c
         sel = (t >= ph["t0"]) & (t <= ph["t1"])
     if sel.sum() < 3:
         raise ValueError(f"{d}: fewer than 3 IMU samples inside the calibration phase")
-    lay = layout if isinstance(layout, Layout) else load_layout(layout or m.layout)
+    if isinstance(layout, Layout):
+        lay = layout
+    elif layout:
+        lay = load_layout(layout)
+    else:
+        # manifest.layout may be session-relative / a session-local copy (moved datasets): resolve it
+        # exactly like preprocessing does
+        from robot_skin.datasets.build import resolve_layout
+
+        lay = resolve_layout(d, m)[0]
     sites = sites or [s.name for s in lay.imu_sites]
     calib, quality = compute_imu_calibration(quat[sel], sites, lay, gyro=None if gyro is None else gyro[sel],
                                              skeleton=skeleton)

@@ -102,6 +102,7 @@ def test_glove_logger_fake_d1_end_to_end(tmp_path):
     phases = [e["name"] for e in (json.loads(x) for x in (out / "events.jsonl").read_text().splitlines())
               if e["type"] == "phase_start"]
     assert phases[0] == "baseline_start" and phases[-1] == "baseline_end" and "pinch_index" in phases
+    assert {"air_grasp_slow_power", "air_grasp_fast_tripod"} <= set(phases)      # fake scene plays air grasps
     with np.load(out / "pressure.npz") as z:
         assert z["raw"].shape[1] == 9 and np.all(np.diff(z["t"]) > 0)
 

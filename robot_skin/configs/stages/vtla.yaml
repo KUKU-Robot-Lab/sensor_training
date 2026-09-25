@@ -90,8 +90,8 @@ model:                          # vtla.VTLAConfig
     d_model: 64
     depth: 2
     heads: 4
-    n_fourier: 8
-    fourier_scale: 0.05
+    n_fourier: 6                # finest Fourier period 0.3 m / 2**5 ≈ 9 mm (above pose-label noise)
+    fourier_scale: 0.3          # m, lowest-octave period (≥ hand size)
     ff_mult: 4
     dropout: 0.0
   n_tactile_tokens: 4           # TactileTokenAdapter queries K

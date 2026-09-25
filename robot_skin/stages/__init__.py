@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import math
 import os
 import warnings
@@ -19,7 +20,9 @@ from typing import Any, Mapping, Sequence
 
 __all__ = ["apply_stage_hardware", "load_stage_yaml", "resolve_stage_config", "check_stage_keys",
            "finite_json", "write_json_atomic", "parse_overrides", "stage_episodes", "split_stage_episodes",
-           "seed_model_init", "fit_and_restore"]
+           "warn_unshared_split", "warn_legacy_taxel_frame", "seed_model_init", "fit_and_restore"]
+
+log = logging.getLogger("robot_skin.stages")
 
 
 def _deep_merge(a: Mapping[str, Any], b: Mapping[str, Any]) -> dict:
@@ -183,14 +186,44 @@ def stage_episodes(data_cfg: Mapping[str, Any], dataset_keys: Sequence[str] = ("
     return eps, skipped
 
 
-def split_stage_episodes(eps: Sequence, data_cfg: Mapping[str, Any]) -> dict[str, list]:
+def warn_unshared_split(stage: str | None, data_cfg: Mapping[str, Any], how: str) -> None:
+    """Log a WARNING that ``data.splits`` is unset, so ``stage`` split its *own* usable episode pool
+    (``how`` describes the fallback). That split is not shared: every stage re-splits whatever
+    episodes it can use (different skip sets / ``data.kind`` / datasets), so an episode held out here
+    can be a training episode of another stage (e.g. the contact calibrator fitted on baseline-train
+    episodes, or pretraining on later VTLA test episodes). The pipeline should create one
+    ``splits.json`` (``datasets.splits.make_splits`` + ``save_splits``) and pass it as ``data.splits``
+    to every stage (imu_pose, baseline, contact, pretrain, vtla)."""
+    log.warning("%s: data.splits is not set — splitting this stage's own episode pool (%s). This split "
+                "is NOT shared with the other stages, so held-out episodes may be training episodes "
+                "of another stage; pass one splits.json (datasets.splits.make_splits + save_splits) as "
+                "data.splits to every stage.", stage or "stage", how)
+
+
+def warn_legacy_taxel_frame(eps: Sequence, stage: str | None = None) -> list[str]:
+    """Glove episodes preprocessed before ``datasets.build/2`` (no ``meta.preprocessing.taxel_frame``)
+    store **world-frame** taxel poses, not the hand frame (``global_orient = 0``, wrist at the origin)
+    that the baseline, pretraining and VTLA models — and online control — use. Log one WARNING
+    listing them (rebuild with ``python -m robot_skin.datasets.build --force``); returns their ids."""
+    old = [ep.meta.episode_id for ep in eps
+           if ep.meta.kind == "glove" and "taxel_frame" not in (ep.meta.preprocessing or {})]
+    if old:
+        log.warning("%s: %d glove episode(s) preprocessed before robot_skin.datasets.build/2 (no "
+                    "meta.preprocessing.taxel_frame) store world-frame taxel poses, not the hand frame the "
+                    "models use — rebuild them with `python -m robot_skin.datasets.build --force`: %s",
+                    stage or "stage", len(old), ", ".join(old[:5]) + (" …" if len(old) > 5 else ""))
+    return old
+
+
+def split_stage_episodes(eps: Sequence, data_cfg: Mapping[str, Any], *, stage: str | None = None) -> dict[str, list]:
     """Leakage-safe train / val / test split of loaded episodes — exactly
     :func:`robot_skin.stages.pretrain.split_episodes` (``data.splits`` = a ``splits.json`` from
     ``datasets.splits``, test excluded from training unless ``use_test``; else a seeded ``val_frac``
-    split by episode or subject), so every stage sees the same held-out episodes."""
+    split by episode or subject, with a :func:`warn_unshared_split` warning naming ``stage``), so every
+    stage given the same ``splits.json`` sees the same held-out episodes."""
     from .pretrain import split_episodes
 
-    return split_episodes(list(eps), data_cfg)
+    return split_episodes(list(eps), data_cfg, stage=stage)
 
 
 def seed_model_init(train_cfg: Mapping[str, Any]) -> int:

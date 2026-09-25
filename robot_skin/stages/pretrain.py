@@ -49,7 +49,7 @@ import numpy as np
 import yaml
 
 from ..config import deep_merge
-from ..datasets.episode import (D_LEVEL, D_RESIDUAL_Z, K_TAXEL_NRM, K_TAXEL_POS, Episode,
+from ..datasets.episode import (D_LEVEL, D_RESIDUAL_Z, EPISODE_JSON, K_TAXEL_NRM, K_TAXEL_POS, Episode,
                                 list_episodes)
 from ..representation.encoder import (ENCODER_STATE_NAME, TactileFeatureSpec, TaxelEncoder,
                                       save_pretrained_encoder)
@@ -86,7 +86,7 @@ DEFAULTS: dict[str, Any] = {
     },
     "features": {"obs_mode": "full", "history": 1, "stride": 1, "z_clip": 100.0, "z_scale": 2.0},
     "model": {"d_model": 64, "depth": 2, "heads": 4, "ff_mult": 4, "dropout": 0.0,
-              "n_fourier": 8, "fourier_scale": 0.05, "n_taxels": None},
+              "n_fourier": 6, "fourier_scale": 0.3, "n_taxels": None},
     "pretrain": {
         "mask_ratio": 0.3,
         "mask_mode": "mixed",
@@ -242,8 +242,22 @@ def _match(entry: str, eps: Sequence[Episode], bases: Sequence[Path]) -> Episode
     return None
 
 
-def split_episodes(eps: Sequence[Episode], data_cfg: Mapping[str, Any]) -> dict[str, list[Episode]]:
-    """Leakage-safe split (whole episodes, or whole subjects with ``split_by: subject``)."""
+def _is_episode_dir(entry: str, bases: Sequence[Path]) -> bool:
+    """A splits entry that names an episode directory on disk (absolute or relative to one of
+    ``bases``) — an episode outside this stage's pool (another dataset, or skipped as unusable),
+    not a broken entry."""
+    cand = [Path(entry)] + ([b / entry for b in bases] if not Path(entry).is_absolute() else [])
+    return any((c / EPISODE_JSON).is_file() for c in cand)
+
+
+def split_episodes(eps: Sequence[Episode], data_cfg: Mapping[str, Any], *,
+                   stage: str | None = STAGE) -> dict[str, list[Episode]]:
+    """Leakage-safe split (whole episodes, or whole subjects with ``split_by: subject``): from
+    ``data.splits`` (a shared ``splits.json``) or, when absent, a seeded ``val_frac`` split of this
+    pool — logged as a warning (:func:`robot_skin.stages.warn_unshared_split`): it is not shared with
+    the other stages. With a splits file, entries that resolve to no episode and usable episodes it
+    does not list are warned about; entries naming an existing episode directory outside this pool
+    (another dataset — a shared file lists them all) are only logged."""
     root = Path(data_cfg.get("processed_root") or ".")
     splits_path = data_cfg.get("splits")
     if splits_path:
@@ -252,12 +266,17 @@ def split_episodes(eps: Sequence[Episode], data_cfg: Mapping[str, Any]) -> dict[
         # directory of splits.json (datasets.splits.load_splits default)
         bases = [root, Path(splits_path).parent]
         out: dict[str, list[Episode]] = {k: [] for k in _SPLITS}
-        unmatched = 0
+        unmatched = outside = 0
         for name in _SPLITS:
             for entry in spec.get(name, []) or []:
                 ep = _match(str(entry), eps, bases)
                 if ep is None:
-                    unmatched += 1
+                    # a shared splits.json lists every dataset's episodes: an existing episode dir
+                    # that is not in this stage's pool is expected, an unresolvable entry is not
+                    if _is_episode_dir(str(entry), bases):
+                        outside += 1
+                    else:
+                        unmatched += 1
                 elif all(ep is not e for part in out.values() for e in part):
                     out[name].append(ep)
         listed = {id(e) for part in out.values() for e in part}
@@ -265,6 +284,9 @@ def split_episodes(eps: Sequence[Episode], data_cfg: Mapping[str, Any]) -> dict[
         if unmatched or n_unlisted:
             warnings.warn(f"splits {splits_path}: {unmatched} entries without a usable episode, "
                           f"{n_unlisted} usable episodes not listed (ignored)", stacklevel=2)
+        if outside:
+            log.info("%s: splits %s lists %d episodes outside this stage's pool (other datasets / not usable here)",
+                     stage or "stage", splits_path, outside)
         if data_cfg.get("use_test"):
             out["train"] = out["train"] + out["test"]
             out["test"] = []
@@ -272,6 +294,10 @@ def split_episodes(eps: Sequence[Episode], data_cfg: Mapping[str, Any]) -> dict[
     by = data_cfg.get("split_by", "episode")
     if by not in ("episode", "subject"):
         raise ValueError(f"data.split_by must be episode|subject, got {by!r}")
+    from . import warn_unshared_split
+
+    warn_unshared_split(stage, data_cfg, f"seeded split by {by}, val_frac={data_cfg.get('val_frac', 0.2)}, "
+                        f"split_seed={data_cfg.get('split_seed', 0)}, {len(eps)} episodes")
     keys = sorted({(ep.meta.subject or "") if by == "subject" else ep.meta.episode_id for ep in eps})
     rng = np.random.default_rng(int(data_cfg.get("split_seed", 0)))
     order = [keys[i] for i in rng.permutation(len(keys))]
@@ -325,6 +351,9 @@ def run(cfg: Mapping[str, Any] | None = None) -> dict:
     eps, skipped = load_usable_episodes(dirs)
     for s in skipped:
         log.warning("pretrain: skipping %s (%s)", s["episode"], s["reason"])
+    from . import warn_legacy_taxel_frame
+
+    warn_legacy_taxel_frame(eps, STAGE)
     split = split_episodes(eps, d_cfg)
     if not split["train"]:
         raise ValueError(f"no usable training episodes ({len(dirs)} found under "

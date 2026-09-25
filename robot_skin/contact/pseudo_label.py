@@ -8,7 +8,7 @@ there). The contact stage fills the unknown frames by fusing, per (frame, taxel)
 2. the **detector** probability (``contact.detector``), debounced by a :class:`HysteresisFilter`;
 3. the **phase expectation** of the protocol (``meta.phases[].contact`` — ``none`` / ``self`` /
    ``object`` / ``any`` from the recorder / synthetic phase events; if absent, inferred from the
-   phase name: reach / retreat / baseline / calibration → none; grasp / manipulate / release →
+   phase name: reach / retreat / baseline / calibration / air_grasp → none; grasp / manipulate / release →
    object; pinch / fist → self):
 
    - ``none`` phases → 0; a detector firing there is a conflict → −1 (``none_conflict="unknown"``)
@@ -35,17 +35,18 @@ from typing import Any, Mapping
 
 import numpy as np
 
+# derived key written by the contact stage: defined in the Episode contract
+# (``datasets.episode.D_CONTACT_LABEL_PSEUDO``) and re-exported here under the same name for existing
+# imports (labels of a later stage, so they live under ``derived/`` next to ``contact_prob``)
+from ..datasets.episode import D_CONTACT_LABEL_PSEUDO
 from .hysteresis import HysteresisFilter
 
 __all__ = ["D_CONTACT_LABEL_PSEUDO", "EXPECTATIONS", "phase_expectation", "frame_expectation",
            "taxel_world_positions", "pseudo_label_episode", "pseudo_label_metrics"]
 
-#: derived key written by the contact stage (not a ``datasets.episode`` K_* array: labels of a
-#: later stage, so they live under ``derived/`` next to ``contact_prob``)
-D_CONTACT_LABEL_PSEUDO = "contact_label_pseudo"
 EXPECTATIONS = ("none", "self", "object", "any")
 _NONE_NAMES = ("reach", "retreat", "baseline", "rest", "imu_calibration", "calibration", "open_close",
-               "wrist_rotation", "free_motion", "finger_flex", "idle")
+               "wrist_rotation", "free_motion", "finger_flex", "air_grasp", "idle")
 _OBJECT_NAMES = ("grasp", "manipulate", "release", "task", "lift", "place", "pour", "wipe", "insert")
 _SELF_NAMES = ("pinch", "fist", "self_touch", "finger_cross", "palm_touch")
 _ALLOWED = ("self", "object", "any")

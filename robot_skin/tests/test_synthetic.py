@@ -67,7 +67,8 @@ def test_motion_and_task_plans():
             if kind == "robot":
                 assert not any(x.gen == "wrist" or x.info.get("finger") in ("ring", "pinky") for x in b)
     gens = {x.gen for x in S.plan_motion_session(30.0, "glove")}
-    assert {"sweep", "pinch", "wrist", "free", "fist"} <= gens
+    assert {"sweep", "pinch", "wrist", "free", "fist", "air_grasp"} <= gens
+    assert "air_grasp" not in {x.gen for x in S.plan_motion_session(30.0, "robot")}
     t = S.plan_task_session(6.0)
     assert [x.name for x in t] == ["baseline", *S.TASK_PHASES, "baseline_end"]
     assert [x.labels for x in t] == [("no_contact",)] + [()] * 5 + [("no_contact",)]
@@ -531,6 +532,64 @@ def test_generate_dataset_layout(tmp_path):
     assert [p.parent.parent.name for p in dirs] == ["motion"] * 2 + ["task"] * 3
     assert [p.parent.name for p in dirs] == ["s0", "s1", "s0", "s1", "s0"]
     assert len(seeds) == 5 and tasks == sorted(S.SYNTH_TASKS)[:3]
+
+
+def test_shared_glove_physics(tmp_path):
+    """One physical glove across sessions: ``glove_seed`` fixes the per-taxel skin parameters (artefact
+    gains / signs / lags, press model, baselines, noise levels) while motion, drift and noise stay
+    per session; ``generate_dataset`` shares one glove by default."""
+    skin = ("angle_gain", "vel_gain", "quad_gain", "tau_s", "press_gain", "press_max_pct", "press_tau_s",
+            "noise_std_pct", "baseline_raw_all")
+    kw = dict(kind="glove", dataset="motion", duration_s=2.5, cameras=())
+    for i, (seed, subj) in enumerate(((1, "s0"), (2, "s1"))):
+        S.generate_session(tmp_path / f"g{i}", seed=seed, subject=subj, glove_seed=7, **kw)
+    S.generate_session(tmp_path / "own", seed=2, subject="s1", **kw)
+    a, b, own = (S.load_ground_truth(tmp_path / n) for n in ("g0", "g1", "own"))
+    for k in skin:
+        np.testing.assert_array_equal(a[k], b[k], err_msg=k)
+    assert not np.array_equal(a["angle_gain"], own["angle_gain"])
+    assert not np.array_equal(a["drift_pct"][:100], b["drift_pct"][:100])      # per-session drift / noise
+    assert not np.array_equal(a["joint_angle"][:300], b["joint_angle"][:300])  # per-session motion
+    # same session seed, legacy (no glove seed) vs a glove seed: identical motion, different skin
+    np.testing.assert_array_equal(b["joint_angle"], own["joint_angle"])
+    assert SessionManifest.load(tmp_path / "g1").meta["synthetic"]["glove_seed"] == 7
+    assert SessionManifest.load(tmp_path / "own").meta["synthetic"]["glove_seed"] is None
+    # generate_dataset: one glove (glove_seed = seed) unless shared_glove=False; an explicit glove_seed wins
+    dd = dict(n_motion=2, n_task=1, kind="glove", seed=3, duration_s=3.0, cameras=())
+    shared = [S.load_ground_truth(p) for p in S.generate_dataset(tmp_path / "ds", **dd)]
+    assert all(np.array_equal(shared[0][k], x[k]) for x in shared[1:] for k in skin)
+    assert SessionManifest.load(tmp_path / "ds" / "motion" / "s0" / "syn_glove_motion_s0_000_30021"
+                                ).meta["synthetic"]["glove_seed"] == 3
+    own_ds = [S.load_ground_truth(p) for p in S.generate_dataset(tmp_path / "ds2", shared_glove=False, **dd)]
+    assert not np.array_equal(own_ds[0]["angle_gain"], own_ds[1]["angle_gain"])
+    pinned = S.generate_dataset(tmp_path / "ds3", glove_seed=7, **{**dd, "n_task": 0})
+    np.testing.assert_array_equal(S.load_ground_truth(pinned[0])["angle_gain"], a["angle_gain"])
+    with pytest.raises(ValueError, match="glove_seed"):
+        S.generate_session(tmp_path / "bad", glove_seed=-1, **kw)
+    assert not (tmp_path / "bad").exists()
+
+
+def test_air_grasp_block_is_contact_free_grasp_shape(tmp_path):
+    """Glove D1 mirrors the protocol's ``air_grasp`` blocks: the D2 grasp shape held in the air —
+    labelled no_contact, geometrically contact-free, fingers well flexed. Sessions ≤ 6 s keep their
+    earlier plan (the block comes after the first four)."""
+    assert "air_grasp" not in {b.gen for b in S.plan_motion_session(6.0, "glove")}
+    m = S.generate_session(tmp_path / "ag", kind="glove", dataset="motion", duration_s=8.0, seed=4, cameras=())
+    gt = S.load_ground_truth(tmp_path / "ag")
+    (blk,) = [b for b in m.meta["synthetic"]["blocks"] if b["gen"] == "air_grasp"]
+    assert blk["name"] == "air_grasp_slow_power" and blk["contact"] == "none" and blk["labels"] == ["no_contact"]
+    inb = (gt["t"] >= blk["t0"]) & (gt["t"] < blk["t1"])
+    assert not gt["contact"][inb].any() and not gt["self_touch"][inb].any()
+    assert np.all(np.abs(gt["press_pct"][inb]) < S.PRESS_EPS_PCT)
+    nc = _in_spans(gt["t"], m.spans("no_contact"))
+    assert nc[inb].all()                                             # the whole block is a no_contact segment
+    # a grasp, not a rest pose: flexion well above the relaxed start pose, artefact clearly excited
+    rest = _in_spans(gt["t"], [(s["t0"], s["t1"]) for s in m.segments if s["label"] == "no_contact"][:1])
+    theta = gt["joint_angle"]
+    assert theta[inb].max() > theta[rest].max() + 0.5
+    assert np.abs(gt["artefact_pct"][inb]).max() > 1.0
+    ev = [e for e in _events(tmp_path / "ag") if e["type"] == "phase_start" and e["name"] == blk["name"]]
+    assert ev and ev[0]["value"]["contact"] == "none"
 
 
 def test_input_validation(tmp_path):

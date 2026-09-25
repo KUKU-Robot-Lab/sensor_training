@@ -259,6 +259,8 @@ def test_phase_expectation_inference():
     assert phase_expectation("manipulate") == "object" and phase_expectation("pinch_index") == "self"
     assert phase_expectation("retreat") == "none" and phase_expectation("sync_start") == "any"
     assert phase_expectation("mystery") is None
+    # D1 air grasps are grasp shapes WITHOUT contact (not the D2 "grasp" phase)
+    assert phase_expectation("air_grasp_slow_power") == "none" and phase_expectation("grasp") == "object"
     ep = _task_episode()
     exp = frame_expectation(ep)
     assert exp[0] == "none" and exp[30] == "object" and exp[85] == "none" and exp[95] == ""

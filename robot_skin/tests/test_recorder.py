@@ -287,6 +287,27 @@ def test_fake_sources_are_deterministic_and_consistent():
     assert j.info()["names"][0] == "thumb_j1" and j.scene.kind == "robot"
 
 
+def test_fake_d1_air_grasps_are_grasp_shapes_without_press():
+    """The fake scene plays the D1 ``air_grasp_*`` steps as the D2 grasp shapes (flexed, per grasp
+    type) with no press anywhere — they are no_contact data for the baseline."""
+    from robot_skin.acquisition.fake import FakeScene
+    from robot_skin.acquisition.protocol import load_protocol, plan_session
+    plan = plan_session(load_protocol("d1_motion"), seed=0, time_scale=0.1)
+    sc = FakeScene.from_episode(plan.episodes[0], plan.timing, kind="glove", cameras=(), seed=2)
+    rest = sc.hand_state(np.array([0.5]))["flex"][0]
+    shapes = {}
+    for ts in sc.timeline:
+        if ts.step.motion.get("type") != "air_grasp":
+            continue
+        st = sc.hand_state(np.linspace(ts.t0, ts.t1, 200))
+        assert not st["press"].any(), ts.step.id
+        shapes.setdefault(ts.step.motion["grasp"], []).append(st["flex"].max(0))
+    assert set(shapes) == {"power", "precision", "lateral", "tripod"}
+    for g, fl in shapes.items():
+        assert (np.max(fl, 0) > rest + 0.1).sum() >= 3, g                    # fingers clearly flexed
+    assert not np.allclose(shapes["power"][0], shapes["lateral"][0], atol=0.05)
+
+
 def test_fake_d2_tasks_contact_only_when_expected():
     """Every catalog task: no press while reaching / retreating, clear press while grasping or
     manipulating, and the object moves only if it is grasped (not for press_button)."""

@@ -215,7 +215,7 @@ def run(cfg: Mapping[str, Any] | None = None) -> dict:
             with_imu.append(ep)
     pool = [e for e in with_imu if e.meta.dataset in train_sets and e.has(K_HAND_FINGERS) and e.has(K_HAND_VALID)
             and bool(np.asarray(e[K_HAND_VALID]).any())]
-    split = split_stage_episodes(pool, d_cfg)
+    split = split_stage_episodes(pool, d_cfg, stage=STAGE)
     if not split["train"]:
         raise ValueError(f"imu_pose: no training episodes with IMUs and hand labels in {sorted(train_sets)} under "
                          f"{d_cfg.get('processed_root')!r} ({len(eps)} loaded, {len(skipped)} skipped)")

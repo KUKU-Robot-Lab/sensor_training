@@ -57,6 +57,23 @@ def _window_all(mask: np.ndarray, window: int) -> np.ndarray:
     return (c[window:] - c[:-window]) == 0
 
 
+def _label_array(ep: Episode, key: str, who: str) -> np.ndarray:
+    """Per-taxel label array ``[T,N]``: the episode array ``key`` (preprocessing ``contact_label``) or,
+    when absent, the derived array of that name (e.g. the contact stage's ``contact_label_pseudo``,
+    ``datasets.episode.D_CONTACT_LABEL_PSEUDO``)."""
+    if ep.has(key):
+        lab = ep[key]
+    elif ep.has_derived(key):
+        lab = ep.derived(key)
+    else:
+        raise ValueError(f"episode {ep.meta.episode_id!r} lacks {key!r} (neither an array nor a derived "
+                         f"array; needed by {who})")
+    if lab.shape != (ep.T, ep.meta.n_taxels):
+        raise ValueError(f"episode {ep.meta.episode_id!r}: labels {key!r} have shape {lab.shape}, "
+                         f"expected {(ep.T, ep.meta.n_taxels)}")
+    return lab
+
+
 def imu_wrist_index(ep: Episode) -> int:
     """Index of the wrist IMU in ``ep.meta.imu_sites`` (recorded by preprocessing; else the site
     named ``wrist``; else 0)."""
@@ -147,6 +164,8 @@ class BaselineWindowDataset(_WindowDataset):
     ``require_q_valid``) every frame of its window has a measured ``q`` *and* ``qd``
     (:func:`qd_valid_mask`: no held hand label inside the derivative filter's footprint either).
     ``joint_stats``: ``{"q": NormStats, "qd": NormStats}`` (``compute_stats`` output) or a tuple.
+    ``label_key``: an episode array (default ``contact_label``) or, when the episode has no such
+    array, a derived one (e.g. ``contact_label_pseudo`` of the contact stage).
     All episodes must share ``n_taxels``, the joint dimension and ``meta.joint_names``."""
 
     def __init__(self, episodes: Iterable[Episode | str | Path], *, window: int = 32, stride: int = 1,
@@ -159,13 +178,14 @@ class BaselineWindowDataset(_WindowDataset):
         self._q, self._qd, self._valid = [], [], []
         dims = set()
         for e, ep in enumerate(self.episodes):
-            for k in (K_Q, K_QD, K_DELTA, K_TAXEL_POS, K_TAXEL_NRM, label_key):
+            for k in (K_Q, K_QD, K_DELTA, K_TAXEL_POS, K_TAXEL_NRM):
                 if not ep.has(k):
                     raise ValueError(f"episode {ep.meta.episode_id!r} lacks {k!r} (needed by BaselineWindowDataset)")
+            lab = _label_array(ep, label_key, "BaselineWindowDataset")
             dims.add(ep[K_Q].shape[1])
             self._q.append(_norm(self.q_stats, ep[K_Q]))
             self._qd.append(_norm(self.qd_stats, ep[K_QD]))
-            valid = np.isin(np.asarray(ep[label_key]), self.only_labels) & np.isfinite(np.asarray(ep[K_DELTA]))
+            valid = np.isin(np.asarray(lab), self.only_labels) & np.isfinite(np.asarray(ep[K_DELTA]))
             if exclude_saturated and ep.has(K_SATURATED):
                 valid &= ~np.asarray(ep[K_SATURATED], dtype=bool)
             self._valid.append(valid)
@@ -199,23 +219,27 @@ class ContactWindowDataset(_WindowDataset):
     (``contact_label ≥ 0`` and, with ``exclude_saturated``, not saturated), ``q_valid`` (scalar bool:
     ``q``/``qd`` at ``t`` are measurements, :func:`qd_valid_mask` — a glove frame without a valid hand
     label carries the *held* pose and ``qd`` ≈ 0, which must not read as "hand at rest"),
-    ``episode``, ``t_index``. Frames with ≥ ``min_labelled`` labelled taxels are used. Episodes need
-    ``derived/<z_key>.npy`` ``[T,N]`` and must share ``n_taxels`` / joint dims."""
+    ``episode``, ``t_index``. Frames with ≥ ``min_labelled`` labelled taxels are used. Labels come
+    from ``label_key``: the episode array (default ``contact_label``) or, when absent, the derived
+    array of that name — ``label_key="contact_label_pseudo"`` trains on the contact stage's D2 pseudo
+    labels directly. Episodes need ``derived/<z_key>.npy`` ``[T,N]`` and must share ``n_taxels`` /
+    joint dims."""
 
     def __init__(self, episodes: Iterable[Episode | str | Path], *, window: int = 16, stride: int = 1,
                  joint_stats: Mapping[str, NormStats] | tuple | None = None, z_key: str = D_RESIDUAL_Z,
                  label_key: str = K_CONTACT_LABEL, exclude_saturated: bool = True, min_labelled: int = 1):
         super().__init__(episodes, window, stride)
         self.q_stats, self.qd_stats = _joint_stats(joint_stats)
-        self._z, self._q, self._qd, self._mask, self._sat, self._qv = [], [], [], [], [], []
+        self._z, self._q, self._qd, self._mask, self._sat, self._qv, self._lab = [], [], [], [], [], [], []
         dims = set()
         for e, ep in enumerate(self.episodes):
             if not ep.has_derived(z_key):
                 raise ValueError(f"episode {ep.meta.episode_id!r} has no derived {z_key!r} "
                                  "(run the baseline/contact stages first)")
-            for k in (K_Q, K_QD, label_key):
+            for k in (K_Q, K_QD):
                 if not ep.has(k):
                     raise ValueError(f"episode {ep.meta.episode_id!r} lacks {k!r} (needed by ContactWindowDataset)")
+            lab_arr = _label_array(ep, label_key, "ContactWindowDataset")
             z = ep.derived(z_key)
             if z.shape != (ep.T, ep.meta.n_taxels):
                 raise ValueError(f"episode {ep.meta.episode_id!r}: derived {z_key!r} has shape {z.shape}, "
@@ -225,7 +249,8 @@ class ContactWindowDataset(_WindowDataset):
             self._qv.append(qd_valid_mask(ep))
             self._q.append(_norm(self.q_stats, ep[K_Q]))
             self._qd.append(_norm(self.qd_stats, ep[K_QD]))
-            lab = np.asarray(ep[label_key])
+            self._lab.append(lab_arr)
+            lab = np.asarray(lab_arr)
             sat = np.asarray(ep[K_SATURATED], dtype=bool) if ep.has(K_SATURATED) else np.zeros(lab.shape, bool)
             m = lab >= 0
             if exclude_saturated:
@@ -241,9 +266,8 @@ class ContactWindowDataset(_WindowDataset):
 
     def __getitem__(self, i: int) -> dict[str, Any]:
         e, t, w = self._at(i)
-        ep = self.episodes[e]
         z = np.nan_to_num(np.asarray(self._z[e][w], dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
-        lab = np.asarray(ep[self.label_key][t])
+        lab = np.asarray(self._lab[e][t])
         return {"z_hist": torch.from_numpy(z), "sat_hist": torch.from_numpy(np.array(self._sat[e][w], dtype=bool)),
                 "q": torch.from_numpy(self._q[e][t].copy()), "qd": torch.from_numpy(self._qd[e][t].copy()),
                 "label": torch.from_numpy((lab == 1).astype(np.float32)),

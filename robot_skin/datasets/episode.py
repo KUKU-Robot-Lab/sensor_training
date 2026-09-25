@@ -17,6 +17,7 @@ them. Optional keys may be absent (``episode.has(key)``). See ``docs/DATA_FORMAT
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,7 +33,9 @@ K_T = "t"                              # [T] float64 s from session start
 K_PRESSURE_RAW = "pressure_raw"        # [T,N] float64, layout order
 K_DELTA = "delta_pct"                  # [T,N] float32, ΔS% (SATS sign: press → negative)
 K_SATURATED = "saturated"              # [T,N] bool
-K_TAXEL_POS = "taxel_pos"              # [T,N,3] float32 m, hand/robot base frame
+K_TAXEL_POS = "taxel_pos"              # [T,N,3] float32 m, hand/robot base frame (glove: MANO wrist
+                                       #   frame, go = 0 & wrist at origin; robot: URDF root;
+                                       #   meta.preprocessing["taxel_frame"])
 K_TAXEL_NRM = "taxel_nrm"              # [T,N,3] float32 unit
 K_Q = "q"                              # [T,D] float32 joint state (robot joints | glove: finger_pose flat 45)
 K_QD = "qd"                            # [T,D] float32 (smoothed derivative)
@@ -67,6 +70,7 @@ D_RESIDUAL_Z = "residual_z"            # [T,N] float32 calibrated z-score (press
 D_CONTACT_PROB = "contact_prob"        # [T,N] float32
 D_LEVEL = "contact_level"              # [T,N] int8 ContactLevel
 D_HAND_POSE_IMU = "hand_finger_pose_imu"  # [T,15,3] float32 IMU-estimated finger pose
+D_CONTACT_LABEL_PSEUDO = "contact_label_pseudo"  # [T,N] int8 D2 pseudo contact labels (−1/0/1, contact stage)
 
 
 @dataclass
@@ -158,8 +162,18 @@ class Episode:
             raise ValueError(f"derived {key!r} has {value.shape[0]} rows, expected {self.T}")
         self._derived[key] = value
         if save and self.root is not None:
-            (self.root / "derived").mkdir(parents=True, exist_ok=True)
-            np.save(self.root / "derived" / f"{key}.npy", value)
+            # atomic: write a temp file, then os.replace — a reader holding a memmap of the old file
+            # keeps its (old) inode instead of seeing a truncated / half-written array
+            d = self.root / "derived"
+            d.mkdir(parents=True, exist_ok=True)
+            tmp = d / f".{key}.npy.tmp{os.getpid()}"
+            try:
+                with open(tmp, "wb") as fh:
+                    np.save(fh, value)
+                os.replace(tmp, d / f"{key}.npy")
+            finally:
+                if tmp.exists():
+                    tmp.unlink()
 
     # ── cameras ───────────────────────────────────────────────────────────
     def frame_timestamps(self, camera: str) -> np.ndarray:

@@ -2,13 +2,14 @@
 
 Data: three 6 s synthetic glove sessions (``datasets.synthetic``) → ``datasets.build`` episodes.
 All three use the **same generator seed** (two motion sessions of different subjects + one task
-session): the generator draws the per-taxel artefact physics (gains, signs, lags) from the session
-seed, so a shared seed plays "one physical glove" and the baseline stage can be checked on held-out
-data (train on subject s0, validate on s1, predict the D2 task). ``generate_dataset`` gives every
-session its own seed, i.e. a different glove per session, which no baseline model can generalise
-across. Caveat: the motion RNG is seeded by the session seed too, so s1 replays s0's motion plan with
-the subject's amplitude / speed style (time-warped, rescaled) — the D2 task episode (reach / grasp /
-manipulate, different joint trajectories) is the genuinely novel-motion generalisation check.
+session): without a ``glove_seed`` the generator draws the per-taxel artefact physics (gains, signs,
+lags) from the session seed, so a shared seed plays "one physical glove" and the baseline stage can
+be checked on held-out data (train on subject s0, validate on s1, predict the D2 task). (Today
+``generate_session(glove_seed=…)`` / ``generate_dataset(shared_glove=True)``, the default, give one
+glove with a distinct motion seed per session; this fixture keeps its original setup.) Caveat: the
+motion RNG is seeded by the session seed too, so s1 replays s0's motion plan with the subject's
+amplitude / speed style (time-warped, rescaled) — the D2 task episode (reach / grasp / manipulate,
+different joint trajectories) is the genuinely novel-motion generalisation check.
 """
 import json
 import shutil

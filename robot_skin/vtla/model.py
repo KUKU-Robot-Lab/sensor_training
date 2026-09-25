@@ -75,7 +75,7 @@ __all__ = [
 MODALITIES = ("language", "vision", "tactile", "proprio", "readout")
 LANG, VISION, TACTILE, PROPRIO, READOUT = range(len(MODALITIES))
 
-_TACTILE_ENCODER_DEFAULTS = dict(d_model=64, depth=2, heads=4, n_fourier=8, fourier_scale=0.05,
+_TACTILE_ENCODER_DEFAULTS = dict(d_model=64, depth=2, heads=4, n_fourier=6, fourier_scale=0.3,
                                  ff_mult=4, dropout=0.0)
 
 

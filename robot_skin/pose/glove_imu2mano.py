@@ -80,6 +80,11 @@ class GloveImu2ManoPoseProvider:
     offsets / world : IMU calibration (``imu_model.calibrate_imu_offsets``); None → already calibrated.
     global_orient : [T,3] override; else from the wrist IMU when ``global_from_imu``; else zeros.
     wrist_pos : [T,3] (None → origin).
+
+    Frame: with the default ``global_from_imu=True`` the taxel poses are in the (calibrated) IMU world
+    frame. Processed episodes, the baseline model and VTLA use the **hand frame** (``global_orient =
+    0``, wrist at the origin; ``datasets.build`` / ``control.online.glove_pose_fn``) — pass
+    ``global_from_imu=False`` (and no ``wrist_pos``) to feed those models.
     """
 
     def __init__(self, layout: Layout, model: torch.nn.Module, skeleton: ManoSkeleton | None, t, quat,

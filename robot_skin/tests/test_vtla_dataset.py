@@ -1,6 +1,7 @@
 """VTLA dataset on tiny synthetic D2 episodes (datasets.synthetic → datasets.build) and the
 ``vtla`` stage end-to-end (policy_bundle.pt reproduces the trained policy)."""
 import json
+import logging
 import warnings
 
 import numpy as np
@@ -354,7 +355,7 @@ def test_stage_config_rejects_unknown_keys():
     assert h32 == stage._weights_hash(lin) and h32 != stage._weights_hash(lin.to(torch.bfloat16))
 
 
-def test_stage_splits_json_shared_with_other_stages(data, tmp_path):
+def test_stage_splits_json_shared_with_other_stages(data, tmp_path, caplog):
     """data.splits: a datasets.splits splits.json (paths relative to the processed root, or ids)
     assigns episodes exactly; unlisted / unknown entries are reported, never guessed."""
     from robot_skin.datasets.splits import save_splits
@@ -369,6 +370,13 @@ def test_stage_splits_json_shared_with_other_stages(data, tmp_path):
         parts = stage.split_episodes(g + data["robot"], d_cfg)
     assert [e.meta.episode_id for e in parts["train"]] == [g[0].meta.episode_id, g[1].meta.episode_id]
     assert parts["val"] == [g[2]] and parts["test"] == []
+    assert not [r for r in caplog.records if "data.splits is not set" in r.getMessage()]
+    # without data.splits: the stage's own make_splits split, logged as not shared with other stages
+    with caplog.at_level(logging.WARNING, logger="robot_skin.stages"):
+        auto = stage.split_episodes(g, {"split_by": "episode", "processed_root": str(data["proc"])})
+    assert sum(len(v) for v in auto.values()) == len(g)
+    msgs = [r.getMessage() for r in caplog.records if "data.splits is not set" in r.getMessage()]
+    assert len(msgs) == 1 and msgs[0].startswith("vtla:") and "make_splits by episode_id" in msgs[0]
 
 
 def test_stage_run_with_pretrained_frozen_tactile_encoder(data, tmp_path):

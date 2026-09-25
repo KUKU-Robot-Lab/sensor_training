@@ -5,8 +5,9 @@ consistent raw streams, so the whole acquisition chain (recorder → sync → IM
 ``datasets.build``) can run end-to-end without hardware:
 
 - **hand state** per step type (rest, flat-hand calibration, 3-tap sync, per-finger flexion,
-  open/close, wrist rotation, free motion, pinch / fist / finger crossing / finger-to-palm
-  self-touch, D2 reach → grasp → manipulate → release → retreat) as analytic functions of time,
+  open/close, wrist rotation, free motion, contact-free "air grasp" shapes, pinch / fist / finger
+  crossing / finger-to-palm self-touch, D2 reach → grasp → manipulate → release → retreat) as
+  analytic functions of time,
   blended across step transitions;
 - **pressure** ``raw[T,C]`` (channel order): per-taxel baseline ~1e6 counts (mk555 scale) with
   ΔS% = motion artefact (per-taxel gain on the parent finger's flexion + lagged velocity term)
@@ -54,14 +55,16 @@ _REST = np.array([0.25, 0.30, 0.35, 0.40, 0.45])
 _TAP_FLEX = np.array([0.5, 0.05, 1.2, 1.3, 1.3])
 _PRESHAPE = {"power": [0.3, 0.15, 0.15, 0.15, 0.15], "precision": [0.35, 0.2, 0.2, 0.6, 0.7],
              "pinch": [0.35, 0.2, 0.6, 0.8, 0.9], "press": [0.8, 0.05, 1.2, 1.3, 1.3],
-             "lateral": [0.2, 0.6, 0.7, 0.8, 0.9]}
+             "lateral": [0.2, 0.6, 0.7, 0.8, 0.9], "tripod": [0.35, 0.2, 0.2, 0.7, 0.8]}
 _GRIP = {"power": [0.7, 0.9, 0.9, 0.9, 0.9], "precision": [0.6, 0.6, 0.6, 0.7, 0.8],
          "pinch": [0.6, 0.6, 0.7, 0.8, 0.9], "press": [0.8, 0.05, 1.2, 1.3, 1.3],
-         "lateral": [0.5, 0.9, 1.0, 1.0, 1.0]}
+         "lateral": [0.5, 0.9, 1.0, 1.0, 1.0], "tripod": [0.6, 0.6, 0.6, 0.9, 1.0]}
 _GRIP_SITES = {"power": {"thumb": 25, "index": 25, "middle": 25, "ring": 20, "pinky": 15, "palm": 20},
                "precision": {"thumb": 30, "index": 30, "middle": 25},
                "pinch": {"thumb": 30, "index": 30}, "press": {"index": 40},
-               "lateral": {"thumb": 30, "index": 20}}
+               "lateral": {"thumb": 30, "index": 20}, "tripod": {"thumb": 30, "index": 25, "middle": 25}}
+#: "air grasp" (D1, no object): the grip shape stops this fraction of the way from pre-shape to grip
+_AIR_CLOSURE = 0.8
 #: joint weights (MCP, PIP, DIP) when one flexion angle drives a finger
 _JOINT_W = {"thumb": (0.6, 0.8, 0.8)}
 _DEFAULT_JW = (1.0, 1.1, 0.8)
@@ -472,6 +475,12 @@ class FakeScene:
             deep = np.where(cyc_idx == P["deep_cycle"], 96.0, 25.0)
             sites = {"thumb": 0.7 * d, "index": d, "middle": d, "ring": d, "pinky": d,
                      "palm_distal": _contact_profile(s, 0.75, deep), "palm_proximal": 0.6 * d}
+        elif typ == "air_grasp":
+            # D2 grasp shape around an imaginary object, formed and released each cycle; no press
+            g = str(m.get("grasp", "power"))
+            pre = np.asarray(_PRESHAPE.get(g, _PRESHAPE["power"]))
+            air = pre + _AIR_CLOSURE * (np.asarray(_GRIP.get(g, _GRIP["power"])) - pre)
+            flex = _REST + _cyc(tau, cyc_len)[:, None] * (air - _REST) + trem
         elif typ == "finger_crossing":
             s = _cyc(tau, cyc_len)
             flex[:, 1] = 0.3 + 0.2 * s

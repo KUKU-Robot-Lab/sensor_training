@@ -360,7 +360,9 @@ class TaxelEncoder(nn.Module):
         value_dim: per-taxel value width (``TactileFeatureSpec.dim``); must be ≥ 1 — for
             ``obs_mode="none"`` build no tactile encoder at all.
         d_model, depth, heads: transformer width / layers (≥ 1) / attention heads.
-        n_fourier, fourier_scale: Fourier position features (octaves, base period in metres).
+        n_fourier, fourier_scale: Fourier position features (octaves, base period in metres;
+            defaults 6 × 0.3 m: finest period ≈ 9 mm, above mm-level pose-label noise — see
+            ``representation.tokenizer``).
         n_taxels: optional per-index id embedding (single-layout models only; breaks the
             permutation equivariance and taxel-count independence).
         ff_mult, dropout: feed-forward width multiplier and dropout of the transformer.
@@ -369,7 +371,7 @@ class TaxelEncoder(nn.Module):
     """
 
     def __init__(self, value_dim: int, d_model: int = 64, depth: int = 2, heads: int = 4, *,
-                 n_fourier: int = 8, fourier_scale: float = 0.05, n_taxels: int | None = None,
+                 n_fourier: int = 6, fourier_scale: float = 0.3, n_taxels: int | None = None,
                  ff_mult: int = 4, dropout: float = 0.0,
                  feature_spec: TactileFeatureSpec | Mapping[str, Any] | None = None) -> None:
         super().__init__()

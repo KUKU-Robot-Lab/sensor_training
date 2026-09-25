@@ -167,7 +167,9 @@ def layout_group_matrix(layout: Layout, *, max_group_frac: float = 0.5,
 EPISODE_LAYOUT_FILE = "layout.yaml"
 
 #: taxel-centroid travel (m) above which ``taxel_pos`` looks world-framed rather than in the
-#: hand / robot-base frame the Episode contract specifies (finger motion moves it a few cm)
+#: hand / robot-base frame the Episode contract specifies (finger motion moves it a few cm).
+#: ``datasets.build`` ≥ ``/2`` writes hand-frame poses (``meta.preprocessing.taxel_frame``), so the
+#: check only guards episodes built by older preprocessing (world-frame glove poses) or other tools.
 POSE_FRAME_TRAVEL_M = 0.15
 
 
@@ -213,7 +215,8 @@ class TaxelPretrainDataset(Dataset):
 
     Frames whose taxel poses are not finite are skipped (one warning). One warning also lists
     episodes whose taxel centroid travels more than :data:`POSE_FRAME_TRAVEL_M` (world-framed
-    ``taxel_pos`` instead of the hand/robot-base frame of the Episode contract).
+    ``taxel_pos`` instead of the hand/robot-base frame of the Episode contract — episodes of
+    ``datasets.build`` < ``/2``; rebuild them with ``--force``).
     """
 
     def __init__(self, episodes: Sequence[Episode | str | Path],
@@ -295,7 +298,9 @@ class TaxelPretrainDataset(Dataset):
             warnings.warn(f"{len(world_framed)}/{len(self.episodes)} episode(s) have a taxel centroid "
                           f"travelling > {POSE_FRAME_TRAVEL_M} m (e.g. {ex}) — taxel_pos seems to be "
                           "in a world/camera frame, not the hand/robot-base frame the encoder's "
-                          "position features assume", stacklevel=2)
+                          "position features assume (episodes preprocessed before "
+                          "robot_skin.datasets.build/2 stored world-frame glove poses: rebuild them "
+                          "with `python -m robot_skin.datasets.build --force`)", stacklevel=2)
 
     @staticmethod
     def _resolve_layout(ep: Episode, override: Layout | str | Path | None,
