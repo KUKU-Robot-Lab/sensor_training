@@ -1,0 +1,60 @@
+# Stage `imu_pose`: glove IMUs → MANO finger pose (ImuHandPoseNet, the in-house VIFNet-S-role model).
+# Runner: robot_skin.stages.imu_pose.run(cfg)  (python -m robot_skin.stages.imu_pose --config <this>)
+# Trains on episodes with hand labels (hand_pose_valid); writes derived hand_finger_pose_imu for every
+# episode of predict_datasets with IMUs, <out_dir>/imu_pose_model.pt, imu_stats.json, metrics.json.
+# Keys mirror robot_skin.stages.imu_pose.DEFAULTS (kept in sync by a test; unknown keys raise).
+stage: imu_pose
+hardware: null                  # rtx5090 | rtx4090 | rtx3090 | a100 | cpu | auto | null
+hardware_applied: false
+out_dir: null                   # null → train.out_dir
+
+data:
+  processed_root: robot_skin/data/processed
+  datasets: [motion]            # training pool (add task for more labelled frames)
+  predict_datasets: [motion, task]
+  episodes: null                # explicit episode dirs (replace the discovery; the dataset lists still select)
+  splits: null                  # splits.json shared by all stages
+  use_test: false
+  split_by: episode             # episode | subject
+  val_frac: 0.2
+  split_seed: 0
+  stride: 2                     # training window every 2nd labelled frame
+
+features:                       # pose.imu_model.imu_features
+  gyro: true
+  acc: true
+  vec_frame: sensor             # sensor | world
+
+stats:
+  method: std                   # feature normalisation (stored inside the model)
+
+model:                          # pose.imu_model.ImuHandPoseNet (+ window)
+  window: 32                    # causal IMU window (frames)
+  hidden: 128
+  n_layers: 2
+  arch: gru                     # gru | tcn
+  dropout: 0.1
+  kernel: 3                     # tcn only
+
+loss:                           # pose.imu_model.hand_pose_loss
+  tip_weight: 10.0              # 1 cm fingertip error ≈ 0.1 rad
+
+predict:
+  write_derived: true
+  batch_size: 2048
+
+train:
+  max_epochs: 30
+  batch_size: 128
+  lr: 1.0e-3
+  weight_decay: 0.01
+  warmup_steps: 100
+  schedule: cosine
+  min_lr_ratio: 0.05
+  grad_clip: 1.0
+  precision: auto
+  ema_decay: null
+  monitor: val/loss
+  log_every: 50
+  seed: 0
+  out_dir: robot_skin/runs/imu_pose
