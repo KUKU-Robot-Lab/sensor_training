@@ -1,0 +1,61 @@
+# Robot-hand no-contact sweep protocol (robot_logger default): scripted joint motion in free
+# space → training data for the motion-induced tactile baseline predictor on the robot hand.
+# The motions are executed by the hand controller (teleop or a trajectory script); the logger
+# only paces and labels the blocks. Same block schema as d1_motion.yaml.
+name: robot_sweep
+version: 1
+dataset: motion
+kind: robot
+description: >-
+  Robot hand free-space sweeps: static baselines, per-finger flexion sweeps, whole-hand
+  open/close at two speeds and random joint motion — all contact-free.
+cameras: []
+rates: {pressure: 200.0, joint_state: 100.0}
+timing: {lead_in_s: 1.0, transition_s: 1.0, lead_out_s: 1.0, min_step_s: 0.5}
+blocks:
+  - id: baseline_start
+    kind: static
+    pose: rest
+    duration_s: 5
+    contact: none
+    speed: static
+    prompt: "홈 자세 정지 {duration_s}초 (핸드 주변에 아무것도 없게)."
+  - id: finger_flex
+    kind: motion
+    motion: finger_flex
+    for_each: {finger: [thumb, index, middle, ring, pinky]}
+    cycle_s: 2.0
+    repetitions: 5
+    contact: none
+    speed: slow
+    prompt: "{finger_ko} 관절 스윕 ({cycle_s}초 주기 × {repetitions}회, 관절 한계 90 %까지)."
+  - id: open_close_slow
+    kind: motion
+    motion: open_close
+    cycle_s: 2.0
+    repetitions: 8
+    contact: none
+    speed: slow
+    prompt: "전체 손가락 쥐기/펴기 느리게 (자기 접촉 전까지)."
+  - id: open_close_fast
+    kind: motion
+    motion: open_close
+    cycle_s: 0.7
+    repetitions: 12
+    contact: none
+    speed: fast
+    prompt: "전체 손가락 쥐기/펴기 빠르게."
+  - id: free_motion
+    kind: motion
+    motion: free
+    duration_s: 30
+    contact: none
+    speed: mixed
+    prompt: "무작위 관절 궤적 {duration_s}초 (접촉 없음)."
+  - id: baseline_end
+    kind: static
+    pose: rest
+    duration_s: 5
+    contact: none
+    speed: static
+    prompt: "홈 자세 정지 {duration_s}초."

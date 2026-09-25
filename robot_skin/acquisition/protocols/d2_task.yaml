@@ -1,0 +1,208 @@
+# D2 "task" protocol — object manipulation with language instructions: vision (ego + third) +
+# glove IMUs + tactile + instruction. ONE EPISODE = ONE TASK REPETITION = ONE SESSION DIRECTORY.
+#
+# Episode = pre blocks (static rest baseline, flat-hand IMU calibration, 3-tap sync) → task phases
+# → post blocks. (Per-episode calibration/sync keep every directory self-contained and catch glove
+# slip; to save time they can be removed here and copied from a calibration session of the same
+# sitting with glove_logger --calibration-from / --sync-from.)
+# Task phases come from the phase vocabulary below; the operator marks phase transitions (key /
+# foot pedal, `advance: manual`) at the moments defined in `boundary`: every press is the START of
+# a phase (first press: reach starts), one extra press ends the last phase (n phases → n + 1
+# presses). Nominal durations are used for planning estimates and synthetic --fake sessions only.
+#
+# Instructions are rendered from `templates` with slots {object}, {target} and any task-specific
+# `slots` (values with underscores are rendered as words: cup_of_beads → "cup of beads").
+# The operator may override the instruction per episode (glove_logger --instruction "...").
+# Objects/targets are the default lab set — edit to match the objects you actually have, but keep
+# ids stable across sessions (splits by object use them).
+name: d2_task
+version: 1
+dataset: task
+kind: glove
+language: en
+description: >-
+  D2 object-task episodes for VTLA: 8 tasks (grasp-lift-place, pour, peg insertion, jar opening,
+  wiping, handover, button pressing, in-hand rotation) with object/target lists, paraphrased
+  instruction templates, contact-annotated phases and success criteria.
+cameras: [ego, third]
+rates: {pressure: 200.0, imu: 100.0, camera: 30.0, hand_pose: 30.0, object_pose: 30.0}
+timing:
+  lead_in_s: 0.5
+  transition_s: 0.3     # nominal gap between steps (fake sessions); real phases are contiguous
+  lead_out_s: 0.5
+  min_step_s: 0.3
+sync:
+  taps: 3
+  intervals_s: [0.5, 1.0]
+  lead_s: 0.8
+  tail_s: 1.0
+  finger: index
+
+episode:
+  pre:
+    - id: baseline
+      kind: static
+      pose: rest            # same relaxed rest pose as D1 baseline_start → consistent ΔS reference
+      duration_s: 3
+      contact: none
+      speed: static
+      prompt: "시작 자세(D1 과 같은 휴식 자세): 손에 힘을 빼고 시작 마커 위 공중에 띄워 {duration_s}초 정지 (아무것도 닿지 않게)."
+      prompt_en: "Rest pose (same as D1): relaxed hand hovering over the start marker, touching nothing; hold still."
+    - id: imu_calibration
+      kind: calibration
+      pose: flat_hand
+      duration_s: 2
+      contact: none
+      labels: [calibration, no_contact]
+      speed: static
+      prompt: "보정 자세: 손가락을 붙여 곧게 펴고 손바닥을 아래로, 수평으로 공중에서 {duration_s}초 정지."
+      prompt_en: "Flat hand, fingers together, palm down, level, in the air; hold still."
+    - id: sync_start
+      kind: sync
+      prompt: "검지 끝으로 싱크 패드를 '탁-탁---탁' 3번 친다."
+      prompt_en: "Three short-long taps on the sync pad with the index fingertip."
+  post: []
+
+phases:
+  reach:
+    contact: none
+    labels: []           # boundaries are operator-marked → not used as clean no_contact data
+    duration_s: 1.5
+    boundary: "시작: 손이 시작 자세를 떠나는 순간"
+    prompt: "물체 쪽으로 손을 뻗는다 (아직 닿지 않음)."
+  grasp:
+    contact: object
+    duration_s: 1.0
+    boundary: "시작: 손(장갑)이 물체에 처음 닿는 순간"
+    prompt: "물체를 잡는다."
+  manipulate:
+    contact: object
+    duration_s: 3.0
+    boundary: "시작: 파지가 안정되어 물체를 들어 올리거나 조작을 시작하는 순간"
+    prompt: "지시문대로 조작한다."
+  release:
+    contact: object
+    duration_s: 0.8
+    boundary: "시작: 물체를 내려놓고 손을 펴기 시작하는 순간"
+    prompt: "물체를 놓는다."
+  retreat:
+    contact: none
+    labels: []
+    duration_s: 1.5
+    boundary: "시작: 손이 물체에서 마지막으로 떨어지는 순간 (끝: 시작 자세 도착)"
+    prompt: "시작 자세로 손을 되돌린다."
+
+tasks:
+  - id: grasp_lift_place
+    description: "물체를 집어 들어 목표 위에 놓기 (power grasp + transport)"
+    objects: [cup, block, ball, bottle]
+    targets: [plate, tray, box_lid]
+    templates:
+      - "pick up the {object} and place it on the {target}"
+      - "put the {object} on the {target}"
+      - "move the {object} onto the {target}"
+    grasp: power
+    manipulate: transport
+    durations: {manipulate: 3.0}
+    repetitions: 5
+    success: "object rests on the target after release (not dropped, not tipped over)"
+
+  - id: pour
+    description: "용기를 기울여 내용물(비즈)을 목표 용기에 붓기"
+    objects: [cup_of_beads, small_pitcher, bottle_of_beads]
+    targets: [bowl, glass]
+    templates:
+      - "pour the {object} into the {target}"
+      - "pour the contents of the {object} into the {target}"
+      - "empty the {object} into the {target}"
+    grasp: power
+    manipulate: pour
+    durations: {manipulate: 4.0}
+    repetitions: 5
+    success: "at least 90% of the beads end up in the target and the container is set back upright"
+
+  - id: peg_insert
+    description: "페그/플러그를 구멍에 끼우기 (정밀 파지 + 삽입; VTLA 논문의 삽입 과제 계열)"
+    objects: [round_peg, square_peg, usb_plug]
+    targets: [peg_board]
+    templates:
+      - "insert the {object} into the {target}"
+      - "put the {object} into its hole on the {target}"
+      - "plug the {object} into the {target}"
+    grasp: precision
+    manipulate: insert
+    durations: {manipulate: 4.0}
+    repetitions: 5
+    success: "fully seated (flush) in the matching hole; at most two re-grasps"
+
+  - id: open_jar
+    description: "뚜껑 돌려 열기 (비틀기, 큰 접선력)"
+    objects: [jar, water_bottle]
+    targets: []
+    templates:
+      - "open the {object}"
+      - "unscrew the lid of the {object}"
+      - "take the lid off the {object}"
+    grasp: power
+    manipulate: twist
+    durations: {manipulate: 5.0}
+    repetitions: 5
+    success: "lid completely removed and put down next to the container"
+
+  - id: wipe
+    description: "스펀지/천으로 표시 영역 닦기 (지속 접촉 + 미끄럼)"
+    objects: [sponge, cloth]
+    targets: [marked_area, plate]
+    templates:
+      - "wipe the {target} with the {object}"
+      - "clean the {target} using the {object}"
+      - "use the {object} to wipe the {target}"
+    grasp: power
+    manipulate: wipe
+    durations: {manipulate: 5.0}
+    repetitions: 5
+    success: "the whole target area is covered by at least three strokes; tool put back"
+
+  - id: handover
+    description: "실험자에게 물체 건네기 (상대가 잡은 뒤 놓기)"
+    objects: [cup, block, marker]
+    targets: [experimenter]
+    templates:
+      - "hand the {object} to the {target}"
+      - "give the {object} to the {target}"
+      - "pass the {object} to the {target}"
+    grasp: precision
+    manipulate: handover
+    durations: {manipulate: 2.5}
+    repetitions: 5
+    success: "the partner holds the object before the subject lets go; not dropped"
+
+  - id: press_button
+    description: "버튼/스위치 누르기 (검지 단일 접촉, grasp 없음)"
+    objects: [red_button, light_switch, keypad_key]
+    targets: []
+    templates:
+      - "press the {object}"
+      - "push the {object}"
+      - "press the {object} once"
+    phases: [reach, manipulate, release, retreat]
+    grasp: press
+    manipulate: press
+    durations: {manipulate: 1.0, release: 0.5}
+    repetitions: 5
+    success: "actuated exactly once (click / LED); no double press"
+
+  - id: in_hand_rotate
+    description: "손 안에서 물체 회전 (손가락 재파지, 내려놓지 않음)"
+    objects: [block, marker, ball]
+    targets: []
+    slots: {angle: [90, 180]}
+    templates:
+      - "rotate the {object} by {angle} degrees in your hand"
+      - "turn the {object} {angle} degrees using only your fingers"
+      - "reorient the {object} {angle} degrees without putting it down"
+    grasp: precision
+    manipulate: rotate
+    durations: {manipulate: 4.0}
+    repetitions: 5
+    success: "target orientation reached within 20 degrees; object never dropped or supported by the table"
