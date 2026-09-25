@@ -6,8 +6,10 @@ the parent poses differs:
 
 - :class:`StaticPoseProvider` — fixed parent transforms (bench pad, rigid mount). Implemented.
 - :class:`TransformPoseProvider` — any ``t → {parent: T}`` callable. Implemented.
-- ``robot_fk.RobotFKPoseProvider`` — URDF forward kinematics from joint states. Stub.
-- ``glove_imu2mano.GloveImu2ManoPoseProvider`` — 7 IMUs → MANO via fine-tuned VIFNet-S. Stub.
+- ``robot_fk.RobotFKPoseProvider`` — URDF forward kinematics from joint states (``pose.urdf``).
+- ``glove_imu2mano.GloveImu2ManoPoseProvider`` — 7 IMUs → MANO finger pose (``pose.imu_model``;
+  VIFNet-S loader is a documented stub) → skeleton FK (``pose.mano``).
+- ``mano.ManoPoseProvider`` — MANO pose callable → skeleton FK.
 """
 from __future__ import annotations
 

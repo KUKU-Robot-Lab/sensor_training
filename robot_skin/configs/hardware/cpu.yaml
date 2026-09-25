@@ -1,0 +1,23 @@
+# Hardware profile: CPU only (laptops, CI, unit tests, quick debugging of a pipeline).
+name: cpu
+gpu: null
+
+train:
+  device: cpu
+  precision: fp32           # CPU autocast bf16 is possible (precision: bf16) but rarely faster
+  tf32: false
+  compile: false
+  num_workers: 0            # in-process loading: deterministic, no fork overhead for tiny data
+  pin_memory: false
+
+suggest:                    # small debug batches — NOT the GPU effective batch; for real CPU
+  imu_pose: {batch_size: 64, grad_accum: 1}     # training scale lr or raise grad_accum
+  baseline: {batch_size: 256, grad_accum: 1}
+  contact:  {batch_size: 64, grad_accum: 1}
+  pretrain: {batch_size: 16, grad_accum: 1}
+  vtla:     {batch_size: 8, grad_accum: 1}
+
+env: {}
+
+notes: >-
+  Used by the test-suite and smoke runs; every stage must run end-to-end with this profile.

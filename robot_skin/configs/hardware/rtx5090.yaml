@@ -1,0 +1,44 @@
+# Hardware profile: NVIDIA GeForce RTX 5090 (Blackwell, compute capability 12.0 = sm_120, 32 GB).
+# Load with robot_skin.train.load_hw_profile("rtx5090"); applied with apply_hw_profile(cfg, ...).
+# Precedence: stage `train:` < `suggest.<stage>` < `train:` below < CLI overrides.
+#
+# REQUIREMENT: torch built for CUDA >= 12.8 (sm_120 kernels). The repo pins
+#   torch==2.9.0+cu128  (--extra-index-url https://download.pytorch.org/whl/cu128)
+# in deformable_sats/requirements.txt, plus an NVIDIA driver that supports Blackwell (R570+).
+# Check: python -m robot_skin.train.hardware   (warns if sm_120 is missing from the arch list)
+name: rtx5090
+gpu:
+  vendor: nvidia
+  model: GeForce RTX 5090
+  arch: blackwell
+  compute_capability: [12, 0]
+  memory_gb: 32
+  bf16: true
+  min_torch_cuda: "12.8"
+
+train:                      # hardware knobs — override the stage config
+  device: auto
+  precision: bf16           # native bf16 tensor cores; no GradScaler needed
+  tf32: true
+  compile: true             # torch.compile (inductor/Triton); set false if compile time dominates
+  num_workers: 8
+  pin_memory: true
+
+# Per-stage starting points. Effective batch = batch_size × grad_accum × GPUs and is kept equal
+# across all GPU profiles, so the stage learning rates need no retuning between machines.
+suggest:
+  imu_pose: {batch_size: 512, grad_accum: 1}
+  baseline: {batch_size: 1024, grad_accum: 1}
+  contact:  {batch_size: 512, grad_accum: 1}
+  pretrain: {batch_size: 256, grad_accum: 1}
+  vtla:     {batch_size: 64, grad_accum: 2}     # online image encoder; with cached vision
+                                                # features batch 128 × 1 fits easily
+
+env:                        # exported by apply_profile_env() before CUDA init
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+
+notes: >-
+  Single-GPU workstation profile. For 2+ GPUs in one box launch with
+  `torchrun --standalone --nproc_per_node=<n>` and divide grad_accum by n to keep the effective
+  batch. If the first CUDA call fails with "no kernel image is available", the installed torch
+  lacks sm_120 (install the cu128 wheel).
