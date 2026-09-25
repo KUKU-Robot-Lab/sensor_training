@@ -1,0 +1,72 @@
+# Preprocessing stage: raw sessions → processed Episodes (robot_skin.datasets.build).
+#   python -m robot_skin.datasets.build --raw robot_skin/data/raw --out robot_skin/data/processed \
+#       --config robot_skin/configs/stages/preprocess.yaml [--set baseline.duration_s=2] [--force]
+# Mirrors robot_skin.datasets.build.DEFAULTS (a test keeps them identical); unknown keys raise.
+# Units: s, Hz, m, ΔS in % (SATS sign: press → negative). Formats: docs/DATA_FORMAT.md.
+stage: preprocess
+raw_root: robot_skin/data/raw
+out_root: robot_skin/data/processed
+master_hz: null                 # null → manifest.master_hz (200 Hz)
+layout: null                    # override manifest.layout (built-in name or YAML path)
+
+clock:
+  reference: [pressure, imu, joint_state]   # master clock = overlap of these streams (if present)
+  span: intersection                        # intersection | pressure (pressure span only)
+
+pressure:
+  loader: null                  # "package.module:function" (session_dir, manifest) -> (t[T], raw[T,C]),
+                                #   e.g. a wrapper around deformable_sats/sats/preprocessing/bin_merge.py
+  lowpass_hz: null              # optional zero-phase Butterworth low-pass (NON-causal: online can't match)
+  lowpass_order: 2
+  adc_min: 0.0                  # ADC rails (common.signal.ADC_MIN / ADC_MAX)
+  adc_max: 16777215.0
+  rail_margin: 0.0
+  max_abs_pct: 90.0             # |ΔS| ≥ this → saturated
+
+baseline:
+  phase: null                   # phase name to take the baseline from (default: first no_contact segment)
+  duration_s: 1.0               # median over the first duration_s of that segment (estimate_baseline)
+  trim_s: 0.0                   # skip the segment's first trim_s (settling)
+  fallback_s: 1.0               # no usable segment and no manifest.baseline → first fallback_s of the recording
+  use_manifest: true            # fall back to manifest.baseline (per channel) before the recording start
+
+imu:
+  apply_calibration: true       # manifest.calibration imu_offsets / imu_world → segment frames
+  calibrate_if_missing: false   # compute it from the calibration phase (acquisition.calibration, not saved)
+  calibration_phase: imu_calibration
+
+hand_pose:                      # pose.vision_hand.smooth_hand_labels
+  min_conf: 0.5                 # confidence gate → hand_pose_valid
+  max_gap_s: 0.25               # SLERP-fill gaps up to this long (longer → invalid)
+  cutoff_hz: 6.0                # zero-phase low-pass of the labels (null → off)
+  order: 2
+  mano_model: null              # MANO_RIGHT.pkl/.npz → ManoSkeleton.from_mano_pkl (default: built-in skeleton)
+
+qd:
+  method: savgol_causal         # savgol_causal (history only → online controllers reproduce it exactly)
+                                #   | savgol (centred, smoother, offline only) | gradient
+  window_s: 0.05
+  polyorder: 2
+  source: derivative            # derivative | file (robot: resample joint_state.npz qd)
+
+robot:
+  urdf: null                    # override manifest.meta.urdf: session-relative, then its file name inside the
+                                #   session, then as given (absolute / CWD-relative); not found → error
+
+self_touch:
+  enabled: true                 # glove: pose.mano.self_touch_from_hand on the smoothed hand pose
+  margin_m: 0.004
+
+labels:
+  conflict: unknown             # self-touch inside a no_contact segment → unknown (-1) | segment (0) | geometry (1)
+
+cameras:
+  copy_frames: symlink          # symlink | copy | none — camera_<name>/ inside the episode
+  max_age_s: null               # cam_<name>_idx = -1 when the latest frame is older (null → never)
+
+synthetic_gt:                   # datasets.synthetic sidecar gt_synthetic.npz (ignored for real sessions)
+  check: true                   # compare ΔS with the ground truth → meta.preprocessing.synthetic_gt
+  store: true                   # store gt_artefact_pct / gt_press_pct / gt_contact / gt_self_touch / gt_object_contact
+
+qc:
+  skip_failed: false            # skip sessions whose qc.json says passed: false
