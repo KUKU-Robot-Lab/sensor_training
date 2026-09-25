@@ -13,7 +13,8 @@ robot_skin 의 코드·README·docstring 이 인용할 수 있는 **검증된** 
   본문을 열어 보지 않았다. **"robot_skin 이 가져오는 것" 열은 초록 수준에서 확인한 내용과 robot_skin 설계 의도를
   연결한 것이다.** 원문 세부(수식 기호, 하이퍼파라미터 등)를 docstring 에 옮길 때는 원문으로 다시 확인할 것.
 - 저자는 `제1저자 et al.` 로만 적는다. 전체 저자 목록은 링크에서 확인한다.
-- "코드 위치" 는 robot_skin 모듈 경로다. 일부 파일은 wave 2/3 에서 작성 중이며, 경로는 구현 계약(SPEC)의 모듈 맵을 따른다.
+- "코드 위치" 는 robot_skin 모듈 경로다(`robot_skin/` 기준; `deformable_sats/…` 는 저장소 루트 기준). 표에 적힌
+  경로는 모두 현재 코드에 있다. 각 논문이 robot_skin 설계 전체에서 어디에 쓰였는지는 [`ARCHITECTURE.md`](ARCHITECTURE.md) §6.
 
 ---
 
@@ -111,10 +112,11 @@ robot_skin 의 코드·README·docstring 이 인용할 수 있는 **검증된** 
 
 **코드에 미치는 영향**
 
-`pose/imu_model.py` 와 `pose/README.md` 는 `ImuHandPoseNet` 을 "VIFNet-S 와 같은 I/O" 라고 적고 있다. 이것은
-**가정**이다. `load_vifnet_s` 를 구현할 때는 두 변환을 감싸는 래퍼로 만들어야 한다: 입력 어댑터(robot_skin 7 사이트
-특징 → VIFNet-S 입력 배치)와 출력 변환(→ `finger_pose[15,3]` axis-angle). 그 전까지 `ImuHandPoseNet` 이 같은
-역할(IMU 윈도 → MANO 손가락 자세)의 사내 베이스라인이다.
+`pose/imu_model.py`, `pose/glove_imu2mano.py`, `pose/README.md` 는 `ImuHandPoseNet` 을 VIFNet-S 와 **같은 역할**
+(IMU 윈도 → MANO 손가락 자세)의 사내 베이스라인으로만 적고, VIFNet-S 의 실제 입출력은 **미검증**이라고 명시한다.
+`load_vifnet_s` 를 구현할 때는 두 변환을 감싸는 래퍼로 만들어야 한다: 입력 어댑터(robot_skin 7 사이트 특징 →
+VIFNet-S 입력 배치)와 출력 변환(→ `finger_pose[15,3]` axis-angle). 그 전까지 `load_vifnet_s` / `finetune_vifnet_s` 는
+`NotImplementedError` 스텁이고, `stages/imu_pose.py` 가 `ImuHandPoseNet` 을 학습한다.
 
 ## 9. 내부 참고 (이 저장소)
 

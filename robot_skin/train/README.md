@@ -180,12 +180,13 @@ torchrun --standalone --nproc_per_node=2 -m robot_skin train vtla \
 tailscale status
 ssh arm4090 'cd ~/sensor_training && .venv/bin/python -m robot_skin.train.hardware'
 
-# 1) 코드·전처리 데이터 동기화 (run 산출물은 제외)
-rsync -az --exclude 'robot_skin/runs/' --exclude '.venv/' ~/sensor_training/ arm4090:~/sensor_training/
+# 1) 코드·전처리 데이터 동기화 (run 산출물은 제외). processed episode 의 camera_<name> 은 기본이 raw 세션을
+#    가리키는 절대 경로 symlink 라 -L(링크를 따라가 프레임 복사)로 보낸다 — docs/TRAINING.md §9
+rsync -azL --exclude 'robot_skin/runs/' --exclude '.venv/' ~/sensor_training/ arm4090:~/sensor_training/
 
 # 2) 원격 실행 — tmux/nohup 로 SSH 끊겨도 계속, resume=auto 로 재실행 시 이어서
 ssh arm4090 'cd ~/sensor_training && tmux new -d -s vtla \
-  ".venv/bin/python -m robot_skin train vtla --hardware auto --set train.resume=auto"'
+  ".venv/bin/python -m robot_skin train vtla --hardware auto --set data.splits=robot_skin/runs/splits.json --set train.resume=auto"'
 
 # 3) 모니터링 (metrics.jsonl 은 한 줄 = 한 기록)
 ssh arm4090 'tail -n 3 ~/sensor_training/robot_skin/runs/vtla/metrics.jsonl'
@@ -203,7 +204,7 @@ ssh arm4090 'test -f ~/sensor_training/robot_skin/runs/vtla/summary.json' && \
 ```bash
 # 5090
 python -m robot_skin.train.sweep --fn robot_skin.stages.vtla:run --base robot_skin/configs/stages/vtla.yaml \
-    --space sweep_vtla.yaml --metric val/loss --out robot_skin/runs/sweeps/vtla --shard 0/2 --hardware rtx5090
+    --space sweep_vtla.yaml --metric val/l1 --out robot_skin/runs/sweeps/vtla --shard 0/2 --hardware rtx5090
 # arm4090
 python -m robot_skin.train.sweep ... --out robot_skin/runs/sweeps/vtla --shard 1/2 --hardware rtx4090
 # 합치기 (원격 결과를 rsync 로 가져온 뒤)
@@ -282,7 +283,12 @@ space:
 * `run_sweep(train_fn, base_cfg, overrides, out_dir)` — trial 마다 `out_dir/trial_XXX` 를
   `train.out_dir` 에 넣고, 끝날 때마다 `results.jsonl` 에 한 줄 추가. 다시 실행하면 성공한 trial 은
   건너뛴다. `train_fn` 은 float 또는 dict(stage `run(cfg)` 의 metrics) 를 반환, `--metric` 으로 키 지정.
-* 실패한 trial 은 `status: failed` + 에러로 기록되고 정렬에서 맨 뒤.
+* stage metrics 의 키는 stage 마다 다르다. `best.value`(monitor 값, 기본 `val/loss`)는 모든 stage 에 있고, 최상위
+  `val/loss` 는 pretrain 에만 있다 — vtla 는 `val/l1`, baseline `val/nll`, imu_pose `val/rot_deg`, contact
+  `val/z_auroc`(`--direction max`). 목록은 `docs/TRAINING.md` §11–12.
+* stage 1(imu_pose/baseline/contact) trial 은 space 에 `predict.write_derived: [false]` 를 넣어 episode 의
+  derived 배열(다음 stage 입력)을 덮어쓰지 않게 한다.
+* 실패한 trial(없는 `--metric` 키 포함)은 `status: failed` + 에러로 기록되고 정렬에서 맨 뒤.
 
 ---
 

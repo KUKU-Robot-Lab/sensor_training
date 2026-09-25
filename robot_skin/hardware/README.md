@@ -11,3 +11,6 @@
 - 채널 ↔ taxel id 매핑(레이아웃 YAML의 `channel`), 각 pad 의 parent 프레임 내 위치·법선 실측값.
 - 펌웨어/보드 버전, 샘플레이트, 시계 동기 방식(→ `acquisition.SessionManifest.meta`).
 - raw `.bin` 포맷이 mk555 와 같으면 파서는 `deformable_sats/sats/preprocessing/bin_merge.py` 가 정본(복제 금지).
+
+장비 체크리스트·장갑 착용·3-탭 싱크·세션 스크립트는 `docs/DATA_ACQUISITION.md`, 파일 포맷은 `docs/DATA_FORMAT.md`,
+로봇 핸드 드라이버 연결(`control.RobotHandInterface` 구현)은 `docs/DEPLOYMENT.md` §7.

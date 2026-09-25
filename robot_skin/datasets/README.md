@@ -4,20 +4,27 @@ raw/processed 포맷의 모든 키·dtype·단위·좌표 규약은 **`docs/DATA
 
 | 파일 | 역할 |
 |---|---|
-| `episode.py` | **고정 계약**: `Episode` / `EpisodeMeta`, 키 상수 `K_*`/`S_*`/`D_*`, `cam_idx_key`, `list_episodes` (수정 금지) |
+| `episode.py` | **고정 계약**: `Episode` / `EpisodeMeta`, 키 상수 `K_*`/`S_*`/`D_*` (`D_CONTACT_LABEL_PSEUDO` = contact stage 의 D2 pseudo 라벨 포함), `cam_idx_key`, `list_episodes`. `set_derived` 는 원자적 쓰기(임시 파일 + `os.replace`) |
 | `build.py` | `preprocess_session(session_dir, out_root, cfg)` → `Episode`; `build_all`; CLI `python -m robot_skin.datasets.build` |
 | `splits.py` | `make_splits(episode_dirs, by, val_frac, test_frac, seed, holdout)` — 그룹이 split 을 넘지 않음; `save_splits`/`load_splits`/`check_splits` |
 | `stats.py` | `compute_stats(episodes, keys, method)` → `{key: NormStats}` (train split, 포화·무효 프레임 마스크); `apply_stats`/`invert_stats`; `save_stats`/`load_stats` |
 | `motion.py` | D1 데이터셋: `BaselineWindowDataset`, `ContactWindowDataset`, `ImuPoseWindowDataset` (인과 창) |
-| `synthetic.py` | 합성 raw 세션 (`generate_session` / `generate_dataset` / `load_ground_truth`) — 무거운 import(torch) 때문에 `datasets/__init__` 에서 export 하지 않음 |
+| `synthetic.py` | 합성 raw 세션 (`generate_session` / `generate_dataset` / `load_ground_truth`). `generate_dataset(shared_glove=True)` (기본) 은 모든 세션을 **장갑 하나**(`glove_seed`)로 만든다 — 스킨 물리 파라미터 공유, 동작·드리프트·잡음은 세션별. 정답 `taxel_pos` 는 world(glove)/손 base(robot) 프레임. glove D1 은 ≈ 6.4 s 보다 길면 무접촉 `air_grasp_*` 블록 포함 |
+
+`robot_skin.datasets` 는 `episode` 만 즉시 import 하고, `build`/`splits`/`stats`/`motion` 의 이름
+(`preprocess_session`, `make_splits`, `compute_stats`, `BaselineWindowDataset` …)과 하위 모듈은 첫 접근 때
+지연 로드한다 (PEP 562). `synthetic`(torch + pose) 은 절대 즉시 import 하지 않는다.
 
 ## 빠른 시작
 
 ```bash
 PY=python   # repo 루트
-# 1) raw → processed (이미 있는 episode 는 건너뜀; --force 로 재생성)
+# 1) raw → processed (이미 있는 episode 는 건너뜀; --force 로 재생성 — derived/ 도 지워진다)
 $PY -m robot_skin.datasets.build --raw robot_skin/data/raw --out robot_skin/data/processed \
     --config robot_skin/configs/stages/preprocess.yaml [--set baseline.duration_s=2 --set qd.method=savgol]
+# 같은 일: python -m robot_skin preprocess [...]   (합성 raw: python -m robot_skin synth --out <dir>)
+# 2) 모든 stage 가 공유할 splits.json: python -m robot_skin splits --out robot_skin/runs/splits.json
+#    (파이프라인은 <runs>/splits.json 을 스스로 만든다 — docs/TRAINING.md §3)
 ```
 
 ```python
@@ -80,6 +87,9 @@ imu = ImuPoseWindowDataset(splits["train"], window=32, imu_stats=stats)
 | `BaselineWindowDataset` | `q_hist[W,D]`, `qd_hist[W,D]`, `pos[N,3]`, `nrm[N,3]`, `y[N]` (t 의 ΔS), `valid[N]` | `contact_label ∈ only_labels` (기본 0) 이고 포화 아닌 taxel ≥ `min_valid` 개, 창 전체의 `q`·`qd` 가 측정값 (glove: `stats.qd_valid_mask` = `hand_pose_valid` 를 미분 필터 폭만큼 침식) |
 | `ContactWindowDataset` | `z_hist[W,N]` (derived `residual_z`, 누름 양수), `sat_hist[W,N]`, `q[D]`, `qd[D]`, `q_valid` (t 의 q/qd 가 측정값인지), `label[N]`, `label_mask[N]` | `contact_label ≥ 0` (포화 제외) 인 taxel ≥ `min_labelled` 개; derived `residual_z` `[T,N]` 필요 |
 | `ImuPoseWindowDataset` | `feat[W,F]` (`pose.imu_model.imu_features`, 손목 IMU 기준), `finger_pose[15,3]`, `global_orient[3]` | `hand_pose_valid` |
+
+`label_key` (기본 `contact_label`) 는 episode 배열을 먼저 찾고, 없으면 같은 이름의 **derived** 배열을 쓴다 —
+`label_key="contact_label_pseudo"` 로 contact stage 의 D2 pseudo 라벨을 그대로 학습에 쓸 수 있다.
 
 한 데이터셋의 episode 들은 `n_taxels`, `meta.joint_names` (q 열 순서), IMU 사이트가 같아야 한다 (다르면
 `ValueError` — 예: URDF 를 못 찾아 드라이버 순서로 남은 robot episode 가 섞이는 것을 막는다).

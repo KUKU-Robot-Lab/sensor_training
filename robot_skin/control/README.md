@@ -31,7 +31,7 @@ Stage runner: `robot_skin/stages/deploy.py` (`configs/stages/deploy.yaml`).
 `contact.calibration.ResidualCalibrator` + `SaturationFSM` (calibrator.fsm), `representation.TactileHistory`,
 `vtla.contact_from_level`. `tests/test_control.py` 가 처리된 합성 에피소드(로봇·글러브, 드롭아웃 주입)를
 틱마다 흘려 `predict_episode` → `residual_levels` → `TactileFeatureSpec.from_arrays` 와 모든 중간값이
-같음을 확인한다 (ΔS·포화·레벨은 비트 단위, 신경망 출력은 1e-5).
+같음을 확인한다 (ΔS·포화·레벨·미신뢰·히스테리시스는 비트 단위, q̇·baseline 출력·z·특징·검출 확률은 1e-4 이내).
 
 남는 차이(설계상): 압력은 온라인에서 최신 샘플(zero-order hold), 오프라인은 마스터 격자 선형 보간
 (+ 레일 샘플 인접 프레임 포화 처리) — 프런트엔드를 200 Hz 로 읽으면 무시할 수준. 글러브 손 라벨의

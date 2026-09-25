@@ -2,7 +2,9 @@
 
 D2 과제 에피소드(비전 + 촉각 + 지시문 + 손 자세)로 **action chunk 정책**을 학습하고, 제어(`control`)가 그대로
 다시 만들 수 있는 `policy_bundle.pt` 를 쓴다. 스테이지 러너: `robot_skin/stages/vtla.py`
-(`python -m robot_skin.stages.vtla --config robot_skin/configs/stages/vtla.yaml --set model.head=flow`).
+(`python -m robot_skin train vtla --set model.head=flow` ≡ `python -m robot_skin.stages.vtla --config
+robot_skin/configs/stages/vtla.yaml --set model.head=flow`; 파이프라인 안에서는 `python -m robot_skin pipeline`).
+설계·샘플링·번들·논문 관계·VLM 확장은 [`docs/VTLA.md`](../../docs/VTLA.md), 실행은 [`docs/TRAINING.md`](../../docs/TRAINING.md).
 
 ## 모듈
 
@@ -39,7 +41,8 @@ readout ─ 학습 토큰 ──────────────────
   토큰 전체를 key-padding 으로 가린다. 가려진 토큰도 그래프에 남으므로(기울기 0) DDP 에
   `find_unused_parameters` 가 필요 없다.
 - **Aux contact head** (`aux_contact_weight > 0`): 촉각 인코더 토큰에서 taxel 별 접촉 logit → BCE
-  (`data.aux_target`: `label` = contact_label ≥ 0, `level`, `gt` = 합성 정답).
+  (`data.aux_target`: `label` = contact stage 의 D2 pseudo 라벨 `derived/contact_label_pseudo`, 없으면 전처리
+  `contact_label` (−1 은 무시), `level` = 촉각 레벨 규칙, `gt` = 합성 정답).
 - `lr_mult` 접두사: `text_encoder`, `vision_encoder`, `tactile_encoder`, `adapter`, `fusion`, `head` …
 
 ## Flow matching 규약 (`heads.py`)
@@ -81,7 +84,7 @@ robot_skin 에서는 이 규약만 쓴다. 근거: Flow Matching (Lipman et al.,
 | `model_config`, `state_dict` | `VTLAConfig` + 최적(EMA) 가중치 |
 | `action` | `spec` (ActionSpec), `normalizer` (ActionNormalizer), `rel_mode`, `chunk_offset` |
 | `proprio` | `normalizer`, `history`, `source` (= action 공간 상태) |
-| `tactile` | `feature_spec`, `contact_rule`, `source` (derived / bootstrap), `calibrator` / `baseline_model` / `pretrained_encoder` 참조, `layouts` |
+| `tactile` | `feature_spec`, `obs_mode`, `contact_rule`, `source` (derived / bootstrap / mixed), `calibrator` / `baseline_model` / `pretrained_encoder` 참조, `calibrator_state` (contact stage 의 `calibrator.json` 내용 내장), `frozen`, `layouts` |
 | `vision` | `cameras`, `encoder` cfg, `eval_transform` 파라미터, `cached_features_key`, `transform_config` |
 | `language`, `timing`, `head`, `meta` | 텍스트 인코더 cfg; `policy_hz`, `source_hz`, `stride`, `horizon`, `obs_history`; head 종류·flow 스텝; split·지표 |
 

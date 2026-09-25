@@ -84,7 +84,7 @@ ACT 방식(Zhao et al., arXiv:2304.13705): 매 정책 틱에 새 chunk 를 `Temp
 
 `OnlineTactileProcessor` 는 학습 데이터를 만든 함수를 틱마다 그대로 부른다(`control/README.md` 표).
 `tests/test_control.py::test_online_processor_reproduces_offline_stage_outputs` 가 처리된 합성 에피소드를 흘려
-ΔS·포화·레벨은 비트 단위로, baseline 평균/분산·z·특징·detector 확률은 1e-5 수준으로 오프라인 스테이지 출력과
+ΔS·포화·레벨은 비트 단위로, baseline 평균/분산·z·특징·detector 확률은 1e-4 이내로 오프라인 스테이지 출력과
 같음을 확인한다. 배포 설정 검증에는 녹화된 에피소드를 `control.replay_episode` 로 흘려 derived 배열과 비교하면 된다.
 
 설계상 남는 차이: (1) 압력은 최신 샘플(zero-order hold) vs 오프라인 선형 보간 — 프런트엔드를 200 Hz 로 읽으면

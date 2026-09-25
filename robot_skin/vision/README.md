@@ -107,6 +107,8 @@ x, valid = gather_frame_features(feats, ep[cam_idx_key("ego")][ticks])   # 마�
 
 - 선택 의존성은 torch 빌드와 맞춰 설치: Blackwell(sm_120)은 CUDA ≥ 12.8 휠 — `pip install torchvision --index-url https://download.pytorch.org/whl/cu128`.
   `transformers` 가중치는 `HF_HOME` 캐시를 공유하면 여러 머신(Tailscale)에서 재다운로드를 피할 수 있다.
-- 동결 대형 백본은 먼저 캐시하고(`--bf16`), VTLA 학습은 캐시 특징으로 → 이미지 디코딩/인코딩 비용 제거.
+- VTLA 학습용 캐시는 `vtla` stage 가 직접 만든다(`--set vision.cache_features=true`: 인코더 동결, 키 =
+  `cache_key` + 인코더 가중치 해시, eval 변환) → 이미지 디코딩/인코딩 비용 제거. 위 CLI 로 만든 캐시는 키에 가중치
+  해시가 없어 stage 가 재사용하지 않는다 — 분석·다른 모델용 (`docs/TRAINING.md` §13).
 - 온라인 인코더 학습 시에는 `TrainAugment` 를 GPU 텐서에 적용해도 된다 (배치 연산).
 - 선택 의존성이 없으면 `ImportError` 에 설치 방법과 대안(`type: tiny`)이 표시된다. 테스트는 선택 의존성 없이 돈다.

@@ -32,6 +32,9 @@ $PY -m robot_skin.acquisition.qc robot_skin/data/raw/motion/S01/<session_id> --w
 $PY -m robot_skin.acquisition.session <session_dir> [--sync-from DIR] [--calibration-from DIR]
 ```
 
+최상위 CLI 로도 같다: `python -m robot_skin record glove|robot <위 인자>` ≡ `glove_logger` / `robot_logger`,
+`python -m robot_skin postprocess …` ≡ `acquisition.session`, `python -m robot_skin qc …` ≡ `acquisition.qc`.
+
 주요 옵션: `--protocol d1_motion|d2_task|robot_sweep|<yaml>`, `--subject S01`(가명 ID만),
 `--cameras ego,third|none`, `--task`/`--object`/`--episodes`/`--repetitions` (D2), `--instruction "..."`
 (운영자 지시문 덮어쓰기), `--seed`, `--time-scale`, `--no-imu`, `--no-sync`, `--sync-from`,

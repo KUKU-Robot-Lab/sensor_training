@@ -61,6 +61,9 @@ tokens = enc(torch.as_tensor(vals)[None], torch.as_tensor(pos)[None],     # pos/
 * `key_padding_mask` `[B,N]` (True = 무시) — 어텐션 key 에서 제외하고 출력은 0. 레이아웃 혼합 배치의
   패딩, MAE 사전학습의 가려진 taxel 에 쓴다. 한 샘플의 모든 taxel 을 가리면 `ValueError`.
 * 입력은 파라미터 dtype 으로 변환(bf16 autocast 에서도 Fourier 위상은 fp32).
+* 위치 Fourier 특징 기본값 `fourier_scale = 0.3` m (최저 옥타브 주기, 손 크기 이상), `n_fourier = 6`
+  (최고 옥타브 주기 0.3 / 2⁵ ≈ 9 mm). 예전 기본값 0.05 m × 8 옥타브는 최고 주기가 0.4 mm 라 mm 수준의
+  손 자세 라벨 오차에서 상위 옥타브가 순수 잡음이 됐다. 저장된 인코더는 자기 config 를 가지므로 영향 없음.
 * `config` / `from_config`, `encode(residual_z, level, saturated, pos, nrm)` (history=1 편의 함수).
 
 `encoder_state.pt` = `{format: "robot_skin/taxel_encoder", version, config (feature_spec 포함),
@@ -103,7 +106,9 @@ python -m robot_skin.stages.pretrain --config robot_skin/configs/stages/pretrain
    사전학습에 쓸 수 있다.
 3. `frame_stride`(기본 4 → 50 Hz) 로 프레임 샘플링, `contact_repeat` 로 접촉 프레임 과표집.
    taxel pose 가 NaN/inf 인 프레임은 건너뛰고(경고 1회), taxel 중심이 0.15 m 넘게 움직이는 에피소드
-   (world 좌표계 `taxel_pos` 로 의심)는 경고 1회로 모아 알린다.
+   (world 좌표계 `taxel_pos` 로 의심)는 경고 1회로 모아 알린다. `datasets.build/2` 부터 glove `taxel_pos` 는
+   손 프레임(MANO 손목, `meta.preprocessing.taxel_frame = mano_wrist`)이므로 이 경고는 그 이전 버전으로
+   만든 에피소드(→ `--force` 로 재빌드)나 외부 도구 산출물에 대한 안전장치다.
 4. `robot_skin.train.Trainer` (`train:` = `TrainConfig`, 프로파일 `suggest.pretrain` 배치).
    우선순위: YAML `train` < 하드웨어 프로파일 < 명시적 override(`--set`). `load_stage_config` 가
    YAML 과 override 사이에서 프로파일을 적용하고 `hardware_applied: true` 로 표시한다(프로파일 `env`

@@ -82,6 +82,14 @@ robot:  joint_state q ─▶ URDFModel.fk ─▶ taxel_poses_from_joints ─▶ 
 
 포즈는 `baseline/`(입력), `contact/self_touch`(자동 라벨), `representation/`(pose 임베딩), `action/retarget`(URDF FK)에 쓰인다.
 
+**taxel pose 의 프레임**: 전처리(`datasets.build`)는 글러브 taxel pose 를 **손 프레임**(`global_orient = 0`, 손목 =
+원점; `meta.preprocessing.taxel_frame = mano_wrist`), 로봇은 URDF 루트 프레임(`urdf_root`)으로 저장한다. baseline·
+pretrain·VTLA·온라인 처리기(`control.online.glove_pose_fn`)가 모두 이 규약을 쓴다. 아래 예처럼 `global_orient`·
+`wrist_pos` 를 넣으면 월드(카메라) 프레임 자세가 나온다 — 손–물체 근접처럼 월드 좌표가 필요할 때만 쓴다
+(`contact.pseudo_label.taxel_world_positions` = `R(hand_global_orient)·p + hand_wrist_pos`).
+`GloveImu2ManoPoseProvider` 는 기본(`global_from_imu=True`)이 IMU 월드 프레임이므로, 이 모델들에 넣을 때는
+`global_from_imu=False`(그리고 `wrist_pos` 없이)로 만든다.
+
 ## 예
 
 ```python

@@ -11,7 +11,7 @@
 | `calibration.py` | **`ResidualCalibrator`**: D1 val 무접촉 프레임으로 taxel별 robust σ(MAD·1.4826), 중심 c, 이득 g 적합 → `z = (p − c) / (g·sqrt(σ² + exp(logvar)))` (baseline 예측 분산 사용 시). 레벨: `WEAK ⇔ z ≥ weak_z ∧ p ≥ weak_floor_pct`, `STRONG` 동일, 포화/FSM 미신뢰 → `SATURATED`. `saturation_gate`(FSM 오프라인 실행), `residual_levels`(오프라인 단일 진입점), `to_dict/save/load` |
 | `detector.py` | **`ContactDetector`**: taxel별 인과 z 이력 `[W]`(+포화 플래그) → causal dilated conv(taxel 공유) + 관절속도 요약(RMS, max) + 선택적 taxel 임베딩 → logit. `focal_loss`(Lin et al. 2017)·`contact_loss`(focal/BCE), 출력 bias = prior π 초기화, `predict_contact_prob`(= `predict_episode`), `CausalDetectorStream`(온라인, 오프라인과 동일), `save/load_detector` |
 | `hysteresis.py` | **`HysteresisFilter(on_thr, off_thr, min_on, min_off)`**: 두 임계 + 체류 틱 디바운스, `step`(온라인) ≡ `run`(오프라인). NaN = 낮음(가짜 접촉 방지) |
-| `pseudo_label.py` | **`pseudo_label_episode`**: D2 미지 프레임에 detector 확률 + 히스테리시스 + 페이즈 기대(`none`→0, `object/self/any`→허용) + 포화(허용 페이즈에서 1) + 선택적 손–물체 근접 veto 를 융합 → `derived/contact_label_pseudo` (int8 −1/0/1). 기존 확실한 라벨은 유지. `phase_expectation`, `frame_expectation`, `taxel_world_positions`, `pseudo_label_metrics` |
+| `pseudo_label.py` | **`pseudo_label_episode`**: D2 미지 프레임에 detector 확률 + 히스테리시스 + 페이즈 기대(`none`→0, `object/self/any`→허용) + 포화(허용 페이즈에서 1) + 선택적 손–물체 근접 veto 를 융합 → `derived/contact_label_pseudo` (int8 −1/0/1; 키는 Episode 계약의 `datasets.episode.D_CONTACT_LABEL_PSEUDO`, `datasets.motion` 데이터셋이 `label_key` 로 직접 읽는다). 기존 확실한 라벨은 유지. 이름에서 기대를 추론할 때 D1 `air_grasp_*` 는 `none` (물체 없는 쥐기 손모양). `phase_expectation`, `frame_expectation`, `taxel_world_positions`, `pseudo_label_metrics` |
 
 `ContactDetector` 등 torch 모듈은 `contact/__init__` 에서 지연 import(PEP 562) — `ordinal`/`saturation_fsm`
 사용자는 torch 를 import 하지 않는다.
